@@ -1,0 +1,41 @@
+name: Real isolation security gate
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: isolation-security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  real-rootless-podman:
+    name: real rootless Podman isolation
+    runs-on: [self-hosted, linux, rootless-podman, claw-security]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify runner host contract
+        env:
+          CLAW_PREFLIGHT_CONFIG_ONLY: "1"
+        run: ./scripts/security-runner-preflight.sh
+      - name: Build worker image
+        run: podman build -f Containerfile.worker -t claw-exec:security .
+      - name: Run real isolation gate
+        env:
+          CLAW_REAL_PODMAN_IMAGE: claw-exec:security
+        run: ./scripts/test-real-isolation.sh
+      - name: Upload sanitized verification artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: claw-real-isolation-verification
+          path: artifacts/security-verification.json
+          if-no-files-found: ignore

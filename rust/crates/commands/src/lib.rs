@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use plugins::{PluginError, PluginLoadFailure, PluginManager, PluginSummary};
 use runtime::{
     compact_session, CompactionConfig, ConfigLoader, ConfigSource, McpOAuthConfig, McpServerConfig,
-    ScopedMcpServerConfig, Session,
+    RuntimeImage, ScopedMcpServerConfig, Session,
 };
 use serde_json::{json, Value};
 
@@ -3551,6 +3551,15 @@ fn render_mcp_summary_report(
         format!("  Working directory {}", cwd.display()),
         format!("  Configured servers {}", servers.len()),
     ];
+    if std::env::var("CLAW_EXECUTION_MODE").as_deref() == Ok("isolated") {
+        lines.push(format!(
+            "  Execution         isolated Podman ({})",
+            RuntimeImage::configured()
+        ));
+        lines.push(String::from(
+            "  Network           none; host executables and environment are not mounted",
+        ));
+    }
     if servers.is_empty() {
         lines.push("  No MCP servers configured.".to_string());
         return lines.join("\n");
@@ -3607,6 +3616,13 @@ fn render_mcp_server_report(
             mcp_transport_label(&server.config)
         ),
     ];
+    if std::env::var("CLAW_EXECUTION_MODE").as_deref() == Ok("isolated") {
+        lines.push(format!(
+            "  Execution         isolated Podman ({})",
+            RuntimeImage::configured()
+        ));
+        lines.push(String::from("  Network           none"));
+    }
 
     match &server.config {
         McpServerConfig::Stdio(config) => {
@@ -5363,7 +5379,7 @@ mod tests {
         )
         .expect("write local settings");
 
-        let loader = ConfigLoader::new(&workspace, &config_home);
+        let loader = ConfigLoader::new(&workspace, &config_home).with_project_trust(true);
         let list = super::render_mcp_report_for(&loader, &workspace, None)
             .expect("mcp list report should render");
         assert!(list.contains("Configured servers 2"));
@@ -5440,7 +5456,7 @@ mod tests {
         )
         .expect("write local settings");
 
-        let loader = ConfigLoader::new(&workspace, &config_home);
+        let loader = ConfigLoader::new(&workspace, &config_home).with_project_trust(true);
         let list =
             render_mcp_report_json_for(&loader, &workspace, None).expect("mcp list json render");
         assert_eq!(list["kind"], "mcp");

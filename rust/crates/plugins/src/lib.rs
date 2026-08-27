@@ -304,6 +304,21 @@ impl PluginTool {
         self.required_permission.as_str()
     }
 
+    #[must_use]
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+
+    #[must_use]
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+
+    #[must_use]
+    pub fn plugin_name(&self) -> &str {
+        &self.plugin_name
+    }
+
     pub fn execute(&self, input: &Value) -> Result<String, PluginError> {
         let input_json = input.to_string();
         let mut process = Command::new(&self.command);

@@ -319,6 +319,7 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
         .env("NO_COLOR", "1")
         .env("PATH", "/usr/bin:/bin")
         .args([
+            "--no-isolation",
             "--model",
             "sonnet",
             "--permission-mode",
@@ -672,7 +673,8 @@ fn assert_plugin_tool_roundtrip(_: &HarnessWorkspace, run: &ScenarioRun) {
     let tool_output = run.response["tool_results"][0]["output"]
         .as_str()
         .expect("tool output");
-    let parsed: Value = serde_json::from_str(tool_output).expect("plugin output json");
+    let parsed: Value = serde_json::from_str(tool_output)
+        .unwrap_or_else(|error| panic!("plugin output json ({error}): {tool_output:?}"));
     assert_eq!(
         parsed["plugin"],
         Value::String("parity-plugin@external".to_string())

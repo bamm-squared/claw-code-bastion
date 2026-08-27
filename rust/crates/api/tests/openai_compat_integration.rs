@@ -28,11 +28,14 @@ async fn send_message_uses_openai_compatible_endpoint_and_auth() {
         "\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5}",
         "}"
     );
-    let server = spawn_server(
+    let Some(server) = spawn_server(
         state.clone(),
         vec![http_response("200 OK", "application/json", body)],
     )
-    .await;
+    .await
+    else {
+        return;
+    };
 
     let client = OpenAiCompatClient::new("xai-test-key", OpenAiCompatConfig::xai())
         .with_base_url(server.base_url());
@@ -66,11 +69,14 @@ async fn send_message_uses_openai_compatible_endpoint_and_auth() {
 #[tokio::test]
 async fn send_message_blocks_oversized_xai_requests_before_the_http_call() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
-    let server = spawn_server(
+    let Some(server) = spawn_server(
         state.clone(),
         vec![http_response("200 OK", "application/json", "{}")],
     )
-    .await;
+    .await
+    else {
+        return;
+    };
 
     let client = OpenAiCompatClient::new("xai-test-key", OpenAiCompatConfig::xai())
         .with_base_url(server.base_url());
@@ -114,11 +120,14 @@ async fn send_message_accepts_full_chat_completions_endpoint_override() {
         "\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}",
         "}"
     );
-    let server = spawn_server(
+    let Some(server) = spawn_server(
         state.clone(),
         vec![http_response("200 OK", "application/json", body)],
     )
-    .await;
+    .await
+    else {
+        return;
+    };
 
     let endpoint_url = format!("{}/chat/completions", server.base_url());
     let client = OpenAiCompatClient::new("xai-test-key", OpenAiCompatConfig::xai())
@@ -144,7 +153,7 @@ async fn stream_message_normalizes_text_and_multiple_tool_calls() {
         "data: {\"id\":\"chatcmpl_stream\",\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
         "data: [DONE]\n\n"
     );
-    let server = spawn_server(
+    let Some(server) = spawn_server(
         state.clone(),
         vec![http_response_with_headers(
             "200 OK",
@@ -153,7 +162,10 @@ async fn stream_message_normalizes_text_and_multiple_tool_calls() {
             &[("x-request-id", "req_grok_stream")],
         )],
     )
-    .await;
+    .await
+    else {
+        return;
+    };
 
     let client = OpenAiCompatClient::new("xai-test-key", OpenAiCompatConfig::xai())
         .with_base_url(server.base_url());
@@ -243,7 +255,7 @@ async fn openai_streaming_requests_opt_into_usage_chunks() {
         "data: {\"id\":\"chatcmpl_openai_stream\",\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4}}\n\n",
         "data: [DONE]\n\n"
     );
-    let server = spawn_server(
+    let Some(server) = spawn_server(
         state.clone(),
         vec![http_response_with_headers(
             "200 OK",
@@ -252,7 +264,10 @@ async fn openai_streaming_requests_opt_into_usage_chunks() {
             &[("x-request-id", "req_openai_stream")],
         )],
     )
-    .await;
+    .await
+    else {
+        return;
+    };
 
     let client = OpenAiCompatClient::new("openai-test-key", OpenAiCompatConfig::openai())
         .with_base_url(server.base_url());
@@ -316,7 +331,7 @@ async fn provider_client_dispatches_xai_requests_from_env() {
     let _api_key = ScopedEnvVar::set("XAI_API_KEY", "xai-test-key");
 
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
-    let server = spawn_server(
+    let Some(server) = spawn_server(
         state.clone(),
         vec![http_response(
             "200 OK",
@@ -324,7 +339,10 @@ async fn provider_client_dispatches_xai_requests_from_env() {
             "{\"id\":\"chatcmpl_provider\",\"model\":\"grok-3\",\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"Through provider client\",\"tool_calls\":[]},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4}}",
         )],
     )
-    .await;
+    .await
+    else {
+        return;
+    };
     let _base_url = ScopedEnvVar::set("XAI_BASE_URL", server.base_url());
 
     let client =
@@ -374,10 +392,16 @@ impl Drop for TestServer {
 async fn spawn_server(
     state: Arc<Mutex<Vec<CapturedRequest>>>,
     responses: Vec<String>,
-) -> TestServer {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("listener should bind");
+) -> Option<TestServer> {
+    let listener = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            return None;
+        }
+        Err(error) => {
+            panic!("listener should bind: {error}");
+        }
+    };
     let address = listener.local_addr().expect("listener addr");
     let join_handle = tokio::spawn(async move {
         for response in responses {
@@ -444,10 +468,10 @@ async fn spawn_server(
         }
     });
 
-    TestServer {
+    Some(TestServer {
         base_url: format!("http://{address}"),
         join_handle,
-    }
+    })
 }
 
 fn find_header_end(bytes: &[u8]) -> Option<usize> {

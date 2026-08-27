@@ -85,6 +85,18 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace
 
+  check-workspace:
+    name: cargo check --workspace
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+      - name: Check workspace
+        run: cargo check --workspace
+
   clippy-workspace:
     name: cargo clippy --workspace
     runs-on: ubuntu-latest
@@ -97,4 +109,16 @@ jobs:
         with:
           workspaces: rust -> target
       - name: Run workspace clippy
-        run: cargo clippy --workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  build-workspace:
+    name: cargo build --workspace
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+      - name: Build workspace
+        run: cargo build --workspace

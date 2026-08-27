@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -253,6 +254,12 @@ pub struct McpToolDiscoveryReport {
 #[derive(Debug)]
 pub enum McpServerManagerError {
     Io(io::Error),
+    Spawn {
+        server_name: String,
+        command: String,
+        image: String,
+        source: io::Error,
+    },
     Transport {
         server_name: String,
         method: &'static str,
@@ -285,6 +292,15 @@ impl std::fmt::Display for McpServerManagerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(error) => write!(f, "{error}"),
+            Self::Spawn {
+                server_name,
+                command,
+                image,
+                source,
+            } => write!(
+                f,
+                "MCP server `{server_name}` could not start command `{command}` in isolated image `{image}`: {source}; host executables are not mounted into isolated MCP containers"
+            ),
             Self::Transport {
                 server_name,
                 method,
@@ -330,7 +346,7 @@ impl std::error::Error for McpServerManagerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::Transport { source, .. } => Some(source),
+            Self::Spawn { source, .. } | Self::Transport { source, .. } => Some(source),
             Self::JsonRpc { .. }
             | Self::InvalidResponse { .. }
             | Self::Timeout { .. }
@@ -349,7 +365,7 @@ impl From<io::Error> for McpServerManagerError {
 impl McpServerManagerError {
     fn lifecycle_phase(&self) -> McpLifecyclePhase {
         match self {
-            Self::Io(_) => McpLifecyclePhase::SpawnConnect,
+            Self::Io(_) | Self::Spawn { .. } => McpLifecyclePhase::SpawnConnect,
             Self::Transport { method, .. }
             | Self::JsonRpc { method, .. }
             | Self::InvalidResponse { method, .. }
@@ -383,6 +399,17 @@ impl McpServerManagerError {
     fn error_context(&self) -> BTreeMap<String, String> {
         match self {
             Self::Io(error) => BTreeMap::from([("kind".to_string(), error.kind().to_string())]),
+            Self::Spawn {
+                server_name,
+                command,
+                image,
+                source,
+            } => BTreeMap::from([
+                ("server".to_string(), server_name.clone()),
+                ("command".to_string(), command.clone()),
+                ("image".to_string(), image.clone()),
+                ("io_kind".to_string(), source.kind().to_string()),
+            ]),
             Self::Transport {
                 server_name,
                 method,
@@ -482,6 +509,8 @@ pub struct McpServerManager {
     unsupported_servers: Vec<UnsupportedMcpServer>,
     tool_index: BTreeMap<String, ToolRoute>,
     next_request_id: u64,
+    isolated_workspace: Option<PathBuf>,
+    isolated_image: Option<String>,
 }
 
 impl McpServerManager {
@@ -516,7 +545,41 @@ impl McpServerManager {
             unsupported_servers,
             tool_index: BTreeMap::new(),
             next_request_id: 1,
+            isolated_workspace: None,
+            isolated_image: None,
         }
+    }
+
+    /// Build an MCP manager whose stdio servers execute inside disposable,
+    /// networkless Podman containers. Only servers that need no configured
+    /// environment are accepted because the worker must not receive secrets.
+    #[must_use]
+    pub fn from_servers_isolated(
+        servers: &BTreeMap<String, ScopedMcpServerConfig>,
+        workspace: PathBuf,
+        image: String,
+    ) -> Self {
+        let mut manager = Self::from_servers(servers);
+        manager.isolated_workspace = Some(workspace);
+        manager.isolated_image = Some(image);
+
+        for (server_name, server_config) in servers {
+            if let McpClientTransport::Stdio(transport) =
+                McpClientTransport::from_config(&server_config.config)
+            {
+                if !transport.env.is_empty() {
+                    manager.servers.remove(server_name);
+                    manager.unsupported_servers.push(UnsupportedMcpServer {
+                        server_name: server_name.clone(),
+                        transport: McpTransport::Stdio,
+                        reason: String::from(
+                            "stdio MCP environment variables are unavailable in isolated execution",
+                        ),
+                    });
+                }
+            }
+        }
+        manager
     }
 
     #[must_use]
@@ -1044,6 +1107,7 @@ impl McpServerManager {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn ensure_server_ready(
         &mut self,
         server_name: &str,
@@ -1063,8 +1127,30 @@ impl McpServerManager {
                 })?;
 
             if needs_spawn {
+                let isolated_workspace = self.isolated_workspace.clone();
+                let isolated_image = self.isolated_image.clone();
                 let server = self.server_mut(server_name)?;
-                server.process = Some(spawn_mcp_stdio_process(&server.bootstrap)?);
+                let command = match &server.bootstrap.transport {
+                    McpClientTransport::Stdio(transport) => transport.command.clone(),
+                    _ => String::from("<non-stdio>"),
+                };
+                let image = isolated_image
+                    .clone()
+                    .unwrap_or_else(|| String::from("host process"));
+                let process_result =
+                    match (isolated_workspace.as_deref(), isolated_image.as_deref()) {
+                        (Some(workspace), Some(image)) => {
+                            spawn_mcp_stdio_process_isolated(&server.bootstrap, workspace, image)
+                        }
+                        _ => spawn_mcp_stdio_process(&server.bootstrap),
+                    };
+                let process = process_result.map_err(|source| McpServerManagerError::Spawn {
+                    server_name: server_name.to_string(),
+                    command,
+                    image,
+                    source,
+                })?;
+                server.process = Some(process);
                 server.initialized = false;
             }
 
@@ -1154,6 +1240,7 @@ impl McpStdioProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        command.env_clear();
         apply_env(&mut command, &transport.env);
 
         let mut child = command.spawn()?;
@@ -1379,6 +1466,79 @@ pub fn spawn_mcp_stdio_process(bootstrap: &McpClientBootstrap) -> io::Result<Mcp
             ),
         )),
     }
+}
+
+fn spawn_mcp_stdio_process_isolated(
+    bootstrap: &McpClientBootstrap,
+    workspace: &Path,
+    image: &str,
+) -> io::Result<McpStdioProcess> {
+    let McpClientTransport::Stdio(transport) = &bootstrap.transport else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "isolated MCP requires stdio transport",
+        ));
+    };
+    if !workspace.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "isolated MCP workspace must be absolute",
+        ));
+    }
+
+    let mut args = vec![
+        String::from("run"),
+        String::from("--rm"),
+        String::from("--interactive"),
+        String::from("--network=none"),
+        String::from("--read-only"),
+        String::from("--userns=keep-id"),
+        String::from("--pid=private"),
+        String::from("--ipc=private"),
+        String::from("--cap-drop=ALL"),
+        String::from("--security-opt=no-new-privileges"),
+        String::from("--pids-limit=256"),
+        String::from("--tmpfs"),
+        String::from("/tmp:rw,nosuid,nodev"),
+        String::from("--tmpfs"),
+        String::from("/home/worker:rw,nosuid,nodev"),
+        String::from("--mount"),
+        format!(
+            "type=bind,src={},dst=/workspace/project,rw",
+            workspace.display()
+        ),
+        String::from("--workdir"),
+        String::from("/workspace/project"),
+        String::from("--entrypoint"),
+        transport.command.clone(),
+        image.to_string(),
+    ];
+    args.extend(transport.args.iter().cloned());
+    let mut command = Command::new("podman");
+    command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    // This is the trusted Podman client process, not the MCP container. Keep
+    // its runtime/storage environment so rootless Podman can locate its user
+    // runtime; no host environment is forwarded into the container because
+    // no `--env` or `--env-host` option is supplied.
+
+    let mut child = command.spawn()?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("isolated MCP process missing stdin pipe"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("isolated MCP process missing stdout pipe"))?;
+    Ok(McpStdioProcess {
+        child,
+        stdin,
+        stdout: BufReader::new(stdout),
+    })
 }
 
 fn apply_env(command: &mut Command, env: &BTreeMap<String, String>) {
@@ -2924,5 +3084,46 @@ mod tests {
 
             cleanup_script(&script_path);
         });
+    }
+
+    #[test]
+    fn isolated_manager_accepts_only_secret_free_stdio_servers() {
+        let servers = BTreeMap::from([
+            (
+                "safe".to_string(),
+                ScopedMcpServerConfig {
+                    scope: ConfigSource::User,
+                    config: McpServerConfig::Stdio(McpStdioServerConfig {
+                        command: "/usr/bin/mcp-server".to_string(),
+                        args: Vec::new(),
+                        env: BTreeMap::new(),
+                        tool_call_timeout_ms: None,
+                    }),
+                },
+            ),
+            (
+                "credentialed".to_string(),
+                ScopedMcpServerConfig {
+                    scope: ConfigSource::User,
+                    config: McpServerConfig::Stdio(McpStdioServerConfig {
+                        command: "/usr/bin/mcp-server".to_string(),
+                        args: Vec::new(),
+                        env: BTreeMap::from([(String::from("TOKEN"), String::from("secret"))]),
+                        tool_call_timeout_ms: None,
+                    }),
+                },
+            ),
+        ]);
+
+        let manager = McpServerManager::from_servers_isolated(
+            &servers,
+            PathBuf::from("/tmp/claw-mcp-candidate"),
+            String::from("claw-exec:test"),
+        );
+        assert_eq!(manager.server_names(), vec![String::from("safe")]);
+        assert_eq!(manager.unsupported_servers().len(), 1);
+        assert!(manager.unsupported_servers()[0]
+            .reason
+            .contains("environment variables"));
     }
 }

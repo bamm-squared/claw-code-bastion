@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 use glob::Pattern;
@@ -41,6 +41,201 @@ fn validate_workspace_boundary(resolved: &Path, workspace_root: &Path) -> io::Re
         ));
     }
     Ok(())
+}
+
+/// Filesystem access capabilities for model-facing operations.
+#[derive(Debug, Clone)]
+pub struct FilesystemCapability {
+    readable_roots: Vec<PathBuf>,
+    writable_roots: Vec<PathBuf>,
+}
+
+impl FilesystemCapability {
+    /// Create a capability where reads and writes are restricted to one workspace root.
+    #[must_use]
+    pub fn workspace_root(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        Self {
+            readable_roots: vec![root.clone()],
+            writable_roots: vec![root],
+        }
+    }
+
+    /// Replace readable roots.
+    #[must_use]
+    pub fn with_readable_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.readable_roots = roots;
+        self
+    }
+
+    /// Replace writable roots.
+    #[must_use]
+    pub fn with_writable_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.writable_roots = roots;
+        self
+    }
+
+    /// Return a copy of the readable roots.
+    #[must_use]
+    pub fn readable_roots(&self) -> &[PathBuf] {
+        &self.readable_roots
+    }
+
+    /// Return a copy of the writable roots.
+    #[must_use]
+    pub fn writable_roots(&self) -> &[PathBuf] {
+        &self.writable_roots
+    }
+
+    /// Create a read-capable capability for workspace-restricted reads and writes.
+    #[must_use]
+    pub fn workspace(path: impl AsRef<Path>) -> Self {
+        Self::workspace_root(path.as_ref().to_path_buf())
+    }
+
+    /// Resolve a read path and validate it is inside a readable root.
+    fn resolve_read_path(&self, path: &str) -> io::Result<PathBuf> {
+        let absolute_path = normalize_path(path)?;
+        validate_within_roots(&absolute_path, &self.readable_roots)?;
+        Ok(absolute_path)
+    }
+
+    /// Resolve a write path (possibly missing) and validate it is inside a writable root.
+    fn resolve_write_path(&self, path: &str) -> io::Result<PathBuf> {
+        let absolute_path = normalize_path_allow_missing(path)?;
+        validate_within_roots(&absolute_path, &self.writable_roots)?;
+        Ok(absolute_path)
+    }
+
+    /// Read file contents through the capability.
+    pub fn read_file(
+        &self,
+        path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> io::Result<ReadFileOutput> {
+        self.resolve_read_path(path)?;
+        read_file(path, offset, limit)
+    }
+
+    /// Write file contents through the capability.
+    pub fn write_file(&self, path: &str, content: &str) -> io::Result<WriteFileOutput> {
+        self.resolve_write_path(path)?;
+        write_file(path, content)
+    }
+
+    /// Edit file contents through the capability.
+    pub fn edit_file(
+        &self,
+        path: &str,
+        old_string: &str,
+        new_string: &str,
+        replace_all: bool,
+    ) -> io::Result<EditFileOutput> {
+        self.resolve_write_path(path)?;
+        edit_file(path, old_string, new_string, replace_all)
+    }
+
+    /// Search paths for matching files through the capability.
+    pub fn glob_search(&self, pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOutput> {
+        let base_dir = path
+            .map(normalize_path)
+            .transpose()?
+            .unwrap_or(std::env::current_dir()?);
+        validate_within_roots(&base_dir, &self.readable_roots)?;
+        if has_forbidden_path_component(pattern) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pattern contains parent directory traversal",
+            ));
+        }
+
+        glob_search(pattern, Some(base_dir.to_string_lossy().as_ref()))
+            .and_then(|output| ensure_glob_matches_within_roots(output, &self.readable_roots))
+    }
+
+    /// Run search through the capability.
+    pub fn grep_search(&self, input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
+        let base_path = input
+            .path
+            .as_deref()
+            .map(normalize_path)
+            .transpose()?
+            .unwrap_or(std::env::current_dir()?);
+        validate_within_roots(&base_path, &self.readable_roots)?;
+        let mut scoped_input = input.clone();
+        scoped_input.path = Some(base_path.to_string_lossy().into_owned());
+        grep_search(&scoped_input)
+            .and_then(|output| validate_grep_match_roots(output, &self.readable_roots))
+    }
+}
+
+fn validate_within_roots(path: &Path, roots: &[PathBuf]) -> io::Result<()> {
+    if roots.iter().any(|root| within_root(path, root)) {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("path {} escapes allowed filesystem roots", path.display()),
+    ))
+}
+
+fn within_root(path: &Path, root: &Path) -> bool {
+    path.starts_with(canonical_root(root))
+}
+
+fn canonical_root(root: &Path) -> PathBuf {
+    root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
+}
+
+fn has_forbidden_path_component(pattern: &str) -> bool {
+    Path::new(pattern)
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+}
+
+fn ensure_glob_matches_within_roots(
+    output: GlobSearchOutput,
+    roots: &[PathBuf],
+) -> io::Result<GlobSearchOutput> {
+    let original_len = output.filenames.len();
+    let sanitized = output
+        .filenames
+        .into_iter()
+        .filter(|filename| {
+            let path = PathBuf::from(filename);
+            path.is_absolute() && roots.iter().any(|root| within_root(&path, root))
+        })
+        .collect::<Vec<_>>();
+    if sanitized.len() != original_len {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "glob search result contained a path outside allowed roots",
+        ));
+    }
+
+    Ok(GlobSearchOutput {
+        filenames: sanitized,
+        num_files: output.num_files,
+        duration_ms: output.duration_ms,
+        truncated: output.truncated,
+    })
+}
+
+fn validate_grep_match_roots(
+    output: GrepSearchOutput,
+    roots: &[PathBuf],
+) -> io::Result<GrepSearchOutput> {
+    for filename in &output.filenames {
+        let path = PathBuf::from(filename);
+        if !path.is_absolute() || !roots.iter().any(|root| within_root(&path, root)) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "grep search result contained a path outside allowed roots",
+            ));
+        }
+    }
+    Ok(output)
 }
 
 /// Text payload returned by file-reading operations.
@@ -172,7 +367,7 @@ pub struct GrepSearchOutput {
 }
 
 /// Reads a text file and returns a line-windowed payload.
-pub fn read_file(
+fn read_file(
     path: &str,
     offset: Option<usize>,
     limit: Option<usize>,
@@ -221,7 +416,7 @@ pub fn read_file(
 }
 
 /// Replaces a file's contents and returns patch metadata.
-pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
+fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
     if content.len() > MAX_WRITE_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -255,7 +450,7 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
 }
 
 /// Performs an in-file string replacement and returns patch metadata.
-pub fn edit_file(
+fn edit_file(
     path: &str,
     old_string: &str,
     new_string: &str,
@@ -296,7 +491,7 @@ pub fn edit_file(
 }
 
 /// Expands a glob pattern and returns matching filenames.
-pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOutput> {
+fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOutput> {
     let started = Instant::now();
     let base_dir = path
         .map(normalize_path)
@@ -348,7 +543,7 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
 }
 
 /// Runs a regex search over workspace files with optional context lines.
-pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
+fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     let base_path = input
         .path
         .as_deref()
@@ -567,7 +762,7 @@ fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
 
 /// Read a file with workspace boundary enforcement.
 #[allow(dead_code)]
-pub fn read_file_in_workspace(
+pub(crate) fn read_file_in_workspace(
     path: &str,
     offset: Option<usize>,
     limit: Option<usize>,
@@ -583,7 +778,7 @@ pub fn read_file_in_workspace(
 
 /// Write a file with workspace boundary enforcement.
 #[allow(dead_code)]
-pub fn write_file_in_workspace(
+pub(crate) fn write_file_in_workspace(
     path: &str,
     content: &str,
     workspace_root: &Path,
@@ -598,7 +793,7 @@ pub fn write_file_in_workspace(
 
 /// Edit a file with workspace boundary enforcement.
 #[allow(dead_code)]
-pub fn edit_file_in_workspace(
+pub(crate) fn edit_file_in_workspace(
     path: &str,
     old_string: &str,
     new_string: &str,
@@ -651,6 +846,8 @@ fn expand_braces(pattern: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::FilesystemCapability;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
@@ -753,6 +950,59 @@ mod tests {
         let normal = workspace.join("normal.txt");
         std::fs::write(&normal, "normal content").expect("normal file should write");
         assert!(!is_symlink_escape(&normal, &workspace).expect("check should succeed"));
+    }
+
+    #[test]
+    fn capability_rejects_traversal_external_paths_and_symlink_writes() {
+        let workspace = temp_path("capability-workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir should be created");
+        let outside = temp_path("capability-outside.txt");
+        std::fs::write(&outside, "secret").expect("outside file should write");
+        let capability = FilesystemCapability::workspace(&workspace);
+
+        assert!(capability
+            .read_file("../capability-outside.txt", None, None)
+            .is_err());
+        assert!(capability
+            .read_file(outside.to_string_lossy().as_ref(), None, None)
+            .is_err());
+
+        #[cfg(unix)]
+        {
+            let link = workspace.join("escape");
+            std::os::unix::fs::symlink(&outside, &link).expect("symlink should create");
+            assert!(capability.write_file("escape", "do not overwrite").is_err());
+        }
+    }
+
+    #[test]
+    fn capability_rejects_common_prefix_and_glob_escape() {
+        let workspace = temp_path("capability-prefix");
+        let sibling = PathBuf::from(format!("{}-sibling", workspace.to_string_lossy()));
+        std::fs::create_dir_all(&workspace).expect("workspace dir should be created");
+        std::fs::create_dir_all(&sibling).expect("sibling dir should be created");
+        std::fs::write(sibling.join("secret.rs"), "secret").expect("sibling file should write");
+        let capability = FilesystemCapability::workspace(&workspace);
+
+        assert!(capability.glob_search("../**/*.rs", None).is_err());
+        assert!(capability
+            .grep_search(&GrepSearchInput {
+                pattern: String::from("secret"),
+                path: Some(sibling.to_string_lossy().into_owned()),
+                glob: None,
+                output_mode: Some(String::from("files_with_matches")),
+                before: None,
+                after: None,
+                context_short: None,
+                context: None,
+                line_numbers: None,
+                case_insensitive: None,
+                file_type: None,
+                head_limit: None,
+                offset: None,
+                multiline: None,
+            })
+            .is_err());
     }
 
     #[test]

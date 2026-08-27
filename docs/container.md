@@ -1,4 +1,4 @@
-# Container-first claw-code workflows
+# Container-first Claw Code Bastion workflows
 
 This repo already had **container detection** in the Rust runtime before this document was added:
 
@@ -94,7 +94,7 @@ The `sandbox` command is a useful sanity check: inside Docker or Podman it shoul
 
 ## Bind-mount this repo and another repo at the same time
 
-If you want to run `claw` against a second checkout while keeping `claw-code` itself mounted read-write:
+If you want to run `claw` against a second checkout while keeping the Claw Code Bastion checkout mounted read-write:
 
 ### Docker
 

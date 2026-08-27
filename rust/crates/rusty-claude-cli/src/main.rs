@@ -8,6 +8,7 @@
 )]
 mod init;
 mod input;
+mod provider;
 mod render;
 
 use std::collections::BTreeSet;
@@ -42,18 +43,22 @@ use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    check_base_commit, format_stale_base_warning, format_usd, load_oauth_credentials,
-    load_system_prompt, pricing_for_model, resolve_expected_base, resolve_sandbox_status,
-    ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource,
-    ContentBlock, ConversationMessage, ConversationRuntime, McpServer, McpServerManager,
-    McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode, PermissionPolicy,
-    ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError, Session, TokenUsage,
-    ToolError, ToolExecutor, UsageTracker,
+    check_base_commit, create_disposable_snapshot, format_stale_base_warning, format_usd,
+    load_oauth_credentials, load_system_prompt, pricing_for_model, render_change_summary,
+    require_podman, resolve_expected_base, resolve_sandbox_status, ApiClient, ApiRequest,
+    AssistantEvent, CandidateChange, CandidateChangeSet, CompactionConfig, ConfigLoader,
+    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServer,
+    McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode,
+    PermissionPolicy, PodmanWorkerClient, PodmanWorkerSpec, ProjectContext, PromptCacheEvent,
+    ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
+    UsageTracker, ValidationStatus,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tools::{
-    execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
+    execute_mcp_tool, mvp_tool_specs, ExecutionBackend, GlobalToolRegistry,
+    IsolatedExecutionBackend, LocalExecutionBackend, RuntimeToolDefinition, ToolSearchOutput,
+    UnsafeLocalExecutionPermit,
 };
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
@@ -78,8 +83,8 @@ const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
-const OFFICIAL_REPO_URL: &str = "https://github.com/ultraworkers/claw-code";
-const OFFICIAL_REPO_SLUG: &str = "ultraworkers/claw-code";
+const OFFICIAL_REPO_URL: &str = runtime::release::RELEASE_REPOSITORY_URL;
+const OFFICIAL_REPO_SLUG: &str = runtime::release::RELEASE_REPOSITORY;
 const DEPRECATED_INSTALL_COMMAND: &str = "cargo install claw-code";
 const LATEST_SESSION_REFERENCE: &str = "latest";
 const SESSION_REFERENCE_ALIASES: &[&str] = &[LATEST_SESSION_REFERENCE, "last", "recent"];
@@ -97,9 +102,162 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--resume",
     "--print",
     "--compact",
+    "--isolated",
+    "--no-isolation",
+    "--private",
+    "--allow-remote-provider",
     "--base-commit",
     "-p",
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivacyProfile {
+    Normal,
+    StrictPrivate,
+}
+
+impl PrivacyProfile {
+    fn current() -> Self {
+        if env::var("CLAW_PRIVATE_MODE").as_deref() == Ok("1") {
+            Self::StrictPrivate
+        } else {
+            Self::Normal
+        }
+    }
+
+    const fn is_private(self) -> bool {
+        matches!(self, Self::StrictPrivate)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderPrivacyClass {
+    Local,
+    Confidential,
+    RemoteStandard,
+    Unknown,
+}
+
+impl ProviderPrivacyClass {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Local => "LOCAL",
+            Self::Confidential => "CONFIDENTIAL",
+            Self::RemoteStandard => "REMOTE STANDARD",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+fn is_private_mode() -> bool {
+    PrivacyProfile::current().is_private()
+}
+
+fn validate_private_flags(args: &[String]) -> Result<(), String> {
+    let private = args.iter().any(|arg| arg == "--private");
+    let no_isolation = args.iter().any(|arg| arg == "--no-isolation");
+    let allow_remote_provider = args.iter().any(|arg| arg == "--allow-remote-provider");
+    if private && no_isolation {
+        return Err("--private cannot be combined with --no-isolation".into());
+    }
+    if allow_remote_provider && !private {
+        return Err("--allow-remote-provider requires --private".into());
+    }
+    if private
+        && (args
+            .iter()
+            .any(|arg| arg == "--dangerously-skip-permissions")
+            || args.windows(2).any(|window| {
+                window[0] == "--permission-mode" && window[1] == "danger-full-access"
+            })
+            || args
+                .iter()
+                .any(|arg| arg == "--permission-mode=danger-full-access"))
+    {
+        return Err("--private cannot be combined with unrestricted permission mode".into());
+    }
+    if private
+        && args
+            .iter()
+            .any(|arg| arg == "--resume" || arg.starts_with("--resume="))
+    {
+        return Err(
+            "Session resume is unavailable in strict private mode because private sessions are not persisted."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn provider_endpoint(model: &str) -> String {
+    match detect_provider_kind(model) {
+        ProviderKind::Anthropic => api::read_base_url(),
+        ProviderKind::Xai => api::read_xai_base_url(),
+        ProviderKind::OpenAi => env::var("OPENAI_BASE_URL")
+            .unwrap_or_else(|_| String::from("https://api.openai.com/v1")),
+    }
+}
+
+fn endpoint_host(endpoint: &str) -> Option<&str> {
+    let authority = endpoint.split_once("://")?.1.split('/').next()?;
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    if let Some(host) = authority.strip_prefix('[') {
+        return host.split(']').next();
+    }
+    authority
+        .rsplit_once(':')
+        .map_or(Some(authority), |(host, _)| {
+            if host.contains(':') {
+                Some(authority)
+            } else {
+                Some(host)
+            }
+        })
+}
+
+fn provider_privacy_class(model: &str) -> ProviderPrivacyClass {
+    if env::var("CLAW_PROVIDER_PRIVACY").as_deref() == Ok("confidential") {
+        return ProviderPrivacyClass::Confidential;
+    }
+    let endpoint = provider_endpoint(model);
+    match endpoint_host(&endpoint) {
+        Some("localhost" | "127.0.0.1" | "::1") => ProviderPrivacyClass::Local,
+        Some(_) if endpoint.starts_with("http://") || endpoint.starts_with("https://") => {
+            ProviderPrivacyClass::RemoteStandard
+        }
+        _ => ProviderPrivacyClass::Unknown,
+    }
+}
+
+fn redacted_provider_endpoint(endpoint: &str) -> String {
+    let scheme = endpoint
+        .split_once("://")
+        .map_or("unknown", |(value, _)| value);
+    endpoint_host(endpoint).map_or_else(
+        || String::from("<unparseable endpoint>"),
+        |host| format!("{scheme}://{host}"),
+    )
+}
+
+fn enforce_private_provider(model: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if !is_private_mode() {
+        return Ok(());
+    }
+    let class = provider_privacy_class(model);
+    if matches!(
+        class,
+        ProviderPrivacyClass::RemoteStandard | ProviderPrivacyClass::Unknown
+    ) && env::var("CLAW_PRIVATE_ALLOW_REMOTE_PROVIDER").as_deref() != Ok("1")
+    {
+        return Err(format!(
+            "Private mode requires a local or trusted confidential provider. The configured provider is {} at {} and would receive plaintext prompts, code, and tool results. Use `--allow-remote-provider` for explicit acknowledgement.",
+            class.label(),
+            redacted_provider_endpoint(&provider_endpoint(model)),
+        )
+        .into());
+    }
+    Ok(())
+}
 
 type AllowedToolSet = BTreeSet<String>;
 type RuntimePluginStateBuildOutput = (
@@ -177,9 +335,65 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
     format!("{prompt}\n\n{trimmed}")
 }
 
+#[allow(clippy::too_many_lines)]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
-    match parse_args(&args)? {
+    let private = args.iter().any(|arg| arg == "--private");
+    let no_isolation = args.iter().any(|arg| arg == "--no-isolation");
+    let allow_remote_provider = args.iter().any(|arg| arg == "--allow-remote-provider");
+    validate_private_flags(&args)?;
+    if private {
+        env::set_var("CLAW_PRIVATE_MODE", "1");
+        if allow_remote_provider {
+            env::set_var("CLAW_PRIVATE_ALLOW_REMOTE_PROVIDER", "1");
+        }
+    }
+    let action = parse_args(&args)?;
+    let requires_model_execution =
+        matches!(action, CliAction::Prompt { .. } | CliAction::Repl { .. });
+    if args.iter().any(|arg| arg == "--isolated")
+        || (private && requires_model_execution)
+        || (!no_isolation && requires_model_execution)
+    {
+        require_podman().map_err(|error| {
+            format!(
+                "Secure isolation is unavailable: {error}\n\nInstall/configure rootless Podman or explicitly run `claw --no-isolation`."
+            )
+        })?;
+        env::set_var("CLAW_EXECUTION_MODE", "isolated");
+    } else if no_isolation {
+        env::set_var("CLAW_EXECUTION_MODE", "local");
+    }
+    if args.iter().any(|arg| arg == "--no-isolation")
+        && !args
+            .iter()
+            .any(|arg| arg == "--output-format" || arg.starts_with("--output-format="))
+    {
+        eprintln!("warning: --no-isolation permits model-driven tools to execute under the host user account");
+    }
+    if !io::stdin().is_terminal()
+        && matches!(action, CliAction::Prompt { .. })
+        && !provider::is_configured()
+    {
+        return Err("No model provider is configured. Run `claw provider setup` interactively, or configure the trusted provider environment/settings required for headless operation.".into());
+    }
+    if io::stdin().is_terminal()
+        && matches!(action, CliAction::Repl { .. })
+        && !provider::is_configured()
+    {
+        println!("Welcome to Claw\n\nNo model provider is configured. Let's configure one.\n");
+        provider::run(
+            provider::ProviderAction::Setup {
+                skip_verification: false,
+            },
+            false,
+        )?;
+    }
+    match action {
+        CliAction::Provider {
+            action,
+            output_format,
+        } => provider::run(action, matches!(output_format, CliOutputFormat::Json))?,
         CliAction::DumpManifests {
             output_format,
             manifests_dir,
@@ -247,7 +461,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             cli.set_reasoning_effort(reasoning_effort);
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
-        CliAction::Doctor { output_format } => run_doctor(output_format)?,
+        CliAction::Doctor { output_format } => run_doctor(output_format, false)?,
+        CliAction::PrivacyDoctor { output_format } => run_doctor(output_format, true)?,
+        CliAction::RuntimeDoctor { output_format } => run_runtime_doctor(output_format)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
         CliAction::Export {
@@ -278,6 +494,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliAction {
+    Provider {
+        action: provider::ProviderAction,
+        output_format: CliOutputFormat,
+    },
     DumpManifests {
         output_format: CliOutputFormat,
         manifests_dir: Option<PathBuf>,
@@ -335,6 +555,12 @@ enum CliAction {
         allow_broad_cwd: bool,
     },
     Doctor {
+        output_format: CliOutputFormat,
+    },
+    PrivacyDoctor {
+        output_format: CliOutputFormat,
+    },
+    RuntimeDoctor {
         output_format: CliOutputFormat,
     },
     State {
@@ -400,6 +626,8 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut base_commit: Option<String> = None;
     let mut reasoning_effort: Option<String> = None;
     let mut allow_broad_cwd = false;
+    let mut privacy_diagnostic = false;
+    let mut runtime_diagnostic = false;
     let mut rest: Vec<String> = Vec::new();
     let mut index = 0;
 
@@ -514,6 +742,22 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 allow_broad_cwd = true;
                 index += 1;
             }
+            "--private" | "--allow-remote-provider" => {
+                index += 1;
+            }
+            "--privacy" => {
+                privacy_diagnostic = true;
+                index += 1;
+            }
+            "--runtime" => {
+                runtime_diagnostic = true;
+                index += 1;
+            }
+            "--no-isolation" => {
+                // Explicitly select the legacy local backend. This flag is
+                // intentionally not the default and is kept conspicuous.
+                index += 1;
+            }
             "-p" => {
                 // Claw Code compat: -p "prompt" = one-shot prompt
                 let prompt = args[index + 1..].join(" ");
@@ -580,6 +824,20 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         return Ok(CliAction::Version { output_format });
     }
 
+    if privacy_diagnostic {
+        if rest.len() == 1 && rest[0] == "doctor" {
+            return Ok(CliAction::PrivacyDoctor { output_format });
+        }
+        return Err("--privacy is only supported as `claw doctor --privacy`".to_string());
+    }
+
+    if runtime_diagnostic {
+        if rest.len() == 1 && rest[0] == "doctor" {
+            return Ok(CliAction::RuntimeDoctor { output_format });
+        }
+        return Err("--runtime is only supported as `claw doctor --runtime`".to_string());
+    }
+
     let allowed_tools = normalize_allowed_tools(&allowed_tool_values)?;
 
     if rest.is_empty() {
@@ -630,6 +888,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
 
     match rest[0].as_str() {
+        "provider" => parse_provider_args(&rest[1..], output_format),
         "dump-manifests" => parse_dump_manifests_args(&rest[1..], output_format),
         "bootstrap-plan" => Ok(CliAction::BootstrapPlan { output_format }),
         "agents" => Ok(CliAction::Agents {
@@ -704,6 +963,34 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             allow_broad_cwd,
         }),
     }
+}
+
+fn parse_provider_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
+    let action = match args {
+        [] => provider::ProviderAction::Status,
+        [command] if command == "status" => provider::ProviderAction::Status,
+        [command] if command == "setup" || command == "change" => provider::ProviderAction::Setup {
+            skip_verification: false,
+        },
+        [command, flag]
+            if (command == "setup" || command == "change") && flag == "--skip-verification" =>
+        {
+            provider::ProviderAction::Setup {
+                skip_verification: true,
+            }
+        }
+        [flag] if flag == "--skip-verification" => {
+            return Err("--skip-verification is only valid with `claw provider setup`".to_string())
+        }
+        _ => return Err("usage: claw provider [status|setup]".to_string()),
+    };
+    Ok(CliAction::Provider {
+        action,
+        output_format,
+    })
 }
 
 fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>> {
@@ -917,7 +1204,7 @@ fn omc_compatibility_note_for_unknown_slash_command(name: &str) -> Option<&'stat
 }
 
 fn render_suggestion_line(label: &str, suggestions: &[String]) -> Option<String> {
-    (!suggestions.is_empty()).then(|| format!("  {label:<16} {}", suggestions.join(", "),))
+    (!suggestions.is_empty()).then(|| format!("  {label:<16} {}", suggestions.join(", ")))
 }
 
 fn suggest_slash_commands(input: &str) -> Vec<String> {
@@ -1080,7 +1367,7 @@ fn default_permission_mode() -> PermissionMode {
         .and_then(normalize_permission_mode)
         .map(permission_mode_from_label)
         .or_else(config_permission_mode_for_current_dir)
-        .unwrap_or(PermissionMode::DangerFullAccess)
+        .unwrap_or(PermissionMode::WorkspaceWrite)
 }
 
 fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
@@ -1488,7 +1775,25 @@ fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
     })
 }
 
-fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+fn run_doctor(
+    output_format: CliOutputFormat,
+    privacy_only: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if privacy_only {
+        let message = render_privacy_report();
+        match output_format {
+            CliOutputFormat::Text => println!("{message}"),
+            CliOutputFormat::Json => println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "privacy",
+                    "message": message,
+                    "private": is_private_mode(),
+                }))?
+            ),
+        }
+        return Ok(());
+    }
     let report = render_doctor_report()?;
     let message = report.render();
     match output_format {
@@ -1503,11 +1808,128 @@ fn run_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+fn run_runtime_doctor(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let image = runtime::RuntimeImage::resolve();
+    let resolved = image.resolved_id().unwrap_or("NOT AVAILABLE");
+    let message = format!(
+        "Claw Runtime Status\n────────────────────\n\nExecution\n  Isolation              rootless Podman\n  Runtime source         {}\n  Configured image       {}\n  Resolved image         {resolved}\n  Candidate workspace    /workspace/project\n  Network                none\n\nRuntime requirements\n  /bin/sh                image-provided\n  git                    image-provided\n\nFeature policy\n  MCP/hooks/plugins      selected image only\n  Host executable mount  NO\n  Host fallback          NO",
+        if image.is_custom() { "trusted custom override" } else { "Claw release standard" },
+        image.configured_ref(),
+    );
+    match output_format {
+        CliOutputFormat::Text => println!("{message}"),
+        CliOutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "kind": "runtime",
+                "configured_image": image.configured_ref(),
+                "resolved_image": image.resolved_id(),
+                "source": if image.is_custom() { "custom" } else { "standard" },
+                "available": image.is_available(),
+                "network": "none",
+                "host_executable_mount": false,
+                "host_fallback": false,
+            }))?
+        ),
+    }
+    if image.is_available() {
+        Ok(())
+    } else {
+        Err(format!(
+            "runtime image `{}` is unavailable; {} before isolated execution",
+            image.configured_ref(),
+            if image.is_custom() {
+                "build or select the trusted custom image"
+            } else {
+                "pull the release runtime with `podman pull`"
+            }
+        )
+        .into())
+    }
+}
+
+fn render_privacy_report() -> String {
+    let profile = PrivacyProfile::current();
+    let cwd = env::current_dir().unwrap_or_default();
+    let model = ConfigLoader::default_for(&cwd)
+        .load()
+        .ok()
+        .and_then(|config| config.model().map(str::to_string))
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let endpoint = provider_endpoint(&model);
+    let provider_class = provider_privacy_class(&model);
+    let remote_acknowledged = env::var("CLAW_PRIVATE_ALLOW_REMOTE_PROVIDER").as_deref() == Ok("1");
+    let mut lines = vec![
+        String::from("Claw Privacy Status"),
+        String::from("───────────────────"),
+        String::new(),
+        format!("Profile\n  Strict private mode             {}", if profile.is_private() { "ON" } else { "OFF" }),
+        String::new(),
+        format!(
+            "Execution\n  Backend                         {}\n  Local execution                 {}\n  Worker network                  {}\n  Canonical repo mounted          {}\n  Host HOME exposed               {}\n  Host credentials exposed        {}\n  Candidate review                REQUIRED\n  Validation                      REQUIRED\n  Explicit Apply                  REQUIRED",
+            if profile.is_private() { "Rootless Podman" } else { "Configured runtime" },
+            if profile.is_private() { "DISABLED" } else { "Explicit opt-in only" },
+            if profile.is_private() { "NONE" } else { "Profile dependent" },
+            "NO",
+            "NO",
+            "NO",
+        ),
+        String::new(),
+        format!(
+            "Persistence\n  Conversation recording          {}\n  Session persistence             {}\n  Prompt cache                    {}\n  Telemetry                       {}",
+            if profile.is_private() { "OFF" } else { "ON" },
+            if profile.is_private() { "OFF" } else { "ON" },
+            if profile.is_private() { "OFF" } else { "Anthropic only" },
+            "OFF in CLI runtime",
+        ),
+        String::new(),
+        format!(
+            "External capabilities\n  WebFetch                        {}\n  WebSearch                       {}\n  MCP                             {}\n  Hooks                           {}\n  Plugins                         {}\n  PowerShell                      DISABLED",
+            if profile.is_private() { "OFF" } else { "Network policy" },
+            if profile.is_private() { "OFF" } else { "Network policy" },
+            if profile.is_private() { "Isolated stdio only" } else { "Isolated stdio or host" },
+            if profile.is_private() { "Isolated short-lived only" } else { "Config dependent" },
+            if profile.is_private() { "Isolated executable subset" } else { "Config dependent" },
+        ),
+        String::new(),
+        format!(
+            "Inference\n  Provider                        {}\n  Endpoint                        {}\n  Privacy class                   {}{}\n  Provider fallback               OFF\n  Secondary model calls           OFF",
+            provider_label(detect_provider_kind(&model)),
+            redacted_provider_endpoint(&endpoint),
+            provider_class.label(),
+            if provider_class == ProviderPrivacyClass::Confidential {
+                " (configured; not independently attested)"
+            } else {
+                ""
+            },
+        ),
+        String::new(),
+        format!(
+            "Resume                         {}",
+            if profile.is_private() { "DISABLED (sessions are not persisted)" } else { "AVAILABLE" }
+        ),
+    ];
+    if profile.is_private()
+        && matches!(
+            provider_class,
+            ProviderPrivacyClass::RemoteStandard | ProviderPrivacyClass::Unknown
+        )
+    {
+        lines.push(String::new());
+        lines.push(if remote_acknowledged {
+            String::from("WARNING: the selected conventional provider receives plaintext prompts, code, and tool results; this was explicitly acknowledged.")
+        } else {
+            String::from("WARNING: this provider is not local/confidential. Private mode will refuse startup unless --allow-remote-provider is supplied.")
+        });
+    }
+    lines.join("\n")
+}
+
 /// Starts a minimal Model Context Protocol server that exposes claw's
 /// built-in tools over stdio.
 ///
 /// Tool descriptors come from [`tools::mvp_tool_specs`] and calls are
-/// dispatched through [`tools::execute_tool`], so this server exposes exactly
+/// dispatched through [`tools::execute_mcp_tool`], so this server exposes exactly
 /// Read `.claw/worker-state.json` from the current working directory and print it.
 /// This is the file-based worker observability surface: `push_event()` in `worker_boot.rs`
 /// atomically writes state transitions here so external observers (clawhip, orchestrators)
@@ -1556,7 +1978,7 @@ fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
         server_name: "claw".to_string(),
         server_version: VERSION.to_string(),
         tools,
-        tool_handler: Box::new(execute_tool),
+        tool_handler: Box::new(execute_mcp_tool),
     };
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1571,12 +1993,9 @@ fn run_mcp_serve() -> Result<(), Box<dyn std::error::Error>> {
 
 #[allow(clippy::too_many_lines)]
 fn check_auth_health() -> DiagnosticCheck {
-    let api_key_present = env::var("ANTHROPIC_API_KEY")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty());
-    let auth_token_present = env::var("ANTHROPIC_AUTH_TOKEN")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty());
+    let api_key_present = env::var("ANTHROPIC_API_KEY").is_ok_and(|value| !value.trim().is_empty());
+    let auth_token_present =
+        env::var("ANTHROPIC_AUTH_TOKEN").is_ok_and(|value| !value.trim().is_empty());
     let env_details = format!(
         "Environment       api_key={} auth_token={}",
         if api_key_present { "present" } else { "absent" },
@@ -3137,6 +3556,21 @@ struct LiveCli {
     runtime: BuiltRuntime,
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
+    candidate_state: CandidateLifecycleState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateLifecycleState {
+    Editing,
+    ReviewReady,
+    Applied,
+    Discarded,
+}
+
+impl CandidateLifecycleState {
+    fn reuses_candidate(self) -> bool {
+        matches!(self, Self::Editing | Self::ReviewReady)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3211,6 +3645,12 @@ impl BuiltRuntime {
         }
         Ok(())
     }
+
+    fn execution_backend(&self) -> Option<Arc<Mutex<dyn ExecutionBackend>>> {
+        self.runtime
+            .as_ref()
+            .and_then(|runtime| runtime.tool_executor().execution_backend())
+    }
 }
 
 impl Deref for BuiltRuntime {
@@ -3235,6 +3675,25 @@ impl Drop for BuiltRuntime {
     fn drop(&mut self) {
         let _ = self.shutdown_mcp();
         let _ = self.shutdown_plugins();
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CandidateReviewAction {
+    Apply,
+    ApplyAnyway,
+    RequestChanges,
+    Discard,
+}
+
+fn format_validation_status(status: runtime::ValidationStatus) -> &'static str {
+    match status {
+        runtime::ValidationStatus::Pass => "PASS",
+        runtime::ValidationStatus::Fail => "FAIL",
+        runtime::ValidationStatus::Blocked => "BLOCKED",
+        runtime::ValidationStatus::Timeout => "TIMEOUT",
+        runtime::ValidationStatus::Error => "ERROR",
+        runtime::ValidationStatus::Skipped => "SKIPPED",
     }
 }
 
@@ -3266,8 +3725,17 @@ struct ReadMcpResourceRequest {
 impl RuntimeMcpState {
     fn new(
         runtime_config: &runtime::RuntimeConfig,
+        isolated_workspace: Option<std::path::PathBuf>,
     ) -> Result<Option<(Self, runtime::McpToolDiscoveryReport)>, Box<dyn std::error::Error>> {
-        let mut manager = McpServerManager::from_runtime_config(runtime_config);
+        let mut manager = match isolated_workspace {
+            Some(workspace) => McpServerManager::from_servers_isolated(
+                runtime_config.mcp().servers(),
+                workspace,
+                std::env::var("CLAW_WORKER_IMAGE")
+                    .unwrap_or_else(|_| String::from("claw-exec:latest")),
+            ),
+            None => McpServerManager::from_runtime_config(runtime_config),
+        };
         if manager.server_names().is_empty() && manager.unsupported_servers().is_empty() {
             return Ok(None);
         }
@@ -3454,8 +3922,10 @@ impl RuntimeMcpState {
 
 fn build_runtime_mcp_state(
     runtime_config: &runtime::RuntimeConfig,
+    isolated_workspace: Option<std::path::PathBuf>,
 ) -> Result<RuntimePluginStateBuildOutput, Box<dyn std::error::Error>> {
-    let Some((mcp_state, discovery)) = RuntimeMcpState::new(runtime_config)? else {
+    let Some((mcp_state, discovery)) = RuntimeMcpState::new(runtime_config, isolated_workspace)?
+    else {
         return Ok((None, Vec::new()));
     };
 
@@ -3626,8 +4096,13 @@ impl LiveCli {
         let system_prompt = build_system_prompt()?;
         let session_state = new_cli_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
+        let session_state = if is_private_mode() {
+            session_state
+        } else {
+            session_state.with_persistence_path(session.path.clone())
+        };
         let runtime = build_runtime(
-            session_state.with_persistence_path(session.path.clone()),
+            session_state,
             &session.id,
             model.clone(),
             system_prompt.clone(),
@@ -3645,6 +4120,7 @@ impl LiveCli {
             runtime,
             session,
             prompt_history: Vec::new(),
+            candidate_state: CandidateLifecycleState::Editing,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -3715,8 +4191,20 @@ impl LiveCli {
         &self,
         emit_output: bool,
     ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
+        let retained_backend = if self.candidate_state.reuses_candidate() {
+            self.runtime.execution_backend()
+        } else {
+            None
+        };
+        if let Some(backend) = &retained_backend {
+            backend
+                .lock()
+                .map_err(|_| "execution backend lock poisoned")?
+                .resume_candidate()
+                .map_err(std::io::Error::other)?;
+        }
         let hook_abort_signal = runtime::HookAbortSignal::new();
-        let runtime = build_runtime(
+        let runtime = build_runtime_with_backend(
             self.runtime.session().clone(),
             &self.session.id,
             self.model.clone(),
@@ -3726,6 +4214,7 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            retained_backend,
         )?
         .with_hook_abort_signal(hook_abort_signal.clone());
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
@@ -3753,6 +4242,7 @@ impl LiveCli {
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
+                self.review_candidate_changes(&mut runtime)?;
                 self.replace_runtime(runtime)?;
                 spinner.finish(
                     "✨ Done",
@@ -3770,6 +4260,8 @@ impl LiveCli {
                 Ok(())
             }
             Err(error) => {
+                let _ = runtime.discard_candidate();
+                self.candidate_state = CandidateLifecycleState::Discarded;
                 runtime.shutdown_plugins()?;
                 spinner.fail(
                     "❌ Request failed",
@@ -3799,7 +4291,15 @@ impl LiveCli {
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
-        let summary = result?;
+        let summary = match result {
+            Ok(summary) => summary,
+            Err(error) => {
+                let _ = runtime.discard_candidate();
+                self.candidate_state = CandidateLifecycleState::Discarded;
+                return Err(Box::new(error));
+            }
+        };
+        self.review_candidate_changes(&mut runtime)?;
         self.replace_runtime(runtime)?;
         self.persist_session()?;
         let final_text = final_assistant_text(&summary);
@@ -3812,7 +4312,15 @@ impl LiveCli {
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
-        let summary = result?;
+        let summary = match result {
+            Ok(summary) => summary,
+            Err(error) => {
+                let _ = runtime.discard_candidate();
+                self.candidate_state = CandidateLifecycleState::Discarded;
+                return Err(Box::new(error));
+            }
+        };
+        self.review_candidate_changes(&mut runtime)?;
         self.replace_runtime(runtime)?;
         self.persist_session()?;
         println!(
@@ -3842,6 +4350,143 @@ impl LiveCli {
                 )
             })
         );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn review_candidate_changes(
+        &mut self,
+        runtime: &mut BuiltRuntime,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(changes) = runtime.finish_candidate()? else {
+            return Ok(());
+        };
+
+        if changes.changes.is_empty() {
+            self.candidate_state = CandidateLifecycleState::Editing;
+            return Ok(());
+        }
+
+        if !io::stdin().is_terminal() {
+            runtime.discard_candidate()?;
+            self.candidate_state = CandidateLifecycleState::Discarded;
+            return Ok(());
+        }
+
+        let validation = runtime.validate_candidate(&changes)?;
+        self.candidate_state = CandidateLifecycleState::ReviewReady;
+        let policy = runtime::ValidationPolicy::default();
+        let normal_apply_allowed = validation.allows_apply(changes.id, policy, false);
+        let blocked_apply_allowed = validation.allows_apply(changes.id, policy, true);
+
+        let action = loop {
+            println!("\nCandidate change set detected (id: {})", changes.id);
+            println!(
+                "  Added:   {}",
+                changes
+                    .changes
+                    .iter()
+                    .filter(|c| matches!(c, CandidateChange::Add { .. }))
+                    .count()
+            );
+            println!(
+                "  Modified: {}",
+                changes
+                    .changes
+                    .iter()
+                    .filter(|c| matches!(c, CandidateChange::Modify { .. }))
+                    .count()
+            );
+            println!(
+                "  Deleted: {}",
+                changes
+                    .changes
+                    .iter()
+                    .filter(|c| matches!(c, CandidateChange::Delete { .. }))
+                    .count()
+            );
+            let review_summary = render_change_summary(&changes, 12 * 1024);
+            if review_summary.is_empty() {
+                println!("  Changes:  unavailable for summary");
+            } else {
+                println!("\n{review_summary}");
+            }
+            println!("\nValidation (id: {})", validation.validation_identity);
+            for check in &validation.checks {
+                println!(
+                    "  {:<8} {}",
+                    format_validation_status(check.status),
+                    check.name
+                );
+                if !check.stderr.is_empty() {
+                    println!("             {}", truncate_for_summary(&check.stderr, 240));
+                }
+            }
+            println!("\nWhat should happen now?");
+            if normal_apply_allowed {
+                println!("  [a] Apply all changes to canonical workspace");
+            } else if blocked_apply_allowed {
+                println!(
+                    "  [x] Apply anyway (validation incomplete; explicit confirmation required)"
+                );
+            } else {
+                println!("  Apply unavailable until validation passes");
+            }
+            println!("  [r] Request changes (discard and continue)");
+            println!("  [d] Discard candidate changes");
+            print!(
+                "Select [a/r/d{}] [default: r]: ",
+                if blocked_apply_allowed { "/x" } else { "" }
+            );
+            io::stdout().flush()?;
+
+            let mut response = String::new();
+            io::stdin().read_line(&mut response)?;
+            match response.trim().to_lowercase().as_str() {
+                "a" if normal_apply_allowed => break CandidateReviewAction::Apply,
+                "x" if blocked_apply_allowed => break CandidateReviewAction::ApplyAnyway,
+                "r" | "request" | "" => break CandidateReviewAction::RequestChanges,
+                "d" | "discard" => break CandidateReviewAction::Discard,
+                _ => {
+                    println!("Invalid response. Use a, r, or d.");
+                }
+            }
+        };
+
+        match action {
+            CandidateReviewAction::Apply => {
+                runtime.apply_candidate_changes(&changes, &validation, false)?;
+                runtime.discard_candidate()?;
+                self.candidate_state = CandidateLifecycleState::Applied;
+                println!("✅ Candidate changes applied.");
+            }
+            CandidateReviewAction::ApplyAnyway => {
+                print!("Validation is incomplete. Type APPLY ANYWAY to continue: ");
+                io::stdout().flush()?;
+                let mut confirmation = String::new();
+                io::stdin().read_line(&mut confirmation)?;
+                if confirmation.trim() != "APPLY ANYWAY" {
+                    runtime.discard_candidate()?;
+                    self.candidate_state = CandidateLifecycleState::Discarded;
+                    println!("Candidate discarded; apply was not confirmed.");
+                    return Ok(());
+                }
+                runtime.apply_candidate_changes(&changes, &validation, true)?;
+                runtime.discard_candidate()?;
+                self.candidate_state = CandidateLifecycleState::Applied;
+                println!("✅ Candidate changes applied with validation override.");
+            }
+            CandidateReviewAction::RequestChanges => {
+                self.candidate_state = CandidateLifecycleState::Editing;
+                println!("↻ Candidate retained. Enter the next refinement for the agent.");
+            }
+            CandidateReviewAction::Discard => {
+                runtime.discard_candidate()?;
+                self.candidate_state = CandidateLifecycleState::Discarded;
+                println!("Candidate discarded.");
+            }
+        }
+
         Ok(())
     }
 
@@ -4019,6 +4664,9 @@ impl LiveCli {
     }
 
     fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if is_private_mode() {
+            return Ok(());
+        }
         self.runtime.session().save_to_path(&self.session.path)?;
         Ok(())
     }
@@ -5329,7 +5977,7 @@ fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
             } else {
                 preview
             };
-            lines.push(format!("  {}. {}", index + 1, file.path.display(),));
+            lines.push(format!("  {}. {}", index + 1, file.path.display()));
             lines.push(format!(
                 "     lines={} preview={}",
                 file.content.lines().count(),
@@ -5410,8 +6058,7 @@ fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Erro
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(cwd)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .is_ok_and(|o| o.status.success());
     if !in_git_repo {
         return Ok(format!(
             "Diff\n  Result           no git repository\n  Detail           {} is not inside a git project",
@@ -5443,8 +6090,7 @@ fn render_diff_json_for(cwd: &Path) -> Result<serde_json::Value, Box<dyn std::er
         .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(cwd)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .is_ok_and(|o| o.status.success());
     if !in_git_repo {
         return Ok(serde_json::json!({
             "kind": "diff",
@@ -5672,8 +6318,7 @@ fn command_exists(name: &str) -> bool {
     Command::new("which")
         .arg(name)
         .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|output| output.status.success())
 }
 
 fn write_temp_text_file(
@@ -5750,7 +6395,7 @@ fn render_prompt_history_report(entries: &[PromptHistoryEntry], limit: usize) ->
         "Prompt history".to_string(),
         format!("  Total            {total}"),
         format!("  Showing          {} most recent", shown.len()),
-        format!("  Reverse search   Ctrl-R in the REPL"),
+        "  Reverse search   Ctrl-R in the REPL".to_string(),
         String::new(),
     ];
     for (offset, entry) in shown.iter().enumerate() {
@@ -5851,7 +6496,7 @@ fn render_version_report() -> String {
     let git_sha = GIT_SHA.unwrap_or("unknown");
     let target = BUILD_TARGET.unwrap_or("unknown");
     format!(
-        "Claw Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
+        "Claw Code Bastion\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
     )
 }
 
@@ -6128,6 +6773,16 @@ fn build_runtime_plugin_state_with_loader(
     loader: &ConfigLoader,
     runtime_config: &runtime::RuntimeConfig,
 ) -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
+    build_runtime_plugin_state_with_loader_and_backend(cwd, loader, runtime_config, None)
+}
+
+fn build_runtime_plugin_state_with_loader_and_backend(
+    cwd: &Path,
+    loader: &ConfigLoader,
+    runtime_config: &runtime::RuntimeConfig,
+    execution_backend: Option<Arc<Mutex<dyn ExecutionBackend>>>,
+) -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
+    let isolated = env::var("CLAW_EXECUTION_MODE").as_deref() == Ok("isolated");
     let plugin_manager = build_plugin_manager(cwd, loader, runtime_config);
     let plugin_registry = plugin_manager.plugin_registry()?;
     let plugin_hook_config =
@@ -6136,15 +6791,59 @@ fn build_runtime_plugin_state_with_loader(
         .feature_config()
         .clone()
         .with_hooks(runtime_config.hooks().merged(&plugin_hook_config));
-    let (mcp_state, runtime_tools) = build_runtime_mcp_state(runtime_config)?;
-    let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_registry.aggregated_tools()?)?
-        .with_runtime_tools(runtime_tools)?;
+    let plugin_tools = plugin_registry.aggregated_tools()?;
+    let execution_backend = match execution_backend {
+        Some(backend) => backend,
+        None => execution_backend_for(cwd)?,
+    };
+    let isolated_workspace = if isolated {
+        execution_backend
+            .lock()
+            .map_err(|_| "execution backend lock poisoned")?
+            .isolated_workspace_root()
+    } else {
+        None
+    };
+    let (mcp_state, runtime_tools) = build_runtime_mcp_state(runtime_config, isolated_workspace)?;
+    let tool_registry = GlobalToolRegistry::with_plugin_tools(plugin_tools)?
+        .with_runtime_tools(runtime_tools)?
+        .with_execution_backend(execution_backend);
     Ok(RuntimePluginState {
         feature_config,
         tool_registry,
         plugin_registry,
         mcp_state,
     })
+}
+
+fn execution_backend_for(
+    cwd: &Path,
+) -> Result<Arc<Mutex<dyn ExecutionBackend>>, Box<dyn std::error::Error>> {
+    if env::var("CLAW_EXECUTION_MODE").as_deref() == Ok("isolated") {
+        let snapshot = create_disposable_snapshot(cwd)?;
+        let image = runtime::RuntimeImage::configured();
+        let spec = PodmanWorkerSpec {
+            image,
+            workspace: snapshot.candidate.root.clone(),
+            worker: String::from("/usr/local/bin/claw-exec-worker"),
+        };
+        let client = PodmanWorkerClient::spawn(&spec)?;
+        Ok(Arc::new(Mutex::new(IsolatedExecutionBackend::new(
+            client, snapshot, spec,
+        ))))
+    } else {
+        let permit = UnsafeLocalExecutionPermit::from_explicit_cli_opt_in();
+        let enforcer = runtime::permission_enforcer::PermissionEnforcer::new(
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        );
+        Ok(Arc::new(Mutex::new(
+            LocalExecutionBackend::from_explicit_permit(
+                permit,
+                enforcer,
+                runtime::NetworkCapability::unrestricted(),
+            ),
+        )))
+    }
 }
 
 fn build_plugin_manager(
@@ -6532,7 +7231,35 @@ fn build_runtime(
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
-    let runtime_plugin_state = build_runtime_plugin_state()?;
+    build_runtime_with_backend(
+        session,
+        session_id,
+        model,
+        system_prompt,
+        enable_tools,
+        emit_output,
+        allowed_tools,
+        permission_mode,
+        progress_reporter,
+        None,
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_arguments)]
+fn build_runtime_with_backend(
+    session: Session,
+    session_id: &str,
+    model: String,
+    system_prompt: Vec<String>,
+    enable_tools: bool,
+    emit_output: bool,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    progress_reporter: Option<InternalPromptProgressReporter>,
+    execution_backend: Option<Arc<Mutex<dyn ExecutionBackend>>>,
+) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
+    let runtime_plugin_state = build_runtime_plugin_state_with_backend(execution_backend)?;
     build_runtime_with_plugin_state(
         session,
         session_id,
@@ -6567,13 +7294,18 @@ fn build_runtime_with_plugin_state(
     }
     let RuntimePluginState {
         feature_config,
-        tool_registry,
+        mut tool_registry,
         plugin_registry,
         mcp_state,
     } = runtime_plugin_state;
-    plugin_registry.initialize()?;
+    if env::var("CLAW_EXECUTION_MODE").as_deref() != Ok("isolated") {
+        plugin_registry.initialize()?;
+    }
     let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
+    tool_registry = tool_registry.with_enforcer(
+        runtime::permission_enforcer::PermissionEnforcer::new(policy.clone()),
+    );
     let mut runtime = ConversationRuntime::new_with_features(
         session,
         AnthropicRuntimeClient::new(
@@ -6595,10 +7327,31 @@ fn build_runtime_with_plugin_state(
         system_prompt,
         &feature_config,
     );
+    if env::var("CLAW_EXECUTION_MODE").as_deref() == Ok("isolated") {
+        if let Some(backend) = tool_registry.execution_backend() {
+            runtime = runtime.with_hook_command_executor(Arc::new(
+                tools::BackendHookCommandExecutor::new(backend),
+            ));
+        }
+    }
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
     Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
+}
+
+fn build_runtime_plugin_state_with_backend(
+    execution_backend: Option<Arc<Mutex<dyn ExecutionBackend>>>,
+) -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let runtime_config = loader.load()?;
+    build_runtime_plugin_state_with_loader_and_backend(
+        &cwd,
+        &loader,
+        &runtime_config,
+        execution_backend,
+    )
 }
 
 struct CliHookProgressReporter;
@@ -6732,12 +7485,15 @@ impl AnthropicRuntimeClient {
         // prompt cache is Anthropic-only so non-Anthropic variants
         // skip it.
         let resolved_model = api::resolve_model_alias(&model);
+        enforce_private_provider(&resolved_model)?;
         let client = match detect_provider_kind(&resolved_model) {
             ProviderKind::Anthropic => {
                 let auth = resolve_cli_auth_source()?;
-                let inner = AnthropicClient::from_auth(auth)
-                    .with_base_url(api::read_base_url())
-                    .with_prompt_cache(PromptCache::new(session_id));
+                let mut inner =
+                    AnthropicClient::from_auth(auth).with_base_url(api::read_base_url());
+                if !is_private_mode() {
+                    inner = inner.with_prompt_cache(PromptCache::new(session_id));
+                }
                 ApiProviderClient::Anthropic(inner)
             }
             ProviderKind::Xai | ProviderKind::OpenAi => {
@@ -7944,6 +8700,24 @@ impl CliToolExecutor {
         }
     }
 
+    fn execution_backend(&self) -> Option<Arc<Mutex<dyn ExecutionBackend>>> {
+        self.tool_registry.execution_backend()
+    }
+
+    fn stop_isolated_mcp(&mut self) -> Result<(), ToolError> {
+        if env::var("CLAW_EXECUTION_MODE").as_deref() != Ok("isolated") {
+            return Ok(());
+        }
+        if let Some(mcp_state) = &self.mcp_state {
+            mcp_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .shutdown()
+                .map_err(|error| ToolError::new(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     fn execute_search_tool(&self, value: serde_json::Value) -> Result<String, ToolError> {
         let input: ToolSearchRequest = serde_json::from_value(value)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
@@ -8006,7 +8780,58 @@ impl CliToolExecutor {
 }
 
 impl ToolExecutor for CliToolExecutor {
+    fn finish_candidate(&mut self) -> Result<Option<CandidateChangeSet>, ToolError> {
+        self.stop_isolated_mcp()?;
+        self.tool_registry
+            .finish_candidate()
+            .map_err(ToolError::new)
+    }
+
+    fn apply_candidate_changes(
+        &mut self,
+        changes: &CandidateChangeSet,
+        validation: &runtime::validator::ValidationResult,
+        blocked_override: bool,
+    ) -> Result<(), ToolError> {
+        self.stop_isolated_mcp()?;
+        self.tool_registry
+            .apply_candidate_changes(changes, validation, blocked_override)
+            .map_err(ToolError::new)
+    }
+
+    fn discard_candidate(&mut self) -> Result<(), ToolError> {
+        self.stop_isolated_mcp()?;
+        self.tool_registry
+            .discard_candidate()
+            .map_err(ToolError::new)
+    }
+
+    fn resume_candidate(&mut self) -> Result<(), ToolError> {
+        self.tool_registry
+            .resume_candidate()
+            .map_err(ToolError::new)
+    }
+
+    fn validate_candidate(
+        &mut self,
+        changes: &CandidateChangeSet,
+    ) -> Result<runtime::validator::ValidationResult, ToolError> {
+        self.tool_registry
+            .validate_candidate(changes)
+            .map_err(ToolError::new)
+    }
+
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        if is_private_mode()
+            && matches!(
+                tool_name,
+                "WebFetch" | "WebSearch" | "web_fetch" | "web_search"
+            )
+        {
+            return Err(ToolError::new(format!(
+                "{tool_name} is denied by strict private mode"
+            )));
+        }
         if self
             .allowed_tools
             .as_ref()
@@ -8191,6 +9016,8 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  --dangerously-skip-permissions  Skip all permission checks"
     )?;
     writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
+    writeln!(out, "  --private                  Require isolated execution and disable persistence/secondary network features")?;
+    writeln!(out, "  --allow-remote-provider    In private mode, explicitly acknowledge plaintext remote inference")?;
     writeln!(
         out,
         "  --version, -V              Print version and build information locally"
@@ -8247,6 +9074,26 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  do not run `{DEPRECATED_INSTALL_COMMAND}` — it installs a deprecated stub"
     )?;
+    writeln!(out, "  claw doctor --privacy")?;
+    writeln!(
+        out,
+        "      Show the resolved execution, persistence, capability, and provider privacy profile"
+    )?;
+    writeln!(out, "  claw doctor --runtime")?;
+    writeln!(
+        out,
+        "      Show the selected isolated runtime image and resolved image identity"
+    )?;
+    writeln!(out, "  claw provider status")?;
+    writeln!(
+        out,
+        "      Show the resolved provider, endpoint, privacy class, and credential source"
+    )?;
+    writeln!(out, "  claw provider setup")?;
+    writeln!(
+        out,
+        "      Configure a trusted user provider selection without storing secrets"
+    )?;
     writeln!(out, "  claw init")?;
     writeln!(out, "  claw export")?;
     writeln!(out, "  claw export conversation.md")?;
@@ -8274,31 +9121,33 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 mod tests {
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        collect_session_prompt_history, create_managed_session_handle, describe_tool_progress,
-        filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
-        format_commit_skipped_report, format_compact_report, format_connected_line,
-        format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        format_ultraplan_report, format_unknown_slash_command,
+        collect_session_prompt_history, create_managed_session_handle, default_permission_mode,
+        describe_tool_progress, endpoint_host, filter_tool_specs, format_bughunter_report,
+        format_commit_preflight_report, format_commit_skipped_report, format_compact_report,
+        format_connected_line, format_cost_report, format_history_timestamp,
+        format_internal_prompt_progress_line, format_issue_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
+        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
         merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        parse_history_count, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
-        render_prompt_history_report, render_repl_help, render_resume_usage,
-        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
-        resolve_repl_model, resolve_session_reference, response_to_events,
-        resume_supported_slash_commands, run_resume_command, short_tool_id,
+        parse_history_count, permission_policy, print_help_to, provider_privacy_class,
+        push_output_block, render_config_report, render_diff_report, render_diff_report_for,
+        render_memory_report, render_privacy_report, render_prompt_history_report,
+        render_repl_help, render_resume_usage, render_session_markdown, resolve_model_alias,
+        resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
+        response_to_events, resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context,
         summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
-        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+        validate_private_flags, write_mcp_server_fixture, CandidateLifecycleState, CliAction,
+        CliOutputFormat, CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
+        InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry,
+        ProviderPrivacyClass, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
         STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
+    use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
@@ -8307,6 +9156,7 @@ mod tests {
         ConversationMessage, MessageRole, OAuthConfig, PermissionMode, Session, ToolExecutor,
     };
     use serde_json::json;
+    use std::env;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -8339,6 +9189,245 @@ mod tests {
             None,
         )])
         .expect("plugin tool registry should build")
+    }
+
+    #[test]
+    fn candidate_lifecycle_reuses_only_non_terminal_candidates() {
+        assert!(CandidateLifecycleState::Editing.reuses_candidate());
+        assert!(CandidateLifecycleState::ReviewReady.reuses_candidate());
+        assert!(!CandidateLifecycleState::Applied.reuses_candidate());
+        assert!(!CandidateLifecycleState::Discarded.reuses_candidate());
+    }
+
+    #[test]
+    fn private_cli_flags_and_privacy_doctor_parse_without_becoming_prompts() {
+        assert!(matches!(
+            parse_args(&[
+                "--private".to_string(),
+                "--allow-remote-provider".to_string()
+            ]),
+            Ok(CliAction::Repl { .. })
+        ));
+        assert!(matches!(
+            parse_args(&["doctor".to_string(), "--privacy".to_string()]),
+            Ok(CliAction::PrivacyDoctor { .. })
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::items_after_statements)]
+    fn private_provider_security_assertions() {
+        for args in [
+            vec!["--private", "--no-isolation"],
+            vec!["--private", "--dangerously-skip-permissions"],
+            vec!["--private", "--permission-mode=danger-full-access"],
+            vec!["--private", "--resume", "session.jsonl"],
+        ] {
+            let args = args.into_iter().map(String::from).collect::<Vec<_>>();
+            assert!(validate_private_flags(&args).is_err());
+        }
+        let claw = std::env::current_exe()
+            .expect("test executable path")
+            .parent()
+            .and_then(Path::parent)
+            .expect("target debug directory")
+            .join("claw");
+        for args in [
+            ["--private", "--no-isolation"].as_slice(),
+            ["--private", "--dangerously-skip-permissions"].as_slice(),
+            ["--private", "--resume", "session.jsonl"].as_slice(),
+        ] {
+            let output = Command::new(&claw)
+                .args(args)
+                .output()
+                .expect("claw binary should launch");
+            assert!(!output.status.success());
+        }
+        println!("CLAW_SECURITY_ASSERTION private_no_resume PASS");
+
+        let private_was_set = env::var_os("CLAW_PRIVATE_MODE");
+        env::set_var("CLAW_PRIVATE_MODE", "1");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("private web listener");
+        listener
+            .set_nonblocking(true)
+            .expect("private web listener nonblocking");
+        let listener_addr = listener.local_addr().expect("private web listener address");
+        let trusted_probe = std::net::TcpStream::connect(listener_addr)
+            .expect("trusted host should reach private web listener");
+        drop(trusted_probe);
+        for _ in 0..20 {
+            if listener.accept().is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut executor =
+            CliToolExecutor::new(None, false, tools::GlobalToolRegistry::builtin(), None);
+        for tool in ["WebFetch", "WebSearch"] {
+            let error = executor
+                .execute(tool, &format!(r#"{{"url":"http://{listener_addr}/"}}"#))
+                .expect_err("private mode must deny web tools");
+            assert!(error.to_string().contains("denied by strict private mode"));
+        }
+        assert!(listener.accept().is_err());
+        println!("CLAW_SECURITY_ASSERTION private_webfetch_denied PASS");
+        println!("CLAW_SECURITY_ASSERTION private_websearch_denied PASS");
+
+        let root = std::env::temp_dir().join(format!(
+            "claw-private-security-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("private state root");
+        let canary = "CLAW_PRIVATE_SESSION_CANARY_TEST_ONLY";
+        let workspace = root.join("workspace");
+        let config_home = root.join("config");
+        let home = root.join("home");
+        fs::create_dir_all(&workspace).expect("private workspace");
+        fs::create_dir_all(&config_home).expect("private config");
+        fs::create_dir_all(&home).expect("private home");
+        let runtime = tokio::runtime::Runtime::new().expect("mock provider runtime");
+        let provider = runtime
+            .block_on(MockAnthropicService::spawn())
+            .expect("mock provider should start");
+        let output = Command::new(&claw)
+            .current_dir(&workspace)
+            .env_clear()
+            .env("ANTHROPIC_API_KEY", "CLAW_TEST_PRIVATE_PROVIDER")
+            .env("ANTHROPIC_BASE_URL", provider.base_url())
+            .env("CLAW_CONFIG_HOME", &config_home)
+            .env("HOME", &home)
+            .env(
+                "CLAW_REAL_PODMAN_IMAGE",
+                env::var("CLAW_REAL_PODMAN_IMAGE").unwrap_or_default(),
+            )
+            .env("NO_COLOR", "1")
+            .env("PATH", "/usr/bin:/bin")
+            .args([
+                "--private",
+                "--compact",
+                "--model",
+                "sonnet",
+                &format!("{SCENARIO_PREFIX}streaming_text {canary}"),
+            ])
+            .output()
+            .expect("private conversation should launch");
+        assert!(
+            output.status.success(),
+            "private conversation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let requests = runtime.block_on(provider.captured_requests());
+        assert!(
+            !requests.is_empty(),
+            "provider should receive conversation requests"
+        );
+        assert!(requests
+            .iter()
+            .any(|request| request.raw_body.contains(canary)));
+        drop(provider);
+        let session = Session::new().with_workspace_root(&workspace);
+        assert_eq!(session.workspace_root(), Some(workspace.as_path()));
+        assert!(!root.join("sessions").exists());
+        assert!(!root.join(canary).exists());
+        fn contains_canary(path: &std::path::Path, canary: &str) -> bool {
+            let Ok(entries) = fs::read_dir(path) else {
+                return false;
+            };
+            entries.flatten().any(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    contains_canary(&path, canary)
+                } else {
+                    fs::read_to_string(path).is_ok_and(|value| value.contains(canary))
+                }
+            })
+        }
+        assert!(!contains_canary(&root, canary));
+        println!("CLAW_SECURITY_ASSERTION private_no_session_persistence PASS");
+        fs::remove_dir_all(&root).expect("private state cleanup");
+
+        let original_base = env::var_os("OPENAI_BASE_URL");
+        let original_key = env::var_os("OPENAI_API_KEY");
+        let original_privacy = env::var_os("CLAW_PROVIDER_PRIVACY");
+        env::set_var("OPENAI_API_KEY", "CLAW_TEST_OPENAI_CANARY");
+        env::set_var("OPENAI_BASE_URL", "http://127.0.0.1:11434/v1");
+        env::remove_var("CLAW_PROVIDER_PRIVACY");
+        assert_eq!(
+            provider_privacy_class("gpt-4o"),
+            ProviderPrivacyClass::Local
+        );
+        env::set_var("CLAW_PROVIDER_PRIVACY", "confidential");
+        assert_eq!(
+            provider_privacy_class("gpt-4o"),
+            ProviderPrivacyClass::Confidential
+        );
+        env::remove_var("CLAW_PROVIDER_PRIVACY");
+        env::set_var("OPENAI_BASE_URL", "https://api.openai.com/v1");
+        assert_eq!(
+            provider_privacy_class("gpt-4o"),
+            ProviderPrivacyClass::RemoteStandard
+        );
+        env::set_var("OPENAI_BASE_URL", "custom://provider/v1");
+        assert_eq!(
+            provider_privacy_class("gpt-4o"),
+            ProviderPrivacyClass::Unknown
+        );
+        let report = render_privacy_report();
+        assert!(report.contains("Provider fallback               OFF"));
+
+        env::set_var(
+            "OPENAI_BASE_URL",
+            "https://user:fake-secret@example.test/v1",
+        );
+        env::set_var("CLAW_SECURITY_CANARY", "CLAW_TEST_HOST_SECRET");
+        let report = render_privacy_report();
+        assert_eq!(
+            provider_privacy_class("gpt-4o"),
+            ProviderPrivacyClass::RemoteStandard
+        );
+        assert!(!report.contains("fake-secret"));
+        assert!(!report.contains("CLAW_TEST_OPENAI_CANARY"));
+        assert!(!report.contains("CLAW_TEST_HOST_SECRET"));
+        println!("CLAW_SECURITY_ASSERTION private_provider_policy PASS");
+        println!("CLAW_SECURITY_ASSERTION provider_host_secret_redaction PASS");
+
+        match original_base {
+            Some(value) => env::set_var("OPENAI_BASE_URL", value),
+            None => env::remove_var("OPENAI_BASE_URL"),
+        }
+        match original_privacy {
+            Some(value) => env::set_var("CLAW_PROVIDER_PRIVACY", value),
+            None => env::remove_var("CLAW_PROVIDER_PRIVACY"),
+        }
+        match original_key {
+            Some(value) => env::set_var("OPENAI_API_KEY", value),
+            None => env::remove_var("OPENAI_API_KEY"),
+        }
+        env::remove_var("CLAW_SECURITY_CANARY");
+        match private_was_set {
+            Some(value) => env::set_var("CLAW_PRIVATE_MODE", value),
+            None => env::remove_var("CLAW_PRIVATE_MODE"),
+        }
+    }
+
+    #[test]
+    fn provider_endpoint_redaction_parses_local_and_remote_authorities() {
+        assert_eq!(
+            endpoint_host("http://localhost:11434/v1"),
+            Some("localhost")
+        );
+        assert_eq!(endpoint_host("http://127.0.0.1:8080/v1"), Some("127.0.0.1"));
+        assert_eq!(
+            endpoint_host("https://user:secret@example.test/v1"),
+            Some("example.test")
+        );
+        assert_eq!(endpoint_host("http://[::1]:11434/v1"), Some("::1"));
+        assert_eq!(ProviderPrivacyClass::Local.label(), "LOCAL");
     }
 
     #[test]
@@ -8598,7 +9687,7 @@ mod tests {
             CliAction::Repl {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
+                permission_mode: PermissionMode::WorkspaceWrite,
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
@@ -8635,7 +9724,9 @@ mod tests {
             Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
             None => std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE"),
         }
-        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+        // Configuration loading may leave auxiliary state under the isolated
+        // fixture root; cleanup is best-effort because this tree is test-owned.
+        let _ = std::fs::remove_dir_all(root);
 
         assert_eq!(resolved, PermissionMode::WorkspaceWrite);
     }
@@ -8731,7 +9822,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
+                permission_mode: PermissionMode::WorkspaceWrite,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -8822,7 +9913,7 @@ mod tests {
                 model: "claude-opus".to_string(),
                 output_format: CliOutputFormat::Json,
                 allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
+                permission_mode: PermissionMode::WorkspaceWrite,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -8853,7 +9944,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
+                permission_mode: PermissionMode::WorkspaceWrite,
                 compact: true,
                 base_commit: None,
                 reasoning_effort: None,
@@ -8896,7 +9987,7 @@ mod tests {
                 model: "claude-opus-4-6".to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: PermissionMode::DangerFullAccess,
+                permission_mode: PermissionMode::WorkspaceWrite,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -9054,7 +10145,7 @@ mod tests {
                         .map(str::to_string)
                         .collect()
                 ),
-                permission_mode: PermissionMode::DangerFullAccess,
+                permission_mode: PermissionMode::WorkspaceWrite,
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
@@ -9090,6 +10181,8 @@ mod tests {
 
     #[test]
     fn removed_login_and_logout_subcommands_error_helpfully() {
+        let _guard = env_lock();
+        let expected_permission_mode = default_permission_mode();
         let login = parse_args(&["login".to_string()]).expect_err("login should be removed");
         assert!(login.contains("ANTHROPIC_API_KEY"));
         let logout = parse_args(&["logout".to_string()]).expect_err("logout should be removed");
@@ -9156,7 +10249,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
-                permission_mode: crate::default_permission_mode(),
+                permission_mode: expected_permission_mode,
                 compact: false,
                 base_commit: None,
                 reasoning_effort: None,
@@ -9239,7 +10332,7 @@ mod tests {
             parse_args(&["status".to_string()]).expect("status should parse"),
             CliAction::Status {
                 model: DEFAULT_MODEL.to_string(),
-                permission_mode: PermissionMode::DangerFullAccess,
+                permission_mode: PermissionMode::WorkspaceWrite,
                 output_format: CliOutputFormat::Text,
             }
         );
@@ -9579,6 +10672,8 @@ mod tests {
 
     #[test]
     fn parses_direct_agents_mcp_and_skills_slash_commands() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         assert_eq!(
             parse_args(&["/agents".to_string()]).expect("/agents should parse"),
             CliAction::Agents {
@@ -9954,7 +11049,9 @@ mod tests {
     fn startup_banner_mentions_workflow_completions() {
         let _guard = env_lock();
         // Inject dummy credentials so LiveCli can construct without real Anthropic key
+        let original_private = std::env::var_os("CLAW_PRIVATE_MODE");
         std::env::set_var("ANTHROPIC_API_KEY", "test-dummy-key-for-banner-test");
+        std::env::remove_var("CLAW_PRIVATE_MODE");
         let root = temp_dir();
         fs::create_dir_all(&root).expect("root dir");
 
@@ -9974,6 +11071,9 @@ mod tests {
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
         std::env::remove_var("ANTHROPIC_API_KEY");
+        if let Some(value) = original_private {
+            std::env::set_var("CLAW_PRIVATE_MODE", value);
+        }
     }
 
     #[test]
@@ -10129,7 +11229,7 @@ mod tests {
         assert!(help.contains("claw mcp"));
         assert!(help.contains("claw skills"));
         assert!(help.contains("claw /skills"));
-        assert!(help.contains("ultraworkers/claw-code"));
+        assert!(help.contains("bamm-squared/claw-code-bastion"));
         assert!(help.contains("cargo install claw-code"));
         assert!(!help.contains("claw login"));
         assert!(!help.contains("claw logout"));

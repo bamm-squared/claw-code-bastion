@@ -25,17 +25,22 @@ pub mod mcp_lifecycle_hardened;
 pub mod mcp_server;
 mod mcp_stdio;
 pub mod mcp_tool_bridge;
+pub mod network;
 mod oauth;
 pub mod permission_enforcer;
 mod permissions;
 pub mod plugin_lifecycle;
+pub mod podman;
 mod policy_engine;
 mod prompt;
 pub mod recovery_recipes;
+pub mod release;
 mod remote;
+pub mod runtime_image;
 pub mod sandbox;
 mod session;
 pub mod session_control;
+pub mod snapshot;
 pub use session_control::SessionStore;
 mod sse;
 pub mod stale_base;
@@ -47,6 +52,7 @@ pub mod team_cron_registry;
 #[cfg(test)]
 mod trust_resolver;
 mod usage;
+pub mod validator;
 pub mod worker_boot;
 
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
@@ -74,13 +80,13 @@ pub use conversation::{
     ToolExecutor, TurnSummary,
 };
 pub use file_ops::{
-    edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
-    GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload,
-    WriteFileOutput,
+    EditFileOutput, FilesystemCapability, GlobSearchOutput, GrepSearchInput, GrepSearchOutput,
+    ReadFileOutput, StructuredPatchHunk, TextFilePayload, WriteFileOutput,
 };
 pub use git_context::{GitCommitEntry, GitContext};
 pub use hooks::{
-    HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult, HookRunner,
+    HookAbortSignal, HookCommandExecutor, HookCommandOutput, HookEvent, HookProgressEvent,
+    HookProgressReporter, HookRunResult, HookRunner,
 };
 pub use lane_events::{
     dedupe_superseded_commit_events, LaneCommitProvenance, LaneEvent, LaneEventBlocker,
@@ -108,6 +114,7 @@ pub use mcp_stdio::{
     McpTool, McpToolCallContent, McpToolCallParams, McpToolCallResult, McpToolDiscoveryReport,
     UnsupportedMcpServer,
 };
+pub use network::{NetworkCapability, NetworkDenied, NetworkDestination};
 pub use oauth::{
     clear_oauth_credentials, code_challenge_s256, credentials_path, generate_pkce_pair,
     generate_state, load_oauth_credentials, loopback_redirect_uri, parse_oauth_callback_query,
@@ -123,6 +130,7 @@ pub use plugin_lifecycle::{
     DegradedMode, DiscoveryResult, PluginHealthcheck, PluginLifecycle, PluginLifecycleEvent,
     PluginState, ResourceInfo, ServerHealth, ServerStatus, ToolInfo,
 };
+pub use podman::{require_podman, PodmanWorkerClient, PodmanWorkerSpec};
 pub use policy_engine::{
     evaluate, DiffScope, GreenLevel, LaneBlocker, LaneContext, PolicyAction, PolicyCondition,
     PolicyEngine, PolicyRule, ReconcileReason, ReviewStatus,
@@ -140,6 +148,7 @@ pub use remote::{
     RemoteSessionContext, UpstreamProxyBootstrap, UpstreamProxyState, DEFAULT_REMOTE_BASE_URL,
     DEFAULT_SESSION_TOKEN_PATH, DEFAULT_SYSTEM_CA_BUNDLE, NO_PROXY_HOSTS, UPSTREAM_PROXY_ENV_KEYS,
 };
+pub use runtime_image::{RuntimeImage, DEFAULT_RUNTIME_IMAGE};
 pub use sandbox::{
     build_linux_sandbox_command, detect_container_environment, detect_container_environment_from,
     resolve_sandbox_status, resolve_sandbox_status_for_request, ContainerEnvironment,
@@ -149,6 +158,11 @@ pub use sandbox::{
 pub use session::{
     ContentBlock, ConversationMessage, MessageRole, Session, SessionCompaction, SessionError,
     SessionFork, SessionPromptEntry,
+};
+pub use snapshot::{
+    apply_approved_changes, create_disposable_snapshot, render_change_summary, scan_candidate,
+    BaselineEntry, BaselineManifest, CandidateChange, CandidateChangeSet, CandidateChangeSetId,
+    CanonicalWorkspace, EntryKind, IsolatedWorkspace, TrustedBaseline, UntrustedCandidate,
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_base::{
@@ -164,6 +178,11 @@ pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, Va
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
 pub use usage::{
     format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
+};
+pub use validator::{
+    detect_validation_plan, PodmanValidatorBackend, ValidatedCandidateInput, ValidationCheck,
+    ValidationCheckResult, ValidationIdentity, ValidationPlan, ValidationPolicy,
+    ValidationSnapshot, ValidationStatus, ValidatorBackend,
 };
 pub use worker_boot::{
     Worker, WorkerEvent, WorkerEventKind, WorkerEventPayload, WorkerFailure, WorkerFailureKind,

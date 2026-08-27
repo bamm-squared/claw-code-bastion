@@ -1,4 +1,4 @@
-FROM rust:bookworm
+FROM docker.io/library/rust:bookworm
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

@@ -142,6 +142,7 @@ fn run_claw(
         .env("HOME", home)
         .env("NO_COLOR", "1")
         .env("PATH", "/usr/bin:/bin")
+        .arg("--no-isolation")
         .args(args);
     command.output().expect("claw should launch")
 }

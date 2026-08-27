@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as FmtWrite;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use api::{
@@ -10,23 +13,22 @@ use api::{
 };
 use plugins::PluginTool;
 use reqwest::blocking::Client;
+use runtime::validator::ValidatorBackend;
 use runtime::{
-    check_freshness, dedupe_superseded_commit_events, edit_file, execute_bash, glob_search,
-    grep_search, load_system_prompt,
+    check_freshness, dedupe_superseded_commit_events, execute_bash, load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
-    read_file,
     summary_compression::compress_summary_text,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry, WorkerTaskReceipt},
-    write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
-    BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
+    ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput, BranchFreshness,
+    ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime, FilesystemCapability,
     GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
-    LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode,
-    PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError, Session, TaskPacket,
-    ToolError, ToolExecutor,
+    LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, NetworkCapability,
+    PermissionMode, PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError,
+    Session, TaskPacket, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -110,6 +112,405 @@ pub struct GlobalToolRegistry {
     plugin_tools: Vec<PluginTool>,
     runtime_tools: Vec<RuntimeToolDefinition>,
     enforcer: Option<PermissionEnforcer>,
+    execution_backend: Option<Arc<Mutex<dyn ExecutionBackend>>>,
+}
+
+pub trait ExecutionBackend: Send + std::fmt::Debug {
+    fn execute(&mut self, tool_name: &str, input: &Value) -> Result<String, String>;
+
+    fn isolated_workspace_root(&self) -> Option<PathBuf> {
+        None
+    }
+
+    fn execute_plugin(&mut self, _tool: &PluginTool, _input: &Value) -> Result<String, String> {
+        Err(String::from(
+            "plugin execution is unavailable through the selected execution backend",
+        ))
+    }
+
+    fn finish_candidate(&mut self) -> Result<Option<runtime::CandidateChangeSet>, String> {
+        Ok(None)
+    }
+
+    fn apply_candidate_changes(
+        &mut self,
+        _changes: &runtime::CandidateChangeSet,
+        _validation: &runtime::validator::ValidationResult,
+        _blocked_override: bool,
+    ) -> Result<(), String> {
+        Err(String::from(
+            "candidate application is unavailable for this backend",
+        ))
+    }
+
+    fn discard_candidate(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn resume_candidate(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn validate_candidate(
+        &mut self,
+        _changes: &runtime::CandidateChangeSet,
+    ) -> Result<runtime::validator::ValidationResult, String> {
+        Err(String::from(
+            "validation is unavailable for the selected backend",
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct UnsafeLocalExecutionPermit {
+    _private: (),
+}
+
+impl UnsafeLocalExecutionPermit {
+    #[must_use]
+    pub fn from_explicit_cli_opt_in() -> Self {
+        Self { _private: () }
+    }
+}
+
+#[derive(Debug)]
+pub struct LocalExecutionBackend {
+    _permit: UnsafeLocalExecutionPermit,
+    enforcer: PermissionEnforcer,
+    network: NetworkCapability,
+}
+
+impl LocalExecutionBackend {
+    #[must_use]
+    pub fn from_explicit_permit(
+        permit: UnsafeLocalExecutionPermit,
+        enforcer: PermissionEnforcer,
+        network: NetworkCapability,
+    ) -> Self {
+        Self {
+            _permit: permit,
+            enforcer,
+            network,
+        }
+    }
+}
+
+impl ExecutionBackend for LocalExecutionBackend {
+    fn execute(&mut self, tool_name: &str, input: &Value) -> Result<String, String> {
+        execute_local_tool(&self.enforcer, &self.network, tool_name, input)
+    }
+
+    fn execute_plugin(&mut self, tool: &PluginTool, input: &Value) -> Result<String, String> {
+        tool.execute(input).map_err(|error| error.to_string())
+    }
+
+    fn apply_candidate_changes(
+        &mut self,
+        _changes: &runtime::CandidateChangeSet,
+        _validation: &runtime::validator::ValidationResult,
+        _blocked_override: bool,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn discard_candidate(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct IsolatedExecutionBackend {
+    client: Option<runtime::PodmanWorkerClient>,
+    workspace: runtime::IsolatedWorkspace,
+    spec: runtime::PodmanWorkerSpec,
+}
+
+#[derive(Debug)]
+pub struct BackendHookCommandExecutor {
+    backend: Arc<Mutex<dyn ExecutionBackend>>,
+}
+
+impl BackendHookCommandExecutor {
+    #[must_use]
+    pub fn new(backend: Arc<Mutex<dyn ExecutionBackend>>) -> Self {
+        Self { backend }
+    }
+}
+
+impl runtime::HookCommandExecutor for BackendHookCommandExecutor {
+    fn execute_hook_command(
+        &self,
+        command: &str,
+        environment: &BTreeMap<String, String>,
+        payload: &str,
+    ) -> Result<runtime::HookCommandOutput, String> {
+        let mut env_assignments = String::new();
+        for (key, value) in environment {
+            write!(env_assignments, "{key}={} ", shell_quote(value))
+                .map_err(|error| error.to_string())?;
+        }
+        let wrapped = format!(
+            "printf '%s' {} | env {} /bin/sh -c {}",
+            shell_quote(payload),
+            env_assignments,
+            shell_quote(command)
+        );
+        let input = json!({
+            "command": wrapped,
+            "timeout": 120_000_u64,
+        });
+        let output = self
+            .backend
+            .lock()
+            .map_err(|_| String::from("execution backend lock poisoned"))?
+            .execute("bash", &input)?;
+        let output: runtime::BashCommandOutput =
+            serde_json::from_str(&output).map_err(|error| error.to_string())?;
+        let exit_code = output
+            .return_code_interpretation
+            .as_deref()
+            .and_then(|value| value.strip_prefix("exit_code:"))
+            .and_then(|value| value.parse::<i32>().ok())
+            .or_else(|| (!output.interrupted).then_some(0));
+        Ok(runtime::HookCommandOutput {
+            exit_code,
+            stdout: output.stdout,
+            stderr: output.stderr,
+            interrupted: output.interrupted,
+        })
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+impl IsolatedExecutionBackend {
+    #[must_use]
+    pub fn new(
+        client: runtime::PodmanWorkerClient,
+        workspace: runtime::IsolatedWorkspace,
+        spec: runtime::PodmanWorkerSpec,
+    ) -> Self {
+        Self {
+            client: Some(client),
+            workspace,
+            spec,
+        }
+    }
+
+    fn stop_worker(&mut self) {
+        let _ = self.client.take();
+    }
+
+    fn resume_worker(&mut self) -> Result<(), String> {
+        if self.client.is_none() {
+            self.client = Some(
+                runtime::PodmanWorkerClient::spawn(&self.spec)
+                    .map_err(|error| format!("failed to resume isolated worker: {error}"))?,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn discard(self) -> std::io::Result<()> {
+        self.workspace.discard()
+    }
+}
+
+impl ExecutionBackend for IsolatedExecutionBackend {
+    fn isolated_workspace_root(&self) -> Option<PathBuf> {
+        Some(self.workspace.candidate.root.clone())
+    }
+
+    fn execute(&mut self, tool_name: &str, input: &Value) -> Result<String, String> {
+        let request = worker_request(tool_name, input)?;
+        let client = self
+            .client
+            .as_mut()
+            .ok_or_else(|| String::from("isolated worker is no longer running"))?;
+        let response = client
+            .request(&request)
+            .map_err(|error| error.to_string())?;
+        if serde_json::to_vec(&response)
+            .map_err(|error| error.to_string())?
+            .len()
+            > 16 * 1024 * 1024
+        {
+            return Err(String::from("worker response exceeds 16 MiB limit"));
+        }
+        if response.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(response
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("worker rejected request")
+                .to_string());
+        }
+        serde_json::to_string(response.get("result").unwrap_or(&Value::Null))
+            .map_err(|error| error.to_string())
+    }
+
+    fn execute_plugin(&mut self, tool: &PluginTool, input: &Value) -> Result<String, String> {
+        let mut command = format!(
+            "printf '%s' {} | env CLAWD_PLUGIN_ID={} CLAWD_PLUGIN_NAME={} CLAWD_TOOL_NAME={} CLAWD_TOOL_INPUT={} {}",
+            shell_quote(&input.to_string()),
+            shell_quote(tool.plugin_id()),
+            shell_quote(tool.plugin_name()),
+            shell_quote(&tool.definition().name),
+            shell_quote(&input.to_string()),
+            shell_quote(tool.command()),
+        );
+        for argument in tool.args() {
+            command.push(' ');
+            command.push_str(&shell_quote(argument));
+        }
+        let output = self.execute("bash", &json!({"command": command, "timeout": 120_000_u64}))?;
+        let output: BashCommandOutput = serde_json::from_str(&output).map_err(|error| {
+            format!(
+                "plugin `{}` returned invalid worker output: {error}",
+                tool.plugin_id()
+            )
+        })?;
+        let exit_code = output
+            .return_code_interpretation
+            .as_deref()
+            .and_then(|value| value.strip_prefix("exit_code:"))
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or_default();
+        if exit_code == 0 && !output.interrupted {
+            return Ok(output.stdout.trim().to_string());
+        }
+        let stderr = output.stderr.trim();
+        if exit_code == 127 {
+            return Err(format!(
+                "plugin `{}` executable `{}` is unavailable in the isolated worker image; host executable fallback is disabled",
+                tool.plugin_id(),
+                tool.command()
+            ));
+        }
+        Err(format!(
+            "isolated plugin `{}` tool `{}` failed with exit code {exit_code}: {}",
+            tool.plugin_id(),
+            tool.definition().name,
+            if stderr.is_empty() {
+                "no stderr"
+            } else {
+                stderr
+            }
+        ))
+    }
+
+    fn finish_candidate(&mut self) -> Result<Option<runtime::CandidateChangeSet>, String> {
+        self.stop_worker();
+        self.workspace
+            .scan()
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
+    fn validate_candidate(
+        &mut self,
+        changes: &runtime::CandidateChangeSet,
+    ) -> Result<runtime::validator::ValidationResult, String> {
+        self.stop_worker();
+        let plan = runtime::detect_validation_plan(&self.workspace.candidate.root);
+        let snapshot = runtime::ValidationSnapshot::create_verified(
+            &self.workspace.candidate,
+            &self.workspace.baseline,
+            changes,
+        )
+        .map_err(|error| error.to_string())?;
+        let backend = runtime::PodmanValidatorBackend {
+            image: std::env::var("CLAW_VALIDATOR_IMAGE")
+                .or_else(|_| std::env::var("CLAW_WORKER_IMAGE"))
+                .unwrap_or_else(|_| runtime::DEFAULT_RUNTIME_IMAGE.to_string()),
+            ..runtime::PodmanValidatorBackend::default()
+        };
+        match runtime::ValidatorBackend::validate(&backend, &snapshot.input(), &plan) {
+            Ok(result) => Ok(result),
+            Err(error) => Ok(runtime::validator::ValidationResult::blocked(
+                changes.id,
+                &plan,
+                backend.backend_id(),
+                format!("secure validator unavailable: {error}"),
+            )),
+        }
+    }
+
+    fn apply_candidate_changes(
+        &mut self,
+        changes: &runtime::CandidateChangeSet,
+        validation: &runtime::validator::ValidationResult,
+        blocked_override: bool,
+    ) -> Result<(), String> {
+        self.stop_worker();
+        if !validation.allows_apply(
+            changes.id,
+            runtime::ValidationPolicy::default(),
+            blocked_override,
+        ) {
+            return Err(String::from(
+                "validation result does not authorize this candidate",
+            ));
+        }
+        runtime::apply_approved_changes(
+            changes,
+            &self.workspace.canonical,
+            &self.workspace.baseline,
+            &self.workspace.candidate,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn discard_candidate(&mut self) -> Result<(), String> {
+        self.stop_worker();
+        self.workspace.discard().map_err(|error| error.to_string())
+    }
+
+    fn resume_candidate(&mut self) -> Result<(), String> {
+        self.resume_worker()
+    }
+}
+
+fn worker_request(tool_name: &str, input: &Value) -> Result<Value, String> {
+    let operation = match tool_name {
+        "read_file" => "read_file",
+        "write_file" => "write_file",
+        "edit_file" => "edit_file",
+        "glob_search" => "glob",
+        "grep_search" => "grep",
+        "bash" => "run_command",
+        "PowerShell" => {
+            return Err(String::from(
+                "PowerShell is unavailable in isolated Linux execution",
+            ))
+        }
+        _ => {
+            return Err(format!(
+                "tool `{tool_name}` is not supported by isolated execution"
+            ))
+        }
+    };
+    let mut request = input.clone();
+    let object = request
+        .as_object_mut()
+        .ok_or_else(|| String::from("worker tool input must be an object"))?;
+    object.insert(
+        String::from("operation"),
+        Value::String(operation.to_string()),
+    );
+    if tool_name == "grep_search" {
+        let input = object
+            .remove("input")
+            .unwrap_or(Value::Object(object.clone()));
+        return Ok(json!({ "operation": "grep", "input": input }));
+    }
+    if tool_name == "bash" {
+        let command = object.remove("command").unwrap_or(Value::Null);
+        let timeout = object.remove("timeout").unwrap_or(Value::Null);
+        return Ok(json!({ "operation": "run_command", "command": command, "timeout": timeout }));
+    }
+    Ok(request)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -127,6 +528,7 @@ impl GlobalToolRegistry {
             plugin_tools: Vec::new(),
             runtime_tools: Vec::new(),
             enforcer: None,
+            execution_backend: None,
         }
     }
 
@@ -153,6 +555,7 @@ impl GlobalToolRegistry {
             plugin_tools,
             runtime_tools: Vec::new(),
             enforcer: None,
+            execution_backend: None,
         })
     }
 
@@ -187,6 +590,22 @@ impl GlobalToolRegistry {
     pub fn with_enforcer(mut self, enforcer: PermissionEnforcer) -> Self {
         self.set_enforcer(enforcer);
         self
+    }
+
+    #[must_use]
+    pub fn with_execution_backend(mut self, backend: Arc<Mutex<dyn ExecutionBackend>>) -> Self {
+        self.execution_backend = Some(backend);
+        self
+    }
+
+    #[must_use]
+    pub fn isolated_workspace_root(&self) -> Option<PathBuf> {
+        self.execution_backend.as_ref().and_then(|backend| {
+            backend
+                .lock()
+                .ok()
+                .and_then(|backend| backend.isolated_workspace_root())
+        })
     }
 
     pub fn normalize_allowed_tools(
@@ -336,16 +755,107 @@ impl GlobalToolRegistry {
         self.enforcer = Some(enforcer);
     }
 
+    #[must_use]
+    pub fn execution_backend(&self) -> Option<Arc<Mutex<dyn ExecutionBackend>>> {
+        self.execution_backend.clone()
+    }
+
+    /// Ends isolated execution before trusted candidate scanning. Local
+    /// execution has no candidate lifecycle and returns `None`.
+    pub fn finish_candidate(&self) -> Result<Option<runtime::CandidateChangeSet>, String> {
+        let Some(backend) = &self.execution_backend else {
+            return Ok(None);
+        };
+        backend
+            .lock()
+            .map_err(|_| String::from("execution backend lock poisoned"))?
+            .finish_candidate()
+    }
+
+    pub fn apply_candidate_changes(
+        &self,
+        changes: &runtime::CandidateChangeSet,
+        validation: &runtime::validator::ValidationResult,
+        blocked_override: bool,
+    ) -> Result<(), String> {
+        let Some(backend) = &self.execution_backend else {
+            return Err(String::from(
+                "no execution backend available for candidate apply",
+            ));
+        };
+        backend
+            .lock()
+            .map_err(|_| String::from("execution backend lock poisoned"))?
+            .apply_candidate_changes(changes, validation, blocked_override)
+    }
+
+    pub fn validate_candidate(
+        &self,
+        changes: &runtime::CandidateChangeSet,
+    ) -> Result<runtime::validator::ValidationResult, String> {
+        let Some(backend) = &self.execution_backend else {
+            return Err(String::from(
+                "no execution backend available for validation",
+            ));
+        };
+        backend
+            .lock()
+            .map_err(|_| String::from("execution backend lock poisoned"))?
+            .validate_candidate(changes)
+    }
+
+    pub fn discard_candidate(&self) -> Result<(), String> {
+        let Some(backend) = &self.execution_backend else {
+            return Ok(());
+        };
+        backend
+            .lock()
+            .map_err(|_| String::from("execution backend lock poisoned"))?
+            .discard_candidate()
+    }
+
+    pub fn resume_candidate(&self) -> Result<(), String> {
+        let Some(backend) = &self.execution_backend else {
+            return Ok(());
+        };
+        backend
+            .lock()
+            .map_err(|_| String::from("execution backend lock poisoned"))?
+            .resume_candidate()
+    }
+
     pub fn execute(&self, name: &str, input: &Value) -> Result<String, String> {
+        let Some(enforcer) = self.enforcer.as_ref() else {
+            return Err(String::from("tool execution requires a PermissionEnforcer"));
+        };
         if mvp_tool_specs().iter().any(|spec| spec.name == name) {
-            return execute_tool_with_enforcer(self.enforcer.as_ref(), name, input);
+            if !is_host_side_tool(name) {
+                if let Some(backend) = &self.execution_backend {
+                    enforce_backend_permission(enforcer, name, input)?;
+                    return backend
+                        .lock()
+                        .map_err(|_| String::from("execution backend lock poisoned"))?
+                        .execute(name, input);
+                }
+            }
+            return execute_tool_with_enforcer(enforcer, &NetworkCapability::none(), name, input);
         }
-        self.plugin_tools
+        let result = enforcer.check(name, &input.to_string());
+        if let EnforcementResult::Denied { reason, .. } = result {
+            return Err(reason);
+        }
+        let plugin = self
+            .plugin_tools
             .iter()
             .find(|tool| tool.definition().name == name)
-            .ok_or_else(|| format!("unsupported tool: {name}"))?
-            .execute(input)
-            .map_err(|error| error.to_string())
+            .ok_or_else(|| format!("unsupported tool: {name}"))?;
+        if let Some(backend) = &self.execution_backend {
+            return backend
+                .lock()
+                .map_err(|_| String::from("execution backend lock poisoned"))?
+                .execute_plugin(plugin, input);
+        }
+        plugin.execute(input).map_err(|error| error.to_string())
     }
 
     fn searchable_tool_specs(&self) -> Vec<SearchableToolSpec> {
@@ -365,6 +875,23 @@ impl GlobalToolRegistry {
         });
         builtin.chain(runtime).chain(plugin).collect()
     }
+}
+
+fn is_host_side_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "WebFetch"
+            | "WebSearch"
+            | "TodoWrite"
+            | "ToolSearch"
+            | "Sleep"
+            | "SendUserMessage"
+            | "Brief"
+            | "AskUserQuestion"
+            | "StructuredOutput"
+            | "EnterPlanMode"
+            | "ExitPlanMode"
+    )
 }
 
 fn normalize_tool_name(value: &str) -> String {
@@ -394,11 +921,6 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "timeout": { "type": "integer", "minimum": 1 },
                     "description": { "type": "string" },
                     "run_in_background": { "type": "boolean" },
-                    "dangerouslyDisableSandbox": { "type": "boolean" },
-                    "namespaceRestrictions": { "type": "boolean" },
-                    "isolateNetwork": { "type": "boolean" },
-                    "filesystemMode": { "type": "string", "enum": ["off", "workspace-only", "allow-list"] },
-                    "allowedMounts": { "type": "array", "items": { "type": "string" } }
                 },
                 "required": ["command"],
                 "additionalProperties": false
@@ -503,7 +1025,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["url", "prompt"],
                 "additionalProperties": false
             }),
-            required_permission: PermissionMode::ReadOnly,
+            required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
             name: "WebSearch",
@@ -524,7 +1046,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["query"],
                 "additionalProperties": false
             }),
-            required_permission: PermissionMode::ReadOnly,
+            required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
             name: "TodoWrite",
@@ -1186,45 +1708,76 @@ pub fn enforce_permission_check(
     }
 }
 
-pub fn execute_tool(name: &str, input: &Value) -> Result<String, String> {
-    execute_tool_with_enforcer(None, name, input)
+/// Execute a request received by the host-side MCP server under the safe
+/// default policy. External MCP callers never receive the trusted test path.
+pub fn execute_mcp_tool(name: &str, input: &Value) -> Result<String, String> {
+    let enforcer = PermissionEnforcer::new(PermissionPolicy::new(PermissionMode::WorkspaceWrite));
+    execute_tool_with_enforcer(&enforcer, &NetworkCapability::none(), name, input)
 }
 
+#[cfg(test)]
+fn execute_trusted_tool(name: &str, input: &Value) -> Result<String, String> {
+    execute_tool_with_enforcer(
+        &PermissionEnforcer::new(PermissionPolicy::new(PermissionMode::DangerFullAccess)),
+        &NetworkCapability::unrestricted(),
+        name,
+        input,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
 fn execute_tool_with_enforcer(
-    enforcer: Option<&PermissionEnforcer>,
+    enforcer: &PermissionEnforcer,
+    network: &NetworkCapability,
     name: &str,
     input: &Value,
 ) -> Result<String, String> {
+    if std::env::var("CLAW_EXECUTION_MODE").as_deref() == Ok("isolated") && !is_host_side_tool(name)
+    {
+        return Err(format!(
+            "tool `{name}` cannot execute on the host in isolated mode"
+        ));
+    }
+    let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
+    let filesystem = FilesystemCapability::workspace(workspace);
     match name {
         "bash" => {
             // Parse input to get the command for permission classification
             let bash_input: BashCommandInput = from_value(input)?;
             let classified_mode = classify_bash_permission(&bash_input.command);
-            maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
+            maybe_enforce_permission_check_with_mode(Some(enforcer), name, input, classified_mode)?;
             run_bash(bash_input)
         }
         "read_file" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<ReadFileInput>(input).and_then(run_read_file)
+            maybe_enforce_permission_check(Some(enforcer), name, input)?;
+            from_value::<ReadFileInput>(input).and_then(|value| run_read_file(value, &filesystem))
         }
         "write_file" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<WriteFileInput>(input).and_then(run_write_file)
+            maybe_enforce_permission_check(Some(enforcer), name, input)?;
+            from_value::<WriteFileInput>(input).and_then(|value| run_write_file(value, &filesystem))
         }
         "edit_file" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<EditFileInput>(input).and_then(run_edit_file)
+            maybe_enforce_permission_check(Some(enforcer), name, input)?;
+            from_value::<EditFileInput>(input).and_then(|value| run_edit_file(value, &filesystem))
         }
         "glob_search" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<GlobSearchInputValue>(input).and_then(run_glob_search)
+            maybe_enforce_permission_check(Some(enforcer), name, input)?;
+            from_value::<GlobSearchInputValue>(input)
+                .and_then(|value| run_glob_search(value, &filesystem))
         }
         "grep_search" => {
-            maybe_enforce_permission_check(enforcer, name, input)?;
-            from_value::<GrepSearchInput>(input).and_then(run_grep_search)
+            maybe_enforce_permission_check(Some(enforcer), name, input)?;
+            from_value::<GrepSearchInput>(input)
+                .and_then(|value| run_grep_search(value, &filesystem))
         }
-        "WebFetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
-        "WebSearch" => from_value::<WebSearchInput>(input).and_then(run_web_search),
+        "WebFetch" => {
+            maybe_enforce_permission_check(Some(enforcer), name, input)?;
+            from_value::<WebFetchInput>(input).and_then(|value| run_web_fetch(value, network))
+        }
+        "WebSearch" => {
+            maybe_enforce_permission_check(Some(enforcer), name, input)?;
+            from_value::<WebSearchInput>(input).and_then(|value| run_web_search(value, network))
+        }
         "TodoWrite" => from_value::<TodoWriteInput>(input).and_then(run_todo_write),
         "Skill" => from_value::<SkillInput>(input).and_then(run_skill),
         "Agent" => from_value::<AgentInput>(input).and_then(run_agent),
@@ -1243,7 +1796,7 @@ fn execute_tool_with_enforcer(
             // Parse input to get the command for permission classification
             let ps_input: PowerShellInput = from_value(input)?;
             let classified_mode = classify_powershell_permission(&ps_input.command);
-            maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
+            maybe_enforce_permission_check_with_mode(Some(enforcer), name, input, classified_mode)?;
             run_powershell(ps_input)
         }
         "AskUserQuestion" => {
@@ -1288,6 +1841,32 @@ fn execute_tool_with_enforcer(
         }
         _ => Err(format!("unsupported tool: {name}")),
     }
+}
+
+fn execute_local_tool(
+    enforcer: &PermissionEnforcer,
+    network: &NetworkCapability,
+    name: &str,
+    input: &Value,
+) -> Result<String, String> {
+    execute_tool_with_enforcer(enforcer, network, name, input)
+}
+
+fn enforce_backend_permission(
+    enforcer: &PermissionEnforcer,
+    name: &str,
+    input: &Value,
+) -> Result<(), String> {
+    if name == "bash" {
+        let bash: BashCommandInput = from_value(input)?;
+        let required = classify_bash_permission(&bash.command);
+        let input_str = serde_json::to_string(input).unwrap_or_default();
+        return match enforcer.check_with_required_mode(name, &input_str, required) {
+            EnforcementResult::Allowed => Ok(()),
+            EnforcementResult::Denied { reason, .. } => Err(reason),
+        };
+    }
+    enforce_permission_check(enforcer, name, input)
 }
 
 fn maybe_enforce_permission_check(
@@ -1988,8 +2567,7 @@ fn git_ref_exists(reference: &str) -> bool {
     Command::new("git")
         .args(["rev-parse", "--verify", "--quiet", reference])
         .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|output| output.status.success())
 }
 
 fn git_stdout(args: &[&str]) -> Option<String> {
@@ -2060,46 +2638,91 @@ fn branch_divergence_output(
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_read_file(input: ReadFileInput) -> Result<String, String> {
-    to_pretty_json(read_file(&input.path, input.offset, input.limit).map_err(io_to_string)?)
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_write_file(input: WriteFileInput) -> Result<String, String> {
-    to_pretty_json(write_file(&input.path, &input.content).map_err(io_to_string)?)
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn run_edit_file(input: EditFileInput) -> Result<String, String> {
+fn run_read_file(
+    input: ReadFileInput,
+    filesystem: &FilesystemCapability,
+) -> Result<String, String> {
     to_pretty_json(
-        edit_file(
-            &input.path,
-            &input.old_string,
-            &input.new_string,
-            input.replace_all.unwrap_or(false),
-        )
-        .map_err(io_to_string)?,
+        filesystem
+            .read_file(&input.path, input.offset, input.limit)
+            .map_err(io_to_string)?,
     )
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_glob_search(input: GlobSearchInputValue) -> Result<String, String> {
-    to_pretty_json(glob_search(&input.pattern, input.path.as_deref()).map_err(io_to_string)?)
+fn run_write_file(
+    input: WriteFileInput,
+    filesystem: &FilesystemCapability,
+) -> Result<String, String> {
+    to_pretty_json(
+        filesystem
+            .write_file(&input.path, &input.content)
+            .map_err(io_to_string)?,
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_grep_search(input: GrepSearchInput) -> Result<String, String> {
-    to_pretty_json(grep_search(&input).map_err(io_to_string)?)
+fn run_edit_file(
+    input: EditFileInput,
+    filesystem: &FilesystemCapability,
+) -> Result<String, String> {
+    to_pretty_json(
+        filesystem
+            .edit_file(
+                &input.path,
+                &input.old_string,
+                &input.new_string,
+                input.replace_all.unwrap_or(false),
+            )
+            .map_err(io_to_string)?,
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_web_fetch(input: WebFetchInput) -> Result<String, String> {
-    to_pretty_json(execute_web_fetch(&input)?)
+fn run_glob_search(
+    input: GlobSearchInputValue,
+    filesystem: &FilesystemCapability,
+) -> Result<String, String> {
+    to_pretty_json(
+        filesystem
+            .glob_search(&input.pattern, input.path.as_deref())
+            .map_err(io_to_string)?,
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn run_web_search(input: WebSearchInput) -> Result<String, String> {
-    to_pretty_json(execute_web_search(&input)?)
+fn run_grep_search(
+    input: GrepSearchInput,
+    filesystem: &FilesystemCapability,
+) -> Result<String, String> {
+    to_pretty_json(filesystem.grep_search(&input).map_err(io_to_string)?)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_web_fetch(input: WebFetchInput, network: &NetworkCapability) -> Result<String, String> {
+    authorize_web_request(network, &input.url)?;
+    to_pretty_json(execute_web_fetch(&input, network)?)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_web_search(input: WebSearchInput, network: &NetworkCapability) -> Result<String, String> {
+    let search_url = build_search_url(&input.query)?;
+    authorize_web_request(network, search_url.as_str())?;
+    to_pretty_json(execute_web_search(&input, network, &search_url)?)
+}
+
+fn authorize_web_request(network: &NetworkCapability, url: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_owned))
+        .is_some_and(|host| host == "127.0.0.1" || host == "localhost")
+    {
+        return Ok(());
+    }
+    network
+        .authorize_web_url(url)
+        .map_err(|error| error.to_string())
 }
 
 fn run_todo_write(input: TodoWriteInput) -> Result<String, String> {
@@ -2744,14 +3367,14 @@ struct SearchHit {
     url: String,
 }
 
-fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
+fn execute_web_fetch(
+    input: &WebFetchInput,
+    network: &NetworkCapability,
+) -> Result<WebFetchOutput, String> {
     let started = Instant::now();
-    let client = build_http_client()?;
-    let request_url = normalize_fetch_url(&input.url)?;
-    let response = client
-        .get(request_url.clone())
-        .send()
+    let request_url = reqwest::Url::parse(&normalize_fetch_url(&input.url)?)
         .map_err(|error| error.to_string())?;
+    let response = send_bounded_redirect_chain(network, &request_url)?;
 
     let status = response.status();
     let final_url = response.url().to_string();
@@ -2763,7 +3386,7 @@ fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    let body = response.text().map_err(|error| error.to_string())?;
+    let body = read_bounded_response(response)?;
     let bytes = body.len();
     let normalized = normalize_fetched_content(&body, &content_type);
     let result = summarize_web_fetch(&final_url, &input.prompt, &normalized, &body, &content_type);
@@ -2778,17 +3401,16 @@ fn execute_web_fetch(input: &WebFetchInput) -> Result<WebFetchOutput, String> {
     })
 }
 
-fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String> {
+fn execute_web_search(
+    input: &WebSearchInput,
+    network: &NetworkCapability,
+    search_url: &reqwest::Url,
+) -> Result<WebSearchOutput, String> {
     let started = Instant::now();
-    let client = build_http_client()?;
-    let search_url = build_search_url(&input.query)?;
-    let response = client
-        .get(search_url)
-        .send()
-        .map_err(|error| error.to_string())?;
+    let response = send_bounded_redirect_chain(network, search_url)?;
 
     let final_url = response.url().clone();
-    let html = response.text().map_err(|error| error.to_string())?;
+    let html = read_bounded_response(response)?;
     let mut hits = extract_search_hits(&html);
 
     if hits.is_empty() && final_url.host_str().is_some() {
@@ -2832,13 +3454,114 @@ fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String>
     })
 }
 
-fn build_http_client() -> Result<Client, String> {
+fn send_bounded_redirect_chain(
+    network: &NetworkCapability,
+    initial_url: &reqwest::Url,
+) -> Result<reqwest::blocking::Response, String> {
+    let mut url = initial_url.clone();
+    for _ in 0..=10 {
+        let addresses = resolve_web_connection_addresses(network, &url)?;
+        let address = addresses
+            .first()
+            .copied()
+            .ok_or_else(|| String::from("web URL did not resolve to an address"))?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| String::from("web URL must contain a host"))?;
+        let client = build_bound_http_client(network, host, address)?;
+        let response = client
+            .get(url.clone())
+            .send()
+            .map_err(|error| error.to_string())?;
+        if !response.status().is_redirection() {
+            return Ok(response);
+        }
+        let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
+            return Ok(response);
+        };
+        let location = location
+            .to_str()
+            .map_err(|error| format!("invalid redirect location: {error}"))?;
+        url = response
+            .url()
+            .join(location)
+            .map_err(|error| format!("invalid redirect URL: {error}"))?;
+    }
+    Err(String::from("web response exceeded the 10 redirect limit"))
+}
+
+fn resolve_web_connection_addresses(
+    network: &NetworkCapability,
+    url: &reqwest::Url,
+) -> Result<Vec<SocketAddr>, String> {
+    #[cfg(test)]
+    if url
+        .host_str()
+        .is_some_and(|host| host == "127.0.0.1" || host == "localhost")
+    {
+        use std::net::ToSocketAddrs;
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| String::from("web URL must use a known or explicit port"))?;
+        return (url.host_str().unwrap_or_default(), port)
+            .to_socket_addrs()
+            .map(Iterator::collect)
+            .map_err(|error| error.to_string());
+    }
+    network
+        .resolve_authorized_web_url(url.as_str())
+        .map_err(|error| error.to_string())
+}
+
+fn build_bound_http_client(
+    network: &NetworkCapability,
+    host: &str,
+    address: SocketAddr,
+) -> Result<Client, String> {
+    build_bound_http_client_with_timeout(network, host, address, Duration::from_secs(20))
+}
+
+fn build_bound_http_client_with_timeout(
+    _network: &NetworkCapability,
+    host: &str,
+    address: SocketAddr,
+    timeout: Duration,
+) -> Result<Client, String> {
     Client::builder()
-        .timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve(host, address)
         .user_agent("clawd-rust-tools/0.1")
         .build()
         .map_err(|error| error.to_string())
+}
+
+fn read_bounded_response(mut response: reqwest::blocking::Response) -> Result<String, String> {
+    const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(format!(
+            "web response exceeds the {MAX_RESPONSE_BYTES} byte limit"
+        ));
+    }
+    let mut bytes = Vec::new();
+    let mut buffer = vec![0_u8; 32 * 1024];
+    loop {
+        let read = std::io::Read::read(&mut response, &mut buffer)
+            .map_err(|error| format!("failed reading web response: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        if bytes.len().saturating_add(read) > MAX_RESPONSE_BYTES {
+            return Err(format!(
+                "web response exceeds the {MAX_RESPONSE_BYTES} byte limit"
+            ));
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    String::from_utf8(bytes).map_err(|error| format!("web response is not valid UTF-8: {error}"))
 }
 
 fn normalize_fetch_url(url: &str) -> Result<String, String> {
@@ -3605,8 +4328,11 @@ fn build_agent_runtime(
     let allowed_tools = job.allowed_tools.clone();
     let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
     let permission_policy = agent_permission_policy();
-    let tool_executor = SubagentToolExecutor::new(allowed_tools)
-        .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
+    let tool_executor = SubagentToolExecutor::new(
+        allowed_tools,
+        PermissionEnforcer::new(permission_policy.clone()),
+        NetworkCapability::none(),
+    );
     Ok(ConversationRuntime::new(
         Session::new(),
         api_client,
@@ -4527,13 +5253,16 @@ impl ProviderRuntimeClient {
         let primary_model = fallback_config.primary().map_or(model, str::to_string);
         let primary = build_provider_entry(&primary_model)?;
         let mut chain = vec![primary];
-        for fallback_model in fallback_config.fallbacks() {
-            match build_provider_entry(fallback_model) {
-                Ok(entry) => chain.push(entry),
-                Err(error) => {
-                    eprintln!(
-                        "warning: skipping unavailable fallback provider {fallback_model}: {error}"
-                    );
+        let private_mode = std::env::var("CLAW_PRIVATE_MODE").is_ok_and(|value| value == "1");
+        if !private_mode {
+            for fallback_model in fallback_config.fallbacks() {
+                match build_provider_entry(fallback_model) {
+                    Ok(entry) => chain.push(entry),
+                    Err(error) => {
+                        eprintln!(
+                            "warning: skipping unavailable fallback provider {fallback_model}: {error}"
+                        );
+                    }
                 }
             }
         }
@@ -4700,20 +5429,21 @@ async fn stream_with_provider(
 
 struct SubagentToolExecutor {
     allowed_tools: BTreeSet<String>,
-    enforcer: Option<PermissionEnforcer>,
+    enforcer: PermissionEnforcer,
+    network: NetworkCapability,
 }
 
 impl SubagentToolExecutor {
-    fn new(allowed_tools: BTreeSet<String>) -> Self {
+    fn new(
+        allowed_tools: BTreeSet<String>,
+        enforcer: PermissionEnforcer,
+        network: NetworkCapability,
+    ) -> Self {
         Self {
             allowed_tools,
-            enforcer: None,
+            enforcer,
+            network,
         }
-    }
-
-    fn with_enforcer(mut self, enforcer: PermissionEnforcer) -> Self {
-        self.enforcer = Some(enforcer);
-        self
     }
 }
 
@@ -4726,7 +5456,7 @@ impl ToolExecutor for SubagentToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        execute_tool_with_enforcer(self.enforcer.as_ref(), tool_name, &value)
+        execute_tool_with_enforcer(&self.enforcer, &self.network, tool_name, &value)
             .map_err(ToolError::new)
     }
 }
@@ -5916,8 +6646,7 @@ fn command_exists(command: &str) -> bool {
         .arg("-lc")
         .arg(format!("command -v {command} >/dev/null 2>&1"))
         .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .is_ok_and(|status| status.success())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6127,13 +6856,15 @@ mod tests {
 
     use super::{
         agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
-        derive_agent_state, execute_agent_with_spawn, execute_tool, extract_recovery_outcome,
-        final_assistant_text, global_cron_registry, maybe_commit_provenance, mvp_tool_specs,
-        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
-        run_task_packet, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
+        derive_agent_state, execute_agent_with_spawn, execute_trusted_tool,
+        extract_recovery_outcome, final_assistant_text, global_cron_registry,
+        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
+        persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
+        ApiClient, ConversationMessage, GlobalToolRegistry, LaneEventName, LaneFailureClass,
         ProviderRuntimeClient, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
+    use runtime::NetworkCapability;
     use runtime::ProviderFallbackConfig;
     use runtime::{
         permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
@@ -6240,13 +6971,13 @@ mod tests {
 
     #[test]
     fn rejects_unknown_tool_names() {
-        let error = execute_tool("nope", &json!({})).expect_err("tool should be rejected");
+        let error = execute_trusted_tool("nope", &json!({})).expect_err("tool should be rejected");
         assert!(error.contains("unsupported tool"));
     }
 
     #[test]
     fn worker_tools_gate_prompt_delivery_until_ready_and_support_auto_trust() {
-        let created = execute_tool(
+        let created = execute_trusted_tool(
             "WorkerCreate",
             &json!({
                 "cwd": "/tmp/worktree/repo",
@@ -6262,7 +6993,7 @@ mod tests {
         assert_eq!(created_output["status"], "spawning");
         assert_eq!(created_output["trust_auto_resolve"], true);
 
-        let gated = execute_tool(
+        let gated = execute_trusted_tool(
             "WorkerSendPrompt",
             &json!({
                 "worker_id": worker_id,
@@ -6272,7 +7003,7 @@ mod tests {
         .expect_err("prompt delivery before ready should fail");
         assert!(gated.contains("not ready for prompt delivery"));
 
-        let observed = execute_tool(
+        let observed = execute_trusted_tool(
             "WorkerObserve",
             &json!({
                 "worker_id": created_output["worker_id"],
@@ -6292,7 +7023,7 @@ mod tests {
             "auto_allowlisted"
         );
 
-        let ready = execute_tool(
+        let ready = execute_trusted_tool(
             "WorkerObserve",
             &json!({
                 "worker_id": created_output["worker_id"],
@@ -6303,7 +7034,7 @@ mod tests {
         let ready_output: serde_json::Value = serde_json::from_str(&ready).expect("json");
         assert_eq!(ready_output["status"], "ready_for_prompt");
 
-        let await_ready = execute_tool(
+        let await_ready = execute_trusted_tool(
             "WorkerAwaitReady",
             &json!({
                 "worker_id": created_output["worker_id"]
@@ -6314,7 +7045,7 @@ mod tests {
             serde_json::from_str(&await_ready).expect("json");
         assert_eq!(await_ready_output["ready"], true);
 
-        let accepted = execute_tool(
+        let accepted = execute_trusted_tool(
             "WorkerSendPrompt",
             &json!({
                 "worker_id": created_output["worker_id"],
@@ -6342,7 +7073,7 @@ mod tests {
 
         // WorkerCreate with no per-call trusted_roots — config should supply them
         let cwd = worktree.to_str().expect("valid utf-8").to_string();
-        let created = execute_tool(
+        let created = execute_trusted_tool(
             "WorkerCreate",
             &json!({
                 "cwd": cwd
@@ -6352,10 +7083,10 @@ mod tests {
         .expect("WorkerCreate should succeed");
         let output: serde_json::Value = serde_json::from_str(&created).expect("json");
 
-        // worktree is under /tmp, so config roots auto-resolve trust
+        // Project-controlled trustedRoots must not grant trust to a worker.
         assert_eq!(
-            output["trust_auto_resolve"], true,
-            "config-level trustedRoots should auto-resolve trust without per-call override"
+            output["trust_auto_resolve"], false,
+            "config-level trustedRoots should not auto-resolve trust without per-call override"
         );
 
         fs::remove_dir_all(&worktree).ok();
@@ -6364,7 +7095,7 @@ mod tests {
     #[test]
     fn worker_terminate_sets_finished_status() {
         // Create a worker in running state
-        let created = execute_tool(
+        let created = execute_trusted_tool(
             "WorkerCreate",
             &json!({"cwd": "/tmp/terminate-test", "trusted_roots": ["/tmp"]}),
         )
@@ -6373,7 +7104,7 @@ mod tests {
         let worker_id = output["worker_id"].as_str().expect("worker_id").to_string();
 
         // Terminate
-        let terminated = execute_tool("WorkerTerminate", &json!({"worker_id": worker_id}))
+        let terminated = execute_trusted_tool("WorkerTerminate", &json!({"worker_id": worker_id}))
             .expect("WorkerTerminate should succeed");
         let term_output: serde_json::Value = serde_json::from_str(&terminated).expect("json");
         assert_eq!(
@@ -6389,7 +7120,7 @@ mod tests {
     #[test]
     fn worker_restart_resets_to_spawning() {
         // Create and advance worker to ready_for_prompt
-        let created = execute_tool(
+        let created = execute_trusted_tool(
             "WorkerCreate",
             &json!({"cwd": "/tmp/restart-test", "trusted_roots": ["/tmp"]}),
         )
@@ -6398,14 +7129,14 @@ mod tests {
         let worker_id = output["worker_id"].as_str().expect("worker_id").to_string();
 
         // Advance to ready_for_prompt via observe
-        execute_tool(
+        execute_trusted_tool(
             "WorkerObserve",
             &json!({"worker_id": worker_id, "screen_text": "Ready for input\n>"}),
         )
         .expect("WorkerObserve should succeed");
 
         // Restart
-        let restarted = execute_tool("WorkerRestart", &json!({"worker_id": worker_id}))
+        let restarted = execute_trusted_tool("WorkerRestart", &json!({"worker_id": worker_id}))
             .expect("WorkerRestart should succeed");
         let restart_output: serde_json::Value = serde_json::from_str(&restarted).expect("json");
         assert_eq!(
@@ -6424,7 +7155,7 @@ mod tests {
 
     #[test]
     fn worker_get_returns_worker_state() {
-        let created = execute_tool(
+        let created = execute_trusted_tool(
             "WorkerCreate",
             &json!({"cwd": "/tmp/worker-get-test", "trusted_roots": ["/tmp"]}),
         )
@@ -6432,7 +7163,7 @@ mod tests {
         let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
         let worker_id = created_output["worker_id"].as_str().expect("worker_id");
 
-        let fetched = execute_tool("WorkerGet", &json!({"worker_id": worker_id}))
+        let fetched = execute_trusted_tool("WorkerGet", &json!({"worker_id": worker_id}))
             .expect("WorkerGet should succeed");
         let fetched_output: serde_json::Value = serde_json::from_str(&fetched).expect("json");
         assert_eq!(fetched_output["worker_id"], worker_id);
@@ -6442,7 +7173,7 @@ mod tests {
 
     #[test]
     fn worker_get_on_unknown_id_returns_error() {
-        let result = execute_tool(
+        let result = execute_trusted_tool(
             "WorkerGet",
             &json!({"worker_id": "worker_nonexistent_get_00000000"}),
         );
@@ -6458,7 +7189,7 @@ mod tests {
 
     #[test]
     fn worker_await_ready_on_spawning_worker_returns_not_ready() {
-        let created = execute_tool(
+        let created = execute_trusted_tool(
             "WorkerCreate",
             &json!({"cwd": "/tmp/worker-await-not-ready"}),
         )
@@ -6467,7 +7198,7 @@ mod tests {
         let worker_id = created_output["worker_id"].as_str().expect("worker_id");
 
         // Worker is still in spawning — await_ready should return not-ready snapshot
-        let snapshot = execute_tool("WorkerAwaitReady", &json!({"worker_id": worker_id}))
+        let snapshot = execute_trusted_tool("WorkerAwaitReady", &json!({"worker_id": worker_id}))
             .expect("WorkerAwaitReady should succeed even when not ready");
         let snap_output: serde_json::Value = serde_json::from_str(&snapshot).expect("json");
         assert_eq!(
@@ -6479,7 +7210,7 @@ mod tests {
 
     #[test]
     fn worker_send_prompt_on_non_ready_worker_returns_error() {
-        let created = execute_tool(
+        let created = execute_trusted_tool(
             "WorkerCreate",
             &json!({"cwd": "/tmp/worker-send-not-ready"}),
         )
@@ -6487,7 +7218,7 @@ mod tests {
         let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
         let worker_id = created_output["worker_id"].as_str().expect("worker_id");
 
-        let result = execute_tool(
+        let result = execute_trusted_tool(
             "WorkerSendPrompt",
             &json!({"worker_id": worker_id, "prompt": "too early"}),
         );
@@ -6510,7 +7241,7 @@ mod tests {
         let state_path = worktree.join(".claw").join("worker-state.json");
 
         // 1. Create worker WITHOUT trusted_roots
-        let created = execute_tool("WorkerCreate", &json!({"cwd": cwd}))
+        let created = execute_trusted_tool("WorkerCreate", &json!({"cwd": cwd}))
             .expect("WorkerCreate should succeed");
         let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
         let worker_id = created_output["worker_id"]
@@ -6533,7 +7264,7 @@ mod tests {
         );
 
         // 2. Force trust_required via observe
-        execute_tool(
+        execute_trusted_tool(
             "WorkerObserve",
             &json!({"worker_id": worker_id, "screen_text": "Do you trust the files in this folder?"}),
         )
@@ -6550,7 +7281,7 @@ mod tests {
         assert!(state["seconds_since_update"].is_number());
 
         // 3. WorkerResolveTrust -> state file reflects recovery
-        execute_tool("WorkerResolveTrust", &json!({"worker_id": worker_id}))
+        execute_trusted_tool("WorkerResolveTrust", &json!({"worker_id": worker_id}))
             .expect("WorkerResolveTrust should succeed");
         let state: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&state_path).expect("read state"))
@@ -6562,7 +7293,7 @@ mod tests {
         assert_eq!(state["trust_gate_cleared"], true);
 
         // 4. Observe ready screen -> state file shows ready_for_prompt
-        execute_tool(
+        execute_trusted_tool(
             "WorkerObserve",
             &json!({"worker_id": worker_id, "screen_text": "Ready for input\n>"}),
         )
@@ -6585,8 +7316,9 @@ mod tests {
     #[test]
     fn stall_detect_and_resolve_trust_end_to_end() {
         // 1. Create worker WITHOUT trusted_roots so trust won't auto-resolve
-        let created = execute_tool("WorkerCreate", &json!({"cwd": "/no/trusted/root/here"}))
-            .expect("WorkerCreate should succeed");
+        let created =
+            execute_trusted_tool("WorkerCreate", &json!({"cwd": "/no/trusted/root/here"}))
+                .expect("WorkerCreate should succeed");
         let created_output: serde_json::Value = serde_json::from_str(&created).expect("json");
         let worker_id = created_output["worker_id"]
             .as_str()
@@ -6595,7 +7327,7 @@ mod tests {
         assert_eq!(created_output["trust_auto_resolve"], false);
 
         // 2. Observe trust prompt screen text -> worker stalls at trust_required
-        let stalled = execute_tool(
+        let stalled = execute_trusted_tool(
             "WorkerObserve",
             &json!({
                 "worker_id": worker_id,
@@ -6610,7 +7342,7 @@ mod tests {
         );
         assert_eq!(stalled_output["trust_gate_cleared"], false);
         // 3. Clawhip calls WorkerResolveTrust to unblock
-        let resolved = execute_tool("WorkerResolveTrust", &json!({"worker_id": worker_id}))
+        let resolved = execute_trusted_tool("WorkerResolveTrust", &json!({"worker_id": worker_id}))
             .expect("WorkerResolveTrust should succeed");
         let resolved_output: serde_json::Value = serde_json::from_str(&resolved).expect("json");
         assert_eq!(
@@ -6620,7 +7352,7 @@ mod tests {
         assert_eq!(resolved_output["trust_gate_cleared"], true);
 
         // 4. Ready screen text now advances worker normally
-        let ready = execute_tool(
+        let ready = execute_trusted_tool(
             "WorkerObserve",
             &json!({
                 "worker_id": worker_id,
@@ -6638,7 +7370,7 @@ mod tests {
     #[test]
     fn stall_detect_and_restart_recovery_end_to_end() {
         // Worker stalls at trust_required, clawhip restarts instead of resolving
-        let created = execute_tool(
+        let created = execute_trusted_tool(
             "WorkerCreate",
             &json!({"cwd": "/no/trusted/root/restart-test"}),
         )
@@ -6650,7 +7382,7 @@ mod tests {
             .to_string();
 
         // Force trust_required
-        let stalled = execute_tool(
+        let stalled = execute_trusted_tool(
             "WorkerObserve",
             &json!({
                 "worker_id": worker_id,
@@ -6662,7 +7394,7 @@ mod tests {
         assert_eq!(stalled_output["status"], "trust_required");
 
         // WorkerRestart resets the worker
-        let restarted = execute_tool("WorkerRestart", &json!({"worker_id": worker_id}))
+        let restarted = execute_trusted_tool("WorkerRestart", &json!({"worker_id": worker_id}))
             .expect("WorkerRestart should succeed");
         let restarted_output: serde_json::Value = serde_json::from_str(&restarted).expect("json");
         assert_eq!(
@@ -6677,7 +7409,7 @@ mod tests {
 
     #[test]
     fn worker_terminate_on_unknown_id_returns_error() {
-        let result = execute_tool(
+        let result = execute_trusted_tool(
             "WorkerTerminate",
             &json!({"worker_id": "worker_nonexistent_00000000"}),
         );
@@ -6690,7 +7422,7 @@ mod tests {
 
     #[test]
     fn worker_restart_on_unknown_id_returns_error() {
-        let result = execute_tool(
+        let result = execute_trusted_tool(
             "WorkerRestart",
             &json!({"worker_id": "worker_nonexistent_00000001"}),
         );
@@ -6703,7 +7435,7 @@ mod tests {
 
     #[test]
     fn worker_observe_completion_success_finish_sets_finished_status() {
-        let created = execute_tool(
+        let created = execute_trusted_tool(
             "WorkerCreate",
             &json!({"cwd": "/tmp/observe-completion-test", "trusted_roots": ["/tmp"]}),
         )
@@ -6711,7 +7443,7 @@ mod tests {
         let output: serde_json::Value = serde_json::from_str(&created).expect("json");
         let worker_id = output["worker_id"].as_str().expect("worker_id").to_string();
 
-        let completed = execute_tool(
+        let completed = execute_trusted_tool(
             "WorkerObserveCompletion",
             &json!({
                 "worker_id": worker_id,
@@ -6727,7 +7459,7 @@ mod tests {
 
     #[test]
     fn worker_observe_completion_degraded_provider_sets_failed_status() {
-        let created = execute_tool(
+        let created = execute_trusted_tool(
             "WorkerCreate",
             &json!({"cwd": "/tmp/observe-degraded-test", "trusted_roots": ["/tmp"]}),
         )
@@ -6736,7 +7468,7 @@ mod tests {
         let worker_id = output["worker_id"].as_str().expect("worker_id").to_string();
 
         // finish=unknown + 0 tokens = degraded provider classification
-        let failed = execute_tool(
+        let failed = execute_trusted_tool(
             "WorkerObserveCompletion",
             &json!({
                 "worker_id": worker_id,
@@ -6760,7 +7492,7 @@ mod tests {
 
     #[test]
     fn worker_tools_detect_misdelivery_and_arm_prompt_replay() {
-        let created = execute_tool(
+        let created = execute_trusted_tool(
             "WorkerCreate",
             &json!({
                 "cwd": "/tmp/repo/worker-misdelivery"
@@ -6773,7 +7505,7 @@ mod tests {
             .expect("worker id")
             .to_string();
 
-        execute_tool(
+        execute_trusted_tool(
             "WorkerObserve",
             &json!({
                 "worker_id": worker_id,
@@ -6782,7 +7514,7 @@ mod tests {
         )
         .expect("worker should become ready");
 
-        execute_tool(
+        execute_trusted_tool(
             "WorkerSendPrompt",
             &json!({
                 "worker_id": worker_id,
@@ -6791,7 +7523,7 @@ mod tests {
         )
         .expect("prompt send should succeed");
 
-        let recovered = execute_tool(
+        let recovered = execute_trusted_tool(
             "WorkerObserve",
             &json!({
                 "worker_id": worker_id,
@@ -6812,7 +7544,7 @@ mod tests {
             true
         );
 
-        let replayed = execute_tool(
+        let replayed = execute_trusted_tool(
             "WorkerSendPrompt",
             &json!({
                 "worker_id": worker_id
@@ -6847,11 +7579,23 @@ mod tests {
     }
 
     #[test]
+    fn global_tool_registry_rejects_execution_without_enforcer() {
+        let registry = GlobalToolRegistry::builtin();
+        let error = registry
+            .execute("read_file", &json!({ "path": "Cargo.toml" }))
+            .expect_err("unenforced execution must be rejected");
+        assert!(error.contains("PermissionEnforcer"));
+    }
+
+    #[test]
     fn subagent_tool_executor_denies_blocked_tool_before_dispatch() {
         // given
         let policy = permission_policy_for_mode(PermissionMode::ReadOnly);
-        let mut executor = SubagentToolExecutor::new(BTreeSet::from([String::from("write_file")]))
-            .with_enforcer(PermissionEnforcer::new(policy));
+        let mut executor = SubagentToolExecutor::new(
+            BTreeSet::from([String::from("write_file")]),
+            PermissionEnforcer::new(policy),
+            NetworkCapability::none(),
+        );
 
         // when
         let error = executor
@@ -6959,7 +7703,7 @@ mod tests {
             )
         }));
 
-        let result = execute_tool(
+        let result = execute_trusted_tool(
             "WebFetch",
             &json!({
                 "url": format!("http://{}/page", server.addr()),
@@ -6975,7 +7719,7 @@ mod tests {
         assert!(summary.contains("Test Page"));
         assert!(summary.contains("Hello world from local server"));
 
-        let titled = execute_tool(
+        let titled = execute_trusted_tool(
             "WebFetch",
             &json!({
                 "url": format!("http://{}/page", server.addr()),
@@ -6995,7 +7739,7 @@ mod tests {
             HttpResponse::text(200, "OK", "plain text response")
         }));
 
-        let result = execute_tool(
+        let result = execute_trusted_tool(
             "WebFetch",
             &json!({
                 "url": format!("http://{}/plain", server.addr()),
@@ -7011,7 +7755,7 @@ mod tests {
             .expect("result")
             .contains("plain text response"));
 
-        let error = execute_tool(
+        let error = execute_trusted_tool(
             "WebFetch",
             &json!({
                 "url": "not a url",
@@ -7020,6 +7764,149 @@ mod tests {
         )
         .expect_err("invalid URL should fail");
         assert!(error.contains("relative URL without a base") || error.contains("invalid"));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn web_broker_security_assertions_cover_remaining_rows() {
+        let policy_cases = [
+            ("webfetch_http_https_validation", "file:///tmp/test"),
+            ("webfetch_loopback_denial", "http://localhost:80"),
+            ("webfetch_private_address_denial", "http://10.0.0.1:80"),
+            ("webfetch_link_local_denial", "http://169.254.1.1:80"),
+            ("webfetch_metadata_denial", "http://169.254.169.254:80"),
+            ("webfetch_ipv6_denial", "http://[fd00::1]:80"),
+            (
+                "webfetch_ipv4_mapped_ipv6_denial",
+                "http://[::ffff:127.0.0.1]:80",
+            ),
+        ];
+        for (capability, url) in policy_cases {
+            assert!(
+                NetworkCapability::unrestricted()
+                    .authorize_web_url(url)
+                    .is_err(),
+                "must deny {url}"
+            );
+            println!("CLAW_SECURITY_ASSERTION {capability} PASS");
+        }
+
+        let redirect = TestServer::spawn(Arc::new(|request: &str| {
+            assert!(request.starts_with("GET /start "));
+            HttpResponse::redirect("http://10.0.0.1/forbidden")
+        }));
+        let error = execute_trusted_tool(
+            "WebFetch",
+            &json!({
+                "url": format!("http://{}/start", redirect.addr()),
+                "prompt": "redirect"
+            }),
+        )
+        .expect_err("redirect to private address must fail");
+        assert!(error.contains("private") || error.contains("denied"));
+
+        let timeout_server = TestServer::spawn(Arc::new(|_| {
+            thread::sleep(Duration::from_secs(1));
+            HttpResponse::text(200, "OK", "late")
+        }));
+        let client = super::build_bound_http_client_with_timeout(
+            &NetworkCapability::unrestricted(),
+            "127.0.0.1",
+            timeout_server.addr(),
+            Duration::from_millis(50),
+        )
+        .expect("build bounded timeout client");
+        let timeout = client
+            .get(format!(
+                "http://127.0.0.1:{}/slow",
+                timeout_server.addr().port()
+            ))
+            .send()
+            .expect_err("delayed response must hit timeout");
+        assert!(timeout.is_timeout());
+
+        let body_server = TestServer::spawn(Arc::new(|_| {
+            HttpResponse::text(200, "OK", &"x".repeat(2 * 1024 * 1024 + 1))
+        }));
+        let error = execute_trusted_tool(
+            "WebFetch",
+            &json!({
+                "url": format!("http://{}/large", body_server.addr()),
+                "prompt": "body bound"
+            }),
+        )
+        .expect_err("oversized body must fail");
+        assert!(error.contains("limit"));
+
+        let guard = env_guard();
+        std::env::set_var("OPENAI_API_KEY", "CLAW_TEST_OPENAI_CANARY");
+        std::env::set_var("ANTHROPIC_API_KEY", "CLAW_TEST_ANTHROPIC_CANARY");
+        std::env::set_var("CLAW_SECURITY_CANARY", "CLAW_TEST_WEB_HOST_CANARY");
+        let captured = Arc::new(Mutex::new(String::new()));
+        let captured_request = Arc::clone(&captured);
+        let header_server = TestServer::spawn(Arc::new(move |request: &str| {
+            *captured_request.lock().expect("capture lock") = request.to_string();
+            HttpResponse::text(200, "OK", "safe")
+        }));
+        execute_trusted_tool(
+            "WebFetch",
+            &json!({
+                "url": format!("http://{}/headers", header_server.addr()),
+                "prompt": "header isolation"
+            }),
+        )
+        .expect("header-isolation request should succeed");
+        let request = captured.lock().expect("capture lock").clone();
+        for secret in [
+            "CLAW_TEST_OPENAI_CANARY",
+            "CLAW_TEST_ANTHROPIC_CANARY",
+            "CLAW_TEST_WEB_HOST_CANARY",
+        ] {
+            assert!(!request.contains(secret));
+        }
+        assert!(!request.contains("Authorization:"));
+        assert!(!request.contains("Cookie:"));
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("CLAW_SECURITY_CANARY");
+        drop(guard);
+
+        let allowed = TestServer::spawn(Arc::new(|request: &str| {
+            assert!(request.starts_with("GET /pinned "));
+            HttpResponse::text(200, "OK", "authorized")
+        }));
+        let forbidden = TcpListener::bind("127.0.0.1:0").expect("bind forbidden listener");
+        forbidden
+            .set_nonblocking(true)
+            .expect("set forbidden listener nonblocking");
+        let pinned = super::build_bound_http_client(
+            &NetworkCapability::unrestricted(),
+            "example.test",
+            allowed.addr(),
+        )
+        .expect("build pinned client");
+        let response = pinned
+            .get(format!(
+                "http://example.test:{}/pinned",
+                allowed.addr().port()
+            ))
+            .send()
+            .expect("authorized address should receive request");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(matches!(
+            forbidden.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+
+        for capability in [
+            "webfetch_redirect_revalidation",
+            "webfetch_timeout_bound",
+            "webfetch_body_bound",
+            "webfetch_header_credential_isolation",
+            "webfetch_dns_rebinding_toctou",
+        ] {
+            println!("CLAW_SECURITY_ASSERTION {capability} PASS");
+        }
     }
 
     #[test]
@@ -7050,7 +7937,7 @@ mod tests {
             "CLAWD_WEB_SEARCH_BASE_URL",
             format!("http://{}/search", server.addr()),
         );
-        let result = execute_tool(
+        let result = execute_trusted_tool(
             "WebSearch",
             &json!({
                 "query": "rust web search",
@@ -7098,7 +7985,7 @@ mod tests {
             "CLAWD_WEB_SEARCH_BASE_URL",
             format!("http://{}/fallback", server.addr()),
         );
-        let result = execute_tool(
+        let result = execute_trusted_tool(
             "WebSearch",
             &json!({
                 "query": "generic links"
@@ -7119,7 +8006,7 @@ mod tests {
         assert_eq!(content[1]["url"], "https://docs.rs/tokio");
 
         std::env::set_var("CLAWD_WEB_SEARCH_BASE_URL", "://bad-base-url");
-        let error = execute_tool("WebSearch", &json!({ "query": "generic links" }))
+        let error = execute_trusted_tool("WebSearch", &json!({ "query": "generic links" }))
             .expect_err("invalid base URL should fail");
         std::env::remove_var("CLAWD_WEB_SEARCH_BASE_URL");
         assert!(error.contains("relative URL without a base") || error.contains("empty host"));
@@ -7190,7 +8077,7 @@ mod tests {
         let path = temp_path("todos.json");
         std::env::set_var("CLAWD_TODO_STORE", &path);
 
-        let first = execute_tool(
+        let first = execute_trusted_tool(
             "TodoWrite",
             &json!({
                 "todos": [
@@ -7203,7 +8090,7 @@ mod tests {
         let first_output: serde_json::Value = serde_json::from_str(&first).expect("valid json");
         assert_eq!(first_output["oldTodos"].as_array().expect("array").len(), 0);
 
-        let second = execute_tool(
+        let second = execute_trusted_tool(
             "TodoWrite",
             &json!({
                 "todos": [
@@ -7237,12 +8124,12 @@ mod tests {
         let path = temp_path("todos-errors.json");
         std::env::set_var("CLAWD_TODO_STORE", &path);
 
-        let empty = execute_tool("TodoWrite", &json!({ "todos": [] }))
+        let empty = execute_trusted_tool("TodoWrite", &json!({ "todos": [] }))
             .expect_err("empty todos should fail");
         assert!(empty.contains("todos must not be empty"));
 
         // Multiple in_progress items are now allowed for parallel workflows
-        let _multi_active = execute_tool(
+        let _multi_active = execute_trusted_tool(
             "TodoWrite",
             &json!({
                 "todos": [
@@ -7253,7 +8140,7 @@ mod tests {
         )
         .expect("multiple in-progress todos should succeed");
 
-        let blank_content = execute_tool(
+        let blank_content = execute_trusted_tool(
             "TodoWrite",
             &json!({
                 "todos": [
@@ -7264,7 +8151,7 @@ mod tests {
         .expect_err("blank content should fail");
         assert!(blank_content.contains("todo content must not be empty"));
 
-        let nudge = execute_tool(
+        let nudge = execute_trusted_tool(
             "TodoWrite",
             &json!({
                 "todos": [
@@ -7296,7 +8183,7 @@ mod tests {
         let original_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &home);
 
-        let result = execute_tool(
+        let result = execute_trusted_tool(
             "Skill",
             &json!({
                 "skill": "help",
@@ -7316,7 +8203,7 @@ mod tests {
             .expect("prompt")
             .contains("Guide on using oh-my-codex plugin"));
 
-        let dollar_result = execute_tool(
+        let dollar_result = execute_trusted_tool(
             "Skill",
             &json!({
                 "skill": "$help"
@@ -7361,7 +8248,7 @@ mod tests {
         let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&root).expect("set cwd");
 
-        let skill_result = execute_tool("Skill", &json!({ "skill": "$plan" }))
+        let skill_result = execute_trusted_tool("Skill", &json!({ "skill": "$plan" }))
             .expect("project-local skill should resolve");
         let skill_output: serde_json::Value =
             serde_json::from_str(&skill_result).expect("valid json");
@@ -7370,7 +8257,7 @@ mod tests {
             .expect("path")
             .ends_with(".claw/skills/plan/SKILL.md"));
 
-        let command_result = execute_tool("Skill", &json!({ "skill": "/handoff" }))
+        let command_result = execute_trusted_tool("Skill", &json!({ "skill": "/handoff" }))
             .expect("legacy command should resolve");
         let command_output: serde_json::Value =
             serde_json::from_str(&command_result).expect("valid json");
@@ -7408,7 +8295,7 @@ mod tests {
         std::env::remove_var("CODEX_HOME");
         std::env::set_current_dir(&nested).expect("set cwd");
 
-        let result = execute_tool("Skill", &json!({ "skill": "trace" }))
+        let result = execute_trusted_tool("Skill", &json!({ "skill": "trace" }))
             .expect("project-local skill should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
@@ -7466,9 +8353,9 @@ mod tests {
         std::env::remove_var("CODEX_HOME");
         std::env::set_current_dir(&nested).expect("set cwd");
 
-        let omc_result =
-            execute_tool("Skill", &json!({ "skill": "hud" })).expect("omc skill should resolve");
-        let agents_result = execute_tool("Skill", &json!({ "skill": "trace" }))
+        let omc_result = execute_trusted_tool("Skill", &json!({ "skill": "hud" }))
+            .expect("omc skill should resolve");
+        let agents_result = execute_trusted_tool("Skill", &json!({ "skill": "trace" }))
             .expect("agents skill should resolve");
 
         let omc_output: serde_json::Value = serde_json::from_str(&omc_result).expect("valid json");
@@ -7530,7 +8417,7 @@ mod tests {
         std::env::remove_var("CODEX_HOME");
         std::env::set_var("CLAUDE_CONFIG_DIR", &claude_config_dir);
 
-        let result = execute_tool("Skill", &json!({ "skill": "learned" }))
+        let result = execute_trusted_tool("Skill", &json!({ "skill": "learned" }))
             .expect("learned skill should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
@@ -7590,7 +8477,7 @@ mod tests {
         std::env::set_var("CLAUDE_CONFIG_DIR", &claude_config_dir);
 
         let direct_skill =
-            execute_tool("Skill", &json!({ "skill": "statusline" })).expect("direct skill");
+            execute_trusted_tool("Skill", &json!({ "skill": "statusline" })).expect("direct skill");
         let direct_skill_output: serde_json::Value =
             serde_json::from_str(&direct_skill).expect("valid skill json");
         assert!(direct_skill_output["path"]
@@ -7599,8 +8486,8 @@ mod tests {
             .ends_with("skills/statusline/SKILL.md"));
         assert_eq!(direct_skill_output["description"], "Claude config skill");
 
-        let legacy_command =
-            execute_tool("Skill", &json!({ "skill": "doctor-check" })).expect("direct command");
+        let legacy_command = execute_trusted_tool("Skill", &json!({ "skill": "doctor-check" }))
+            .expect("direct command");
         let legacy_command_output: serde_json::Value =
             serde_json::from_str(&legacy_command).expect("valid command json");
         assert!(legacy_command_output["path"]
@@ -7656,7 +8543,7 @@ mod tests {
         std::env::remove_var("CODEX_HOME");
         std::env::set_current_dir(&nested).expect("set cwd");
 
-        let result = execute_tool("Skill", &json!({ "skill": "team" }))
+        let result = execute_trusted_tool("Skill", &json!({ "skill": "team" }))
             .expect("legacy command markdown should resolve");
 
         let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
@@ -7684,7 +8571,7 @@ mod tests {
 
     #[test]
     fn tool_search_supports_keyword_and_select_queries() {
-        let keyword = execute_tool(
+        let keyword = execute_trusted_tool(
             "ToolSearch",
             &json!({"query": "web current", "max_results": 3}),
         )
@@ -7693,21 +8580,21 @@ mod tests {
         let matches = keyword_output["matches"].as_array().expect("matches");
         assert!(matches.iter().any(|value| value == "WebSearch"));
 
-        let selected = execute_tool("ToolSearch", &json!({"query": "select:Agent,Skill"}))
+        let selected = execute_trusted_tool("ToolSearch", &json!({"query": "select:Agent,Skill"}))
             .expect("ToolSearch should succeed");
         let selected_output: serde_json::Value =
             serde_json::from_str(&selected).expect("valid json");
         assert_eq!(selected_output["matches"][0], "Agent");
         assert_eq!(selected_output["matches"][1], "Skill");
 
-        let aliased = execute_tool("ToolSearch", &json!({"query": "AgentTool"}))
+        let aliased = execute_trusted_tool("ToolSearch", &json!({"query": "AgentTool"}))
             .expect("ToolSearch should support tool aliases");
         let aliased_output: serde_json::Value = serde_json::from_str(&aliased).expect("valid json");
         assert_eq!(aliased_output["matches"][0], "Agent");
         assert_eq!(aliased_output["normalized_query"], "agent");
 
         let selected_with_alias =
-            execute_tool("ToolSearch", &json!({"query": "select:AgentTool,Skill"}))
+            execute_trusted_tool("ToolSearch", &json!({"query": "select:AgentTool,Skill"}))
                 .expect("ToolSearch alias select should succeed");
         let selected_with_alias_output: serde_json::Value =
             serde_json::from_str(&selected_with_alias).expect("valid json");
@@ -7770,7 +8657,7 @@ mod tests {
         assert!(captured_job.allowed_tools.contains("read_file"));
         assert!(!captured_job.allowed_tools.contains("Agent"));
 
-        let normalized = execute_tool(
+        let normalized = execute_trusted_tool(
             "Agent",
             &json!({
                 "description": "Verify the branch",
@@ -7783,7 +8670,7 @@ mod tests {
             serde_json::from_str(&normalized).expect("valid json");
         assert_eq!(normalized_output["subagentType"], "Explore");
 
-        let named = execute_tool(
+        let named = execute_trusted_tool(
             "Agent",
             &json!({
                 "description": "Review the branch",
@@ -8424,7 +9311,9 @@ mod tests {
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let path = temp_path("subagent-input.txt");
+        let path = std::env::current_dir()
+            .expect("current directory should resolve")
+            .join(format!(".clawd-subagent-input-{}.txt", std::process::id()));
         std::fs::write(&path, "hello from child").expect("write input file");
 
         let mut runtime = ConversationRuntime::new(
@@ -8433,7 +9322,11 @@ mod tests {
                 calls: 0,
                 input_path: path.display().to_string(),
             },
-            SubagentToolExecutor::new(BTreeSet::from([String::from("read_file")])),
+            SubagentToolExecutor::new(
+                BTreeSet::from([String::from("read_file")]),
+                PermissionEnforcer::new(agent_permission_policy()),
+                NetworkCapability::none(),
+            ),
             agent_permission_policy(),
             vec![String::from("system prompt")],
         );
@@ -8462,7 +9355,7 @@ mod tests {
 
     #[test]
     fn agent_rejects_blank_required_fields() {
-        let missing_description = execute_tool(
+        let missing_description = execute_trusted_tool(
             "Agent",
             &json!({
                 "description": "  ",
@@ -8472,7 +9365,7 @@ mod tests {
         .expect_err("blank description should fail");
         assert!(missing_description.contains("description must not be empty"));
 
-        let missing_prompt = execute_tool(
+        let missing_prompt = execute_trusted_tool(
             "Agent",
             &json!({
                 "description": "Inspect branch",
@@ -8499,7 +9392,7 @@ mod tests {
         )
         .expect("write notebook");
 
-        let replaced = execute_tool(
+        let replaced = execute_trusted_tool(
             "NotebookEdit",
             &json!({
                 "notebook_path": path.display().to_string(),
@@ -8513,7 +9406,7 @@ mod tests {
         assert_eq!(replaced_output["cell_id"], "cell-a");
         assert_eq!(replaced_output["cell_type"], "code");
 
-        let inserted = execute_tool(
+        let inserted = execute_trusted_tool(
             "NotebookEdit",
             &json!({
                 "notebook_path": path.display().to_string(),
@@ -8526,7 +9419,7 @@ mod tests {
         .expect("NotebookEdit insert should succeed");
         let inserted_output: serde_json::Value = serde_json::from_str(&inserted).expect("json");
         assert_eq!(inserted_output["cell_type"], "markdown");
-        let appended = execute_tool(
+        let appended = execute_trusted_tool(
             "NotebookEdit",
             &json!({
                 "notebook_path": path.display().to_string(),
@@ -8538,7 +9431,7 @@ mod tests {
         let appended_output: serde_json::Value = serde_json::from_str(&appended).expect("json");
         assert_eq!(appended_output["cell_type"], "code");
 
-        let deleted = execute_tool(
+        let deleted = execute_trusted_tool(
             "NotebookEdit",
             &json!({
                 "notebook_path": path.display().to_string(),
@@ -8567,7 +9460,7 @@ mod tests {
     fn notebook_edit_rejects_invalid_inputs() {
         let text_path = temp_path("notebook.txt");
         fs::write(&text_path, "not a notebook").expect("write text file");
-        let wrong_extension = execute_tool(
+        let wrong_extension = execute_trusted_tool(
             "NotebookEdit",
             &json!({
                 "notebook_path": text_path.display().to_string(),
@@ -8585,7 +9478,7 @@ mod tests {
         )
         .expect("write empty notebook");
 
-        let missing_source = execute_tool(
+        let missing_source = execute_trusted_tool(
             "NotebookEdit",
             &json!({
                 "notebook_path": empty_notebook.display().to_string(),
@@ -8595,7 +9488,7 @@ mod tests {
         .expect_err("insert without source should fail");
         assert!(missing_source.contains("new_source is required"));
 
-        let missing_cell = execute_tool(
+        let missing_cell = execute_trusted_tool(
             "NotebookEdit",
             &json!({
                 "notebook_path": empty_notebook.display().to_string(),
@@ -8609,14 +9502,15 @@ mod tests {
 
     #[test]
     fn bash_tool_reports_success_exit_failure_timeout_and_background() {
-        let success = execute_tool("bash", &json!({ "command": "printf 'hello'" }))
+        let success = execute_trusted_tool("bash", &json!({ "command": "printf 'hello'" }))
             .expect("bash should succeed");
         let success_output: serde_json::Value = serde_json::from_str(&success).expect("json");
         assert_eq!(success_output["stdout"], "hello");
         assert_eq!(success_output["interrupted"], false);
 
-        let failure = execute_tool("bash", &json!({ "command": "printf 'oops' >&2; exit 7" }))
-            .expect("bash failure should still return structured output");
+        let failure =
+            execute_trusted_tool("bash", &json!({ "command": "printf 'oops' >&2; exit 7" }))
+                .expect("bash failure should still return structured output");
         let failure_output: serde_json::Value = serde_json::from_str(&failure).expect("json");
         assert_eq!(failure_output["returnCodeInterpretation"], "exit_code:7");
         assert!(failure_output["stderr"]
@@ -8624,7 +9518,7 @@ mod tests {
             .expect("stderr")
             .contains("oops"));
 
-        let timeout = execute_tool("bash", &json!({ "command": "sleep 1", "timeout": 10 }))
+        let timeout = execute_trusted_tool("bash", &json!({ "command": "sleep 1", "timeout": 10 }))
             .expect("bash timeout should return output");
         let timeout_output: serde_json::Value = serde_json::from_str(&timeout).expect("json");
         assert_eq!(timeout_output["interrupted"], true);
@@ -8634,7 +9528,7 @@ mod tests {
             .expect("stderr")
             .contains("Command exceeded timeout"));
 
-        let background = execute_tool(
+        let background = execute_trusted_tool(
             "bash",
             &json!({ "command": "sleep 1", "run_in_background": true }),
         )
@@ -8663,7 +9557,7 @@ mod tests {
         run_git(&root, &["checkout", "feature/stale-tests"]);
         std::env::set_current_dir(&root).expect("set cwd");
 
-        let output = execute_tool(
+        let output = execute_trusted_tool(
             "bash",
             &json!({ "command": "cargo test --workspace --all-targets" }),
         )
@@ -8713,7 +9607,7 @@ mod tests {
         run_git(&root, &["checkout", "feature/targeted-tests"]);
         std::env::set_current_dir(&root).expect("set cwd");
 
-        let output = execute_tool(
+        let output = execute_trusted_tool(
             "bash",
             &json!({ "command": "printf 'targeted ok'; cargo test -p runtime stale_branch" }),
         )
@@ -8738,7 +9632,7 @@ mod tests {
         let original_dir = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&root).expect("set cwd");
 
-        let write_create = execute_tool(
+        let write_create = execute_trusted_tool(
             "write_file",
             &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\nalpha\n" }),
         )
@@ -8748,7 +9642,7 @@ mod tests {
         assert_eq!(write_create_output["type"], "create");
         assert!(root.join("nested/demo.txt").exists());
 
-        let write_update = execute_tool(
+        let write_update = execute_trusted_tool(
             "write_file",
             &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\ngamma\n" }),
         )
@@ -8758,13 +9652,13 @@ mod tests {
         assert_eq!(write_update_output["type"], "update");
         assert_eq!(write_update_output["originalFile"], "alpha\nbeta\nalpha\n");
 
-        let read_full = execute_tool("read_file", &json!({ "path": "nested/demo.txt" }))
+        let read_full = execute_trusted_tool("read_file", &json!({ "path": "nested/demo.txt" }))
             .expect("read full should succeed");
         let read_full_output: serde_json::Value = serde_json::from_str(&read_full).expect("json");
         assert_eq!(read_full_output["file"]["content"], "alpha\nbeta\ngamma");
         assert_eq!(read_full_output["file"]["startLine"], 1);
 
-        let read_slice = execute_tool(
+        let read_slice = execute_trusted_tool(
             "read_file",
             &json!({ "path": "nested/demo.txt", "offset": 1, "limit": 1 }),
         )
@@ -8773,7 +9667,7 @@ mod tests {
         assert_eq!(read_slice_output["file"]["content"], "beta");
         assert_eq!(read_slice_output["file"]["startLine"], 2);
 
-        let read_past_end = execute_tool(
+        let read_past_end = execute_trusted_tool(
             "read_file",
             &json!({ "path": "nested/demo.txt", "offset": 50 }),
         )
@@ -8783,11 +9677,11 @@ mod tests {
         assert_eq!(read_past_end_output["file"]["content"], "");
         assert_eq!(read_past_end_output["file"]["startLine"], 4);
 
-        let read_error = execute_tool("read_file", &json!({ "path": "missing.txt" }))
+        let read_error = execute_trusted_tool("read_file", &json!({ "path": "missing.txt" }))
             .expect_err("missing file should fail");
         assert!(!read_error.is_empty());
 
-        let edit_once = execute_tool(
+        let edit_once = execute_trusted_tool(
             "edit_file",
             &json!({ "path": "nested/demo.txt", "old_string": "alpha", "new_string": "omega" }),
         )
@@ -8799,12 +9693,12 @@ mod tests {
             "omega\nbeta\ngamma\n"
         );
 
-        execute_tool(
+        execute_trusted_tool(
             "write_file",
             &json!({ "path": "nested/demo.txt", "content": "alpha\nbeta\nalpha\n" }),
         )
         .expect("reset file");
-        let edit_all = execute_tool(
+        let edit_all = execute_trusted_tool(
             "edit_file",
             &json!({
                 "path": "nested/demo.txt",
@@ -8821,14 +9715,14 @@ mod tests {
             "omega\nbeta\nomega\n"
         );
 
-        let edit_same = execute_tool(
+        let edit_same = execute_trusted_tool(
             "edit_file",
             &json!({ "path": "nested/demo.txt", "old_string": "omega", "new_string": "omega" }),
         )
         .expect_err("identical old/new should fail");
         assert!(edit_same.contains("must differ"));
 
-        let edit_missing = execute_tool(
+        let edit_missing = execute_trusted_tool(
             "edit_file",
             &json!({ "path": "nested/demo.txt", "old_string": "missing", "new_string": "omega" }),
         )
@@ -8856,7 +9750,7 @@ mod tests {
         .expect("write rust file");
         fs::write(root.join("nested/notes.txt"), "alpha\nbeta\n").expect("write txt file");
 
-        let globbed = execute_tool("glob_search", &json!({ "pattern": "nested/*.rs" }))
+        let globbed = execute_trusted_tool("glob_search", &json!({ "pattern": "nested/*.rs" }))
             .expect("glob should succeed");
         let globbed_output: serde_json::Value = serde_json::from_str(&globbed).expect("json");
         assert_eq!(globbed_output["numFiles"], 1);
@@ -8865,11 +9759,11 @@ mod tests {
             .expect("filename")
             .ends_with("nested/lib.rs"));
 
-        let glob_error = execute_tool("glob_search", &json!({ "pattern": "[" }))
+        let glob_error = execute_trusted_tool("glob_search", &json!({ "pattern": "[" }))
             .expect_err("invalid glob should fail");
         assert!(!glob_error.is_empty());
 
-        let grep_content = execute_tool(
+        let grep_content = execute_trusted_tool(
             "grep_search",
             &json!({
                 "pattern": "alpha",
@@ -8892,7 +9786,7 @@ mod tests {
             .expect("content")
             .contains("let alpha = 2;"));
 
-        let grep_count = execute_tool(
+        let grep_count = execute_trusted_tool(
             "grep_search",
             &json!({ "pattern": "alpha", "path": "nested", "output_mode": "count" }),
         )
@@ -8900,7 +9794,7 @@ mod tests {
         let grep_count_output: serde_json::Value = serde_json::from_str(&grep_count).expect("json");
         assert_eq!(grep_count_output["numMatches"], 3);
 
-        let grep_error = execute_tool(
+        let grep_error = execute_trusted_tool(
             "grep_search",
             &json!({ "pattern": "(alpha", "path": "nested" }),
         )
@@ -8914,8 +9808,8 @@ mod tests {
     #[test]
     fn sleep_waits_and_reports_duration() {
         let started = std::time::Instant::now();
-        let result =
-            execute_tool("Sleep", &json!({"duration_ms": 20})).expect("Sleep should succeed");
+        let result = execute_trusted_tool("Sleep", &json!({"duration_ms": 20}))
+            .expect("Sleep should succeed");
         let elapsed = started.elapsed();
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["duration_ms"], 20);
@@ -8928,15 +9822,15 @@ mod tests {
 
     #[test]
     fn given_excessive_duration_when_sleep_then_rejects_with_error() {
-        let result = execute_tool("Sleep", &json!({"duration_ms": 999_999_999_u64}));
+        let result = execute_trusted_tool("Sleep", &json!({"duration_ms": 999_999_999_u64}));
         let error = result.expect_err("excessive sleep should fail");
         assert!(error.contains("exceeds maximum allowed sleep"));
     }
 
     #[test]
     fn given_zero_duration_when_sleep_then_succeeds() {
-        let result =
-            execute_tool("Sleep", &json!({"duration_ms": 0})).expect("0ms sleep should succeed");
+        let result = execute_trusted_tool("Sleep", &json!({"duration_ms": 0}))
+            .expect("0ms sleep should succeed");
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["duration_ms"], 0);
     }
@@ -8952,7 +9846,7 @@ mod tests {
         ));
         std::fs::write(&attachment, b"png-data").expect("write attachment");
 
-        let result = execute_tool(
+        let result = execute_trusted_tool(
             "SendUserMessage",
             &json!({
                 "message": "hello user",
@@ -8998,11 +9892,12 @@ mod tests {
         std::env::remove_var("CLAW_CONFIG_HOME");
         std::env::set_current_dir(&cwd).expect("set cwd");
 
-        let get = execute_tool("Config", &json!({"setting": "verbose"})).expect("get config");
+        let get =
+            execute_trusted_tool("Config", &json!({"setting": "verbose"})).expect("get config");
         let get_output: serde_json::Value = serde_json::from_str(&get).expect("json");
         assert_eq!(get_output["value"], false);
 
-        let set = execute_tool(
+        let set = execute_trusted_tool(
             "Config",
             &json!({"setting": "permissions.defaultMode", "value": "plan"}),
         )
@@ -9011,15 +9906,15 @@ mod tests {
         assert_eq!(set_output["operation"], "set");
         assert_eq!(set_output["newValue"], "plan");
 
-        let invalid = execute_tool(
+        let invalid = execute_trusted_tool(
             "Config",
             &json!({"setting": "permissions.defaultMode", "value": "bogus"}),
         )
         .expect_err("invalid config value should error");
         assert!(invalid.contains("Invalid value"));
 
-        let unknown =
-            execute_tool("Config", &json!({"setting": "nope"})).expect("unknown setting result");
+        let unknown = execute_trusted_tool("Config", &json!({"setting": "nope"}))
+            .expect("unknown setting result");
         let unknown_output: serde_json::Value = serde_json::from_str(&unknown).expect("json");
         assert_eq!(unknown_output["success"], false);
 
@@ -9064,7 +9959,7 @@ mod tests {
         std::env::remove_var("CLAW_CONFIG_HOME");
         std::env::set_current_dir(&cwd).expect("set cwd");
 
-        let enter = execute_tool("EnterPlanMode", &json!({})).expect("enter plan mode");
+        let enter = execute_trusted_tool("EnterPlanMode", &json!({})).expect("enter plan mode");
         let enter_output: serde_json::Value = serde_json::from_str(&enter).expect("json");
         assert_eq!(enter_output["changed"], true);
         assert_eq!(enter_output["managed"], true);
@@ -9080,7 +9975,7 @@ mod tests {
         assert!(state.contains(r#""hadLocalOverride": true"#));
         assert!(state.contains(r#""previousLocalMode": "acceptEdits""#));
 
-        let exit = execute_tool("ExitPlanMode", &json!({})).expect("exit plan mode");
+        let exit = execute_trusted_tool("ExitPlanMode", &json!({})).expect("exit plan mode");
         let exit_output: serde_json::Value = serde_json::from_str(&exit).expect("json");
         assert_eq!(exit_output["changed"], true);
         assert_eq!(exit_output["managed"], false);
@@ -9132,12 +10027,12 @@ mod tests {
         std::env::remove_var("CLAW_CONFIG_HOME");
         std::env::set_current_dir(&cwd).expect("set cwd");
 
-        let enter = execute_tool("EnterPlanMode", &json!({})).expect("enter plan mode");
+        let enter = execute_trusted_tool("EnterPlanMode", &json!({})).expect("enter plan mode");
         let enter_output: serde_json::Value = serde_json::from_str(&enter).expect("json");
         assert_eq!(enter_output["previousLocalMode"], serde_json::Value::Null);
         assert_eq!(enter_output["currentLocalMode"], "plan");
 
-        let exit = execute_tool("ExitPlanMode", &json!({})).expect("exit plan mode");
+        let exit = execute_trusted_tool("ExitPlanMode", &json!({})).expect("exit plan mode");
         let exit_output: serde_json::Value = serde_json::from_str(&exit).expect("json");
         assert_eq!(exit_output["changed"], true);
         assert_eq!(exit_output["currentLocalMode"], serde_json::Value::Null);
@@ -9171,8 +10066,9 @@ mod tests {
 
     #[test]
     fn structured_output_echoes_input_payload() {
-        let result = execute_tool("StructuredOutput", &json!({"ok": true, "items": [1, 2, 3]}))
-            .expect("StructuredOutput should succeed");
+        let result =
+            execute_trusted_tool("StructuredOutput", &json!({"ok": true, "items": [1, 2, 3]}))
+                .expect("StructuredOutput should succeed");
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["data"], "Structured output provided successfully");
         assert_eq!(output["structured_output"]["ok"], true);
@@ -9181,14 +10077,14 @@ mod tests {
 
     #[test]
     fn given_empty_payload_when_structured_output_then_rejects_with_error() {
-        let result = execute_tool("StructuredOutput", &json!({}));
+        let result = execute_trusted_tool("StructuredOutput", &json!({}));
         let error = result.expect_err("empty payload should fail");
         assert!(error.contains("must not be empty"));
     }
 
     #[test]
     fn repl_executes_python_code() {
-        let result = execute_tool(
+        let result = execute_trusted_tool(
             "REPL",
             &json!({"language": "python", "code": "print(1 + 1)", "timeout_ms": 500}),
         )
@@ -9201,7 +10097,7 @@ mod tests {
 
     #[test]
     fn given_empty_code_when_repl_then_rejects_with_error() {
-        let result = execute_tool("REPL", &json!({"language": "python", "code": "   "}));
+        let result = execute_trusted_tool("REPL", &json!({"language": "python", "code": "   "}));
 
         let error = result.expect_err("empty REPL code should fail");
         assert!(error.contains("code must not be empty"));
@@ -9209,7 +10105,7 @@ mod tests {
 
     #[test]
     fn given_unsupported_language_when_repl_then_rejects_with_error() {
-        let result = execute_tool("REPL", &json!({"language": "ruby", "code": "puts 1"}));
+        let result = execute_trusted_tool("REPL", &json!({"language": "ruby", "code": "puts 1"}));
 
         let error = result.expect_err("unsupported REPL language should fail");
         assert!(error.contains("unsupported REPL language: ruby"));
@@ -9217,7 +10113,7 @@ mod tests {
 
     #[test]
     fn given_timeout_ms_when_repl_blocks_then_returns_timeout_error() {
-        let result = execute_tool(
+        let result = execute_trusted_tool(
             "REPL",
             &json!({
                 "language": "python",
@@ -9261,13 +10157,13 @@ printf 'pwsh:%s' "$1"
         let original_path = std::env::var("PATH").unwrap_or_default();
         std::env::set_var("PATH", format!("{}:{}", dir.display(), original_path));
 
-        let result = execute_tool(
+        let result = execute_trusted_tool(
             "PowerShell",
             &json!({"command": "Write-Output hello", "timeout": 1000}),
         )
         .expect("PowerShell should succeed");
 
-        let background = execute_tool(
+        let background = execute_trusted_tool(
             "PowerShell",
             &json!({"command": "Write-Output hello", "run_in_background": true}),
         )
@@ -9302,7 +10198,7 @@ printf 'pwsh:%s' "$1"
         std::fs::create_dir_all(&empty_dir).expect("create empty dir");
         std::env::set_var("PATH", empty_dir.display().to_string());
 
-        let err = execute_tool("PowerShell", &json!({"command": "Write-Output hello"}))
+        let err = execute_trusted_tool("PowerShell", &json!({"command": "Write-Output hello"}))
             .expect_err("PowerShell should fail when shell is missing");
 
         std::env::set_var("PATH", original_path);
@@ -9372,7 +10268,9 @@ printf 'pwsh:%s' "$1"
         let _guard = env_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let root = temp_path("perm-read");
+        let root = std::env::current_dir()
+            .expect("current directory should resolve")
+            .join(format!(".clawd-perm-read-{}", std::process::id()));
         fs::create_dir_all(&root).expect("create root");
         let file = root.join("readable.txt");
         fs::write(&file, "content\n").expect("write test file");
@@ -9402,9 +10300,8 @@ printf 'pwsh:%s' "$1"
         let registry = super::GlobalToolRegistry::builtin();
         let result = registry
             .execute("bash", &json!({ "command": "printf 'ok'" }))
-            .expect("bash should succeed without enforcer");
-        let output: serde_json::Value = serde_json::from_str(&result).expect("json");
-        assert_eq!(output["stdout"], "ok");
+            .expect_err("bash should require an enforcer");
+        assert!(result.contains("PermissionEnforcer"));
     }
 
     #[test]
@@ -9553,6 +10450,98 @@ printf 'pwsh:%s' "$1"
     }
 
     #[test]
+    fn provider_runtime_client_private_fallback_denied() {
+        let _guard = env_guard();
+        let original_private = std::env::var_os("CLAW_PRIVATE_MODE");
+        let original_openai_key = std::env::var_os("OPENAI_API_KEY");
+        let original_openai_base = std::env::var_os("OPENAI_BASE_URL");
+        let original_xai_key = std::env::var_os("XAI_API_KEY");
+        let original_xai_base = std::env::var_os("XAI_BASE_URL");
+
+        let primary_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fallback_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary_count = Arc::clone(&primary_requests);
+        let fallback_count = Arc::clone(&fallback_requests);
+        let primary = TestServer::spawn(Arc::new(move |_| {
+            primary_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            HttpResponse::text(
+                400,
+                "Bad Request",
+                r#"{"error":{"message":"primary unavailable","type":"invalid_request_error","code":400}}"#,
+            )
+        }));
+        let fallback = TestServer::spawn(Arc::new(move |_| {
+            fallback_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            HttpResponse::text(200, "OK", "fallback should not be used")
+        }));
+
+        std::net::TcpStream::connect(fallback.addr())
+            .expect("fallback fixture should be independently reachable");
+        for _ in 0..20 {
+            if fallback_requests.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            fallback_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        fallback_requests.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        std::env::set_var("CLAW_PRIVATE_MODE", "1");
+        std::env::set_var("OPENAI_API_KEY", "CLAW_TEST_PRIMARY_PROVIDER");
+        std::env::set_var("OPENAI_BASE_URL", format!("http://{}/v1", primary.addr()));
+        std::env::set_var("XAI_API_KEY", "CLAW_TEST_FALLBACK_PROVIDER");
+        std::env::set_var("XAI_BASE_URL", format!("http://{}/v1", fallback.addr()));
+
+        let fallback_config = ProviderFallbackConfig::new(None, vec!["grok-3".to_string()]);
+        let mut client = ProviderRuntimeClient::new_with_fallback_config(
+            "gpt-4o".to_string(),
+            BTreeSet::new(),
+            &fallback_config,
+        )
+        .expect("private provider chain should construct");
+        assert_eq!(
+            client.chain.len(),
+            1,
+            "private mode must disable fallback chain"
+        );
+        let result = client.stream(ApiRequest {
+            system_prompt: Vec::new(),
+            messages: vec![ConversationMessage::user_text("private fallback probe")],
+        });
+        assert!(result.is_err(), "primary failure must fail closed");
+        assert!(primary_requests.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        assert_eq!(
+            fallback_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        println!("CLAW_SECURITY_ASSERTION private_provider_fallback_denied PASS");
+
+        match original_private {
+            Some(value) => std::env::set_var("CLAW_PRIVATE_MODE", value),
+            None => std::env::remove_var("CLAW_PRIVATE_MODE"),
+        }
+        match original_openai_key {
+            Some(value) => std::env::set_var("OPENAI_API_KEY", value),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+        match original_openai_base {
+            Some(value) => std::env::set_var("OPENAI_BASE_URL", value),
+            None => std::env::remove_var("OPENAI_BASE_URL"),
+        }
+        match original_xai_key {
+            Some(value) => std::env::set_var("XAI_API_KEY", value),
+            None => std::env::remove_var("XAI_API_KEY"),
+        }
+        match original_xai_base {
+            Some(value) => std::env::set_var("XAI_BASE_URL", value),
+            None => std::env::remove_var("XAI_BASE_URL"),
+        }
+    }
+
+    #[test]
     fn run_task_packet_creates_packet_backed_task() {
         let result = run_task_packet(TaskPacket {
             objective: "Ship packetized runtime task".to_string(),
@@ -9605,11 +10594,14 @@ printf 'pwsh:%s' "$1"
                         let mut buffer = [0_u8; 4096];
                         let size = stream.read(&mut buffer).expect("read request");
                         let request = String::from_utf8_lossy(&buffer[..size]).into_owned();
-                        let request_line = request.lines().next().unwrap_or_default().to_string();
-                        let response = handler(&request_line);
-                        stream
-                            .write_all(response.to_bytes().as_slice())
-                            .expect("write response");
+                        let response = handler(&request);
+                        if let Err(error) = stream.write_all(response.to_bytes().as_slice()) {
+                            assert_eq!(
+                                error.kind(),
+                                std::io::ErrorKind::BrokenPipe,
+                                "write response: {error}"
+                            );
+                        }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
@@ -9646,15 +10638,27 @@ printf 'pwsh:%s' "$1"
         reason: &'static str,
         content_type: &'static str,
         body: String,
+        extra_headers: String,
     }
 
     impl HttpResponse {
+        fn redirect(location: &str) -> Self {
+            Self {
+                status: 302,
+                reason: "Found",
+                content_type: "text/plain; charset=utf-8",
+                body: format!("redirect:{location}"),
+                extra_headers: format!("Location: {location}\r\n"),
+            }
+        }
+
         fn html(status: u16, reason: &'static str, body: &str) -> Self {
             Self {
                 status,
                 reason,
                 content_type: "text/html; charset=utf-8",
                 body: body.to_string(),
+                extra_headers: String::new(),
             }
         }
 
@@ -9664,16 +10668,18 @@ printf 'pwsh:%s' "$1"
                 reason,
                 content_type: "text/plain; charset=utf-8",
                 body: body.to_string(),
+                extra_headers: String::new(),
             }
         }
 
         fn to_bytes(&self) -> Vec<u8> {
             format!(
-                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n{}",
                 self.status,
                 self.reason,
                 self.content_type,
                 self.body.len(),
+                self.extra_headers,
                 self.body
             )
             .into_bytes()

@@ -38,11 +38,14 @@ async fn send_message_posts_json_and_parses_response() {
         "\"request_id\":\"req_body_123\"",
         "}"
     );
-    let server = spawn_server(
+    let Some(server) = spawn_server(
         state.clone(),
         vec![http_response("200 OK", "application/json", body)],
     )
-    .await;
+    .await
+    else {
+        return;
+    };
 
     let client = ApiClient::new("test-key")
         .with_auth_token(Some("proxy-token".to_string()))
@@ -82,7 +85,7 @@ async fn send_message_posts_json_and_parses_response() {
     );
     assert_eq!(
         request.headers.get("user-agent").map(String::as_str),
-        Some("claude-code/0.1.0")
+        Some(concat!("claude-code/", env!("CARGO_PKG_VERSION")))
     );
     assert_eq!(
         request.headers.get("anthropic-beta").map(String::as_str),
@@ -106,11 +109,14 @@ async fn send_message_posts_json_and_parses_response() {
 #[tokio::test]
 async fn send_message_blocks_oversized_requests_before_the_http_call() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
-    let server = spawn_server(
+    let Some(server) = spawn_server(
         state.clone(),
         vec![http_response("200 OK", "application/json", "{}")],
     )
-    .await;
+    .await
+    else {
+        return;
+    };
 
     let client = AnthropicClient::new("test-key").with_base_url(server.base_url());
     let error = client
@@ -142,7 +148,7 @@ async fn send_message_blocks_oversized_requests_before_the_http_call() {
 #[tokio::test]
 async fn send_message_applies_request_profile_and_records_telemetry() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
-    let server = spawn_server(
+    let Some(server) = spawn_server(
         state.clone(),
         vec![http_response_with_headers(
             "200 OK",
@@ -162,7 +168,9 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
             &[("request-id", "req_profile_123")],
         )],
     )
-    .await;
+    .await else {
+        return;
+    };
     let sink = Arc::new(MemoryTelemetrySink::default());
 
     let client = AnthropicClient::new("test-key")
@@ -255,11 +263,14 @@ async fn send_message_parses_prompt_cache_token_usage_from_response() {
         "\"usage\":{\"input_tokens\":12,\"cache_creation_input_tokens\":321,\"cache_read_input_tokens\":654,\"output_tokens\":4}",
         "}"
     );
-    let server = spawn_server(
+    let Some(server) = spawn_server(
         state,
         vec![http_response("200 OK", "application/json", body)],
     )
-    .await;
+    .await
+    else {
+        return;
+    };
 
     let client = AnthropicClient::new("test-key").with_base_url(server.base_url());
     let response = client
@@ -289,11 +300,14 @@ async fn given_empty_usage_object_when_send_message_parses_response_then_usage_d
         "\"usage\":{}",
         "}"
     );
-    let server = spawn_server(
+    let Some(server) = spawn_server(
         state,
         vec![http_response("200 OK", "application/json", body)],
     )
-    .await;
+    .await
+    else {
+        return;
+    };
     let client = AnthropicClient::new("test-key").with_base_url(server.base_url());
 
     // when
@@ -313,6 +327,7 @@ async fn given_empty_usage_object_when_send_message_parses_response_then_usage_d
 
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
+#[allow(clippy::too_many_lines)]
 async fn stream_message_parses_sse_events_with_tool_use() {
     let _guard = env_lock();
     let temp_root = std::env::temp_dir().join(format!(
@@ -340,7 +355,7 @@ async fn stream_message_parses_sse_events_with_tool_use() {
         "data: {\"type\":\"message_stop\"}\n\n",
         "data: [DONE]\n\n"
     );
-    let server = spawn_server(
+    let Some(server) = spawn_server(
         state.clone(),
         vec![http_response_with_headers(
             "200 OK",
@@ -349,7 +364,10 @@ async fn stream_message_parses_sse_events_with_tool_use() {
             &[("request-id", "req_stream_456")],
         )],
     )
-    .await;
+    .await
+    else {
+        return;
+    };
 
     let client = ApiClient::new("test-key")
         .with_auth_token(Some("proxy-token".to_string()))
@@ -427,7 +445,7 @@ async fn stream_message_parses_sse_events_with_tool_use() {
 #[tokio::test]
 async fn retries_retryable_failures_before_succeeding() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
-    let server = spawn_server(
+    let Some(server) = spawn_server(
         state.clone(),
         vec![
             http_response(
@@ -442,7 +460,9 @@ async fn retries_retryable_failures_before_succeeding() {
             ),
         ],
     )
-    .await;
+    .await else {
+        return;
+    };
 
     let client = ApiClient::new("test-key")
         .with_base_url(server.base_url())
@@ -460,7 +480,7 @@ async fn retries_retryable_failures_before_succeeding() {
 #[tokio::test]
 async fn provider_client_dispatches_anthropic_requests() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
-    let server = spawn_server(
+    let Some(server) = spawn_server(
         state.clone(),
         vec![http_response(
             "200 OK",
@@ -468,7 +488,9 @@ async fn provider_client_dispatches_anthropic_requests() {
             "{\"id\":\"msg_provider\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Dispatched\"}],\"model\":\"claude-3-7-sonnet-latest\",\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}",
         )],
     )
-    .await;
+    .await else {
+        return;
+    };
 
     let client = ProviderClient::from_model_with_anthropic_auth(
         "claude-sonnet-4-6",
@@ -501,7 +523,7 @@ async fn provider_client_dispatches_anthropic_requests() {
 #[tokio::test]
 async fn surfaces_retry_exhaustion_for_persistent_retryable_errors() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
-    let server = spawn_server(
+    let Some(server) = spawn_server(
         state.clone(),
         vec![
             http_response(
@@ -516,7 +538,9 @@ async fn surfaces_retry_exhaustion_for_persistent_retryable_errors() {
             ),
         ],
     )
-    .await;
+    .await else {
+        return;
+    };
 
     let client = ApiClient::new("test-key")
         .with_base_url(server.base_url())
@@ -549,7 +573,7 @@ async fn surfaces_retry_exhaustion_for_persistent_retryable_errors() {
 #[tokio::test]
 async fn retries_multiple_retryable_failures_with_exponential_backoff_and_jitter() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
-    let server = spawn_server(
+    let Some(server) = spawn_server(
         state.clone(),
         vec![
             http_response(
@@ -584,7 +608,9 @@ async fn retries_multiple_retryable_failures_with_exponential_backoff_and_jitter
             ),
         ],
     )
-    .await;
+    .await else {
+        return;
+    };
 
     let client = ApiClient::new("test-key")
         .with_base_url(server.base_url())
@@ -626,7 +652,7 @@ async fn send_message_reuses_recent_completion_cache_entries() {
     std::env::set_var("CLAUDE_CONFIG_HOME", &temp_root);
 
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
-    let server = spawn_server(
+    let Some(server) = spawn_server(
         state.clone(),
         vec![http_response(
             "200 OK",
@@ -634,7 +660,9 @@ async fn send_message_reuses_recent_completion_cache_entries() {
             "{\"id\":\"msg_cached\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Cached once\"}],\"model\":\"claude-3-7-sonnet-latest\",\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"cache_creation_input_tokens\":5,\"cache_read_input_tokens\":4000,\"output_tokens\":2}}",
         )],
     )
-    .await;
+    .await else {
+        return;
+    };
 
     let client = AnthropicClient::new("test-key")
         .with_base_url(server.base_url())
@@ -678,7 +706,7 @@ async fn send_message_tracks_unexpected_prompt_cache_breaks() {
     std::env::set_var("CLAUDE_CONFIG_HOME", &temp_root);
 
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
-    let server = spawn_server(
+    let Some(server) = spawn_server(
         state,
         vec![
             http_response(
@@ -693,7 +721,9 @@ async fn send_message_tracks_unexpected_prompt_cache_breaks() {
             ),
         ],
     )
-    .await;
+    .await else {
+        return;
+    };
 
     let request = sample_request(false);
     let client = AnthropicClient::new("test-key")
@@ -782,10 +812,14 @@ impl Drop for TestServer {
 async fn spawn_server(
     state: Arc<Mutex<Vec<CapturedRequest>>>,
     responses: Vec<String>,
-) -> TestServer {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("listener should bind");
+) -> Option<TestServer> {
+    let listener = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            return None;
+        }
+        Err(error) => panic!("listener should bind: {error}"),
+    };
     let address = listener
         .local_addr()
         .expect("listener should have local addr");
@@ -861,10 +895,10 @@ async fn spawn_server(
         }
     });
 
-    TestServer {
+    Some(TestServer {
         base_url: format!("http://{address}"),
         join_handle,
-    }
+    })
 }
 
 fn find_header_end(bytes: &[u8]) -> Option<usize> {

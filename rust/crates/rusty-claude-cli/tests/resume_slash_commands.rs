@@ -172,7 +172,8 @@ fn resumed_config_command_loads_settings_files_end_to_end() {
             .expect("utf8 path")
     ));
     assert!(stdout.contains("Merged section: model"));
-    assert!(stdout.contains("opus"));
+    assert!(stdout.contains("haiku"));
+    assert!(!stdout.contains("opus"));
 }
 
 #[test]
@@ -261,7 +262,7 @@ fn resumed_status_command_emits_structured_json_when_requested() {
     assert_eq!(parsed["kind"], "status");
     // model is null in resume mode (not known without --model flag)
     assert!(parsed["model"].is_null());
-    assert_eq!(parsed["permission_mode"], "danger-full-access");
+    assert_eq!(parsed["permission_mode"], "workspace-write");
     assert_eq!(parsed["usage"]["messages"], 1);
     assert!(parsed["usage"]["turns"].is_number());
     assert!(parsed["workspace"]["cwd"].as_str().is_some());

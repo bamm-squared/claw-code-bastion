@@ -66,7 +66,10 @@ pub struct BashCommandOutput {
     pub sandbox_status: Option<SandboxStatus>,
 }
 
-/// Executes a shell command with the requested sandbox settings.
+/// Executes a shell command under trusted sandbox settings.
+///
+/// Legacy request fields remain deserializable for wire compatibility, but are
+/// intentionally ignored. Model-generated input must never widen policy.
 pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     let cwd = env::current_dir()?;
     let sandbox_status = sandbox_status_for_input(&input, &cwd);
@@ -167,18 +170,12 @@ async fn execute_bash_async(
     })
 }
 
-fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> SandboxStatus {
+fn sandbox_status_for_input(_input: &BashCommandInput, cwd: &std::path::Path) -> SandboxStatus {
     let config = ConfigLoader::default_for(cwd).load().map_or_else(
         |_| SandboxConfig::default(),
         |runtime_config| runtime_config.sandbox().clone(),
     );
-    let request = config.resolve_request(
-        input.dangerously_disable_sandbox.map(|disabled| !disabled),
-        input.namespace_restrictions,
-        input.isolate_network,
-        input.filesystem_mode,
-        input.allowed_mounts.clone(),
-    );
+    let request = config.resolve_request(None, None, None, None, None);
     resolve_sandbox_status_for_request(&request, cwd)
 }
 
@@ -196,12 +193,14 @@ fn prepare_command(
         let mut prepared = Command::new(launcher.program);
         prepared.args(launcher.args);
         prepared.current_dir(cwd);
+        prepared.env_clear();
         prepared.envs(launcher.env);
         return prepared;
     }
 
     let mut prepared = Command::new("sh");
     prepared.arg("-lc").arg(command).current_dir(cwd);
+    apply_sanitized_environment(&mut prepared, cwd);
     if sandbox_status.filesystem_active {
         prepared.env("HOME", cwd.join(".sandbox-home"));
         prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
@@ -223,12 +222,14 @@ fn prepare_tokio_command(
         let mut prepared = TokioCommand::new(launcher.program);
         prepared.args(launcher.args);
         prepared.current_dir(cwd);
+        prepared.env_clear();
         prepared.envs(launcher.env);
         return prepared;
     }
 
     let mut prepared = TokioCommand::new("sh");
     prepared.arg("-lc").arg(command).current_dir(cwd);
+    apply_sanitized_tokio_environment(&mut prepared, cwd);
     if sandbox_status.filesystem_active {
         prepared.env("HOME", cwd.join(".sandbox-home"));
         prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
@@ -241,10 +242,53 @@ fn prepare_sandbox_dirs(cwd: &std::path::Path) {
     let _ = std::fs::create_dir_all(cwd.join(".sandbox-tmp"));
 }
 
+fn is_safe_child_environment_key(key: &str) -> bool {
+    matches!(key, "PATH" | "LANG" | "TERM" | "COLORTERM" | "TZ" | "USER") || key.starts_with("LC_")
+}
+
+fn sanitized_environment() -> impl Iterator<Item = (String, String)> {
+    env::vars().filter(|(key, _)| is_safe_child_environment_key(key))
+}
+
+fn apply_sanitized_environment(command: &mut Command, cwd: &std::path::Path) {
+    command.env_clear();
+    command.envs(sanitized_environment());
+    command.env("HOME", cwd.join(".sandbox-home"));
+    command.env("TMPDIR", cwd.join(".sandbox-tmp"));
+}
+
+fn apply_sanitized_tokio_environment(command: &mut TokioCommand, cwd: &std::path::Path) {
+    command.env_clear();
+    command.envs(sanitized_environment());
+    command.env("HOME", cwd.join(".sandbox-home"));
+    command.env("TMPDIR", cwd.join(".sandbox-tmp"));
+}
+
 #[cfg(test)]
 mod tests {
+    use super::is_safe_child_environment_key;
     use super::{execute_bash, BashCommandInput};
     use crate::sandbox::FilesystemIsolationMode;
+
+    #[test]
+    fn child_environment_allowlist_excludes_credentials_and_agent_sockets() {
+        for key in [
+            "AWS_ACCESS_KEY_ID",
+            "GITHUB_TOKEN",
+            "NPM_TOKEN",
+            "SSH_AUTH_SOCK",
+            "GPG_AGENT_INFO",
+            "DOCKER_HOST",
+            "API_SECRET",
+        ] {
+            assert!(
+                !is_safe_child_environment_key(key),
+                "{key} must be excluded"
+            );
+        }
+        assert!(is_safe_child_environment_key("PATH"));
+        assert!(is_safe_child_environment_key("LC_ALL"));
+    }
 
     #[test]
     fn executes_simple_command() {
@@ -267,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn disables_sandbox_when_requested() {
+    fn model_input_cannot_disable_sandbox() {
         let output = execute_bash(BashCommandInput {
             command: String::from("printf 'hello'"),
             timeout: Some(1_000),
@@ -281,7 +325,7 @@ mod tests {
         })
         .expect("bash command should execute");
 
-        assert!(!output.sandbox_status.expect("sandbox status").enabled);
+        assert!(output.sandbox_status.expect("sandbox status").enabled);
     }
 }
 

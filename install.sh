@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Claw Code installer
+# Claw Code Bastion installer
 #
 # Detects the host OS, verifies the Rust toolchain (rustc + cargo),
 # builds the `claw` binary from the `rust/` workspace, and runs a
@@ -66,7 +66,7 @@ print_banner() {
   \____||_| \__,_|  \_/\_/   \____\___/ \__,_|\___|
 EOF
     printf '%s\n' "${COLOR_RESET}"
-    printf '%sClaw Code installer%s\n' "${COLOR_DIM}" "${COLOR_RESET}"
+    printf '%sClaw Code Bastion installer%s\n' "${COLOR_DIM}" "${COLOR_RESET}"
 }
 
 print_usage() {
@@ -364,7 +364,7 @@ fi
 step "Next steps"
 
 cat <<EOF
-${COLOR_GREEN}Claw Code is built and ready.${COLOR_RESET}
+${COLOR_GREEN}Claw Code Bastion is built and ready.${COLOR_RESET}
 
   Binary:  ${COLOR_BOLD}${CLAW_BIN}${COLOR_RESET}
   Profile: ${BUILD_PROFILE}

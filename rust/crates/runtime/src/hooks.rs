@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt::Write as FmtWrite;
 use std::io::Write;
@@ -57,6 +58,23 @@ pub enum HookProgressEvent {
 
 pub trait HookProgressReporter {
     fn on_event(&mut self, event: &HookProgressEvent);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookCommandOutput {
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub interrupted: bool,
+}
+
+pub trait HookCommandExecutor: Send + Sync + std::fmt::Debug {
+    fn execute_hook_command(
+        &self,
+        command: &str,
+        environment: &BTreeMap<String, String>,
+        payload: &str,
+    ) -> Result<HookCommandOutput, String>;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -151,15 +169,25 @@ impl HookRunResult {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct HookRunner {
     config: RuntimeHookConfig,
+    executor: Option<Arc<dyn HookCommandExecutor>>,
 }
 
 impl HookRunner {
     #[must_use]
     pub fn new(config: RuntimeHookConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            executor: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_command_executor(mut self, executor: Arc<dyn HookCommandExecutor>) -> Self {
+        self.executor = Some(executor);
+        self
     }
 
     #[must_use]
@@ -180,7 +208,7 @@ impl HookRunner {
         abort_signal: Option<&HookAbortSignal>,
         reporter: Option<&mut dyn HookProgressReporter>,
     ) -> HookRunResult {
-        Self::run_commands(
+        self.run_commands(
             HookEvent::PreToolUse,
             self.config.pre_tool_use(),
             tool_name,
@@ -230,7 +258,7 @@ impl HookRunner {
         abort_signal: Option<&HookAbortSignal>,
         reporter: Option<&mut dyn HookProgressReporter>,
     ) -> HookRunResult {
-        Self::run_commands(
+        self.run_commands(
             HookEvent::PostToolUse,
             self.config.post_tool_use(),
             tool_name,
@@ -280,7 +308,7 @@ impl HookRunner {
         abort_signal: Option<&HookAbortSignal>,
         reporter: Option<&mut dyn HookProgressReporter>,
     ) -> HookRunResult {
-        Self::run_commands(
+        self.run_commands(
             HookEvent::PostToolUseFailure,
             self.config.post_tool_use_failure(),
             tool_name,
@@ -311,6 +339,7 @@ impl HookRunner {
 
     #[allow(clippy::too_many_arguments)]
     fn run_commands(
+        &self,
         event: HookEvent,
         commands: &[String],
         tool_name: &str,
@@ -351,7 +380,7 @@ impl HookRunner {
                 });
             }
 
-            match Self::run_command(
+            match self.run_command(
                 command,
                 event,
                 tool_name,
@@ -415,6 +444,7 @@ impl HookRunner {
 
     #[allow(clippy::too_many_arguments)]
     fn run_command(
+        &self,
         command: &str,
         event: HookEvent,
         tool_name: &str,
@@ -424,6 +454,34 @@ impl HookRunner {
         payload: &str,
         abort_signal: Option<&HookAbortSignal>,
     ) -> HookCommandOutcome {
+        if let Some(executor) = &self.executor {
+            let environment = hook_environment(event, tool_name, tool_input, tool_output, is_error);
+            return match executor.execute_hook_command(command, &environment, payload) {
+                Ok(output) if output.interrupted => HookCommandOutcome::Cancelled {
+                    message: format!(
+                        "{} hook `{command}` timed out while handling `{tool_name}`",
+                        event.as_str()
+                    ),
+                },
+                Ok(output) => classify_hook_output(
+                    event,
+                    tool_name,
+                    command,
+                    output.exit_code,
+                    &output.stdout,
+                    &output.stderr,
+                ),
+                Err(error) => HookCommandOutcome::Failed {
+                    parsed: ParsedHookOutput {
+                        messages: vec![format!(
+                            "{} hook `{command}` failed to start for `{tool_name}`: {error}",
+                            event.as_str()
+                        )],
+                        ..ParsedHookOutput::default()
+                    },
+                },
+            };
+        }
         let mut child = shell_command(command);
         child.stdin(Stdio::piped());
         child.stdout(Stdio::piped());
@@ -498,6 +556,71 @@ enum HookCommandOutcome {
     Deny { parsed: ParsedHookOutput },
     Failed { parsed: ParsedHookOutput },
     Cancelled { message: String },
+}
+
+fn hook_environment(
+    event: HookEvent,
+    tool_name: &str,
+    tool_input: &str,
+    tool_output: Option<&str>,
+    is_error: bool,
+) -> BTreeMap<String, String> {
+    let mut environment = BTreeMap::from([
+        (String::from("HOOK_EVENT"), event.as_str().to_string()),
+        (String::from("HOOK_TOOL_NAME"), tool_name.to_string()),
+        (String::from("HOOK_TOOL_INPUT"), tool_input.to_string()),
+        (
+            String::from("HOOK_TOOL_IS_ERROR"),
+            if is_error { "1" } else { "0" }.to_string(),
+        ),
+    ]);
+    if let Some(tool_output) = tool_output {
+        environment.insert(String::from("HOOK_TOOL_OUTPUT"), tool_output.to_string());
+    }
+    environment
+}
+
+fn classify_hook_output(
+    event: HookEvent,
+    tool_name: &str,
+    command: &str,
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> HookCommandOutcome {
+    let stdout = stdout.trim();
+    let stderr = stderr.trim();
+    let parsed = parse_hook_output(event, tool_name, command, stdout, stderr);
+    let primary_message = parsed.primary_message().map(ToOwned::to_owned);
+    match exit_code {
+        Some(0) => {
+            if parsed.deny {
+                HookCommandOutcome::Deny { parsed }
+            } else {
+                HookCommandOutcome::Allow { parsed }
+            }
+        }
+        Some(2) => HookCommandOutcome::Deny {
+            parsed: parsed.with_fallback_message(format!(
+                "{} hook denied tool `{tool_name}`",
+                event.as_str()
+            )),
+        },
+        Some(code) => HookCommandOutcome::Failed {
+            parsed: parsed.with_fallback_message(format_hook_failure(
+                command,
+                code,
+                primary_message.as_deref(),
+                stderr,
+            )),
+        },
+        None => HookCommandOutcome::Failed {
+            parsed: parsed.with_fallback_message(format!(
+                "{} hook `{command}` terminated by signal while handling `{tool_name}`",
+                event.as_str()
+            )),
+        },
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -740,6 +863,7 @@ fn shell_command(command: &str) -> CommandWithStdin {
     let mut command_builder = {
         let mut command_builder = Command::new("cmd");
         command_builder.arg("/C").arg(command);
+        command_builder.env_clear();
         CommandWithStdin::new(command_builder)
     };
 
@@ -747,6 +871,7 @@ fn shell_command(command: &str) -> CommandWithStdin {
     let command_builder = {
         let mut command_builder = Command::new("sh");
         command_builder.arg("-lc").arg(command);
+        command_builder.env_clear();
         CommandWithStdin::new(command_builder)
     };
 

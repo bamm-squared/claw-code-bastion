@@ -13,7 +13,9 @@ use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
 use crate::session::{ContentBlock, ConversationMessage, Session};
+use crate::snapshot::CandidateChangeSet;
 use crate::usage::{TokenUsage, UsageTracker};
+use crate::validator::ValidationResult;
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
@@ -57,6 +59,36 @@ pub trait ApiClient {
 /// Trait implemented by tool dispatchers that execute model-requested tools.
 pub trait ToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError>;
+
+    fn validate_candidate(
+        &mut self,
+        _changes: &CandidateChangeSet,
+    ) -> Result<ValidationResult, ToolError> {
+        Err(ToolError::new("candidate validation is unavailable"))
+    }
+
+    fn finish_candidate(&mut self) -> Result<Option<CandidateChangeSet>, ToolError> {
+        Ok(None)
+    }
+
+    fn apply_candidate_changes(
+        &mut self,
+        _changes: &CandidateChangeSet,
+        _validation: &ValidationResult,
+        _blocked_override: bool,
+    ) -> Result<(), ToolError> {
+        Ok(())
+    }
+
+    fn discard_candidate(&mut self) -> Result<(), ToolError> {
+        Ok(())
+    }
+
+    /// Resume editing an existing disposable candidate with a fresh worker.
+    /// Backends without a candidate lifecycle do not need to do anything.
+    fn resume_candidate(&mut self) -> Result<(), ToolError> {
+        Ok(())
+    }
 }
 
 /// Error returned when a tool invocation fails locally.
@@ -197,6 +229,15 @@ where
     #[must_use]
     pub fn with_auto_compaction_input_tokens_threshold(mut self, threshold: u32) -> Self {
         self.auto_compaction_input_tokens_threshold = threshold;
+        self
+    }
+
+    #[must_use]
+    pub fn with_hook_command_executor(
+        mut self,
+        executor: std::sync::Arc<dyn crate::hooks::HookCommandExecutor>,
+    ) -> Self {
+        self.hook_runner = self.hook_runner.with_command_executor(executor);
         self
     }
 
@@ -538,8 +579,51 @@ where
         &mut self.api_client
     }
 
+    #[must_use]
+    pub fn tool_executor(&self) -> &T {
+        &self.tool_executor
+    }
+
     pub fn session_mut(&mut self) -> &mut Session {
         &mut self.session
+    }
+
+    pub fn finish_candidate(&mut self) -> Result<Option<CandidateChangeSet>, RuntimeError> {
+        self.tool_executor
+            .finish_candidate()
+            .map_err(|error| RuntimeError::new(error.to_string()))
+    }
+
+    pub fn apply_candidate_changes(
+        &mut self,
+        changes: &CandidateChangeSet,
+        validation: &ValidationResult,
+        blocked_override: bool,
+    ) -> Result<(), RuntimeError> {
+        self.tool_executor
+            .apply_candidate_changes(changes, validation, blocked_override)
+            .map_err(|error| RuntimeError::new(error.to_string()))
+    }
+
+    pub fn validate_candidate(
+        &mut self,
+        changes: &CandidateChangeSet,
+    ) -> Result<ValidationResult, RuntimeError> {
+        self.tool_executor
+            .validate_candidate(changes)
+            .map_err(|error| RuntimeError::new(error.to_string()))
+    }
+
+    pub fn discard_candidate(&mut self) -> Result<(), RuntimeError> {
+        self.tool_executor
+            .discard_candidate()
+            .map_err(|error| RuntimeError::new(error.to_string()))
+    }
+
+    pub fn resume_candidate(&mut self) -> Result<(), RuntimeError> {
+        self.tool_executor
+            .resume_candidate()
+            .map_err(|error| RuntimeError::new(error.to_string()))
     }
 
     #[must_use]
