@@ -61,7 +61,7 @@ impl Completer for SlashCommandHelper {
         pos: usize,
         _ctx: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
-        let Some(prefix) = slash_command_prefix(line, pos) else {
+        let Some(prefix) = completion_prefix(line, pos) else {
             return Ok((0, Vec::new()));
         };
 
@@ -210,11 +210,16 @@ fn slash_command_prefix(line: &str, pos: usize) -> Option<&str> {
     Some(prefix)
 }
 
+fn completion_prefix(line: &str, pos: usize) -> Option<&str> {
+    slash_command_prefix(line, pos)
+        .or_else(|| (pos == line.len() && line.starts_with('@')).then_some(&line[..pos]))
+}
+
 fn normalize_completions(completions: Vec<String>) -> Vec<String> {
     let mut seen = BTreeSet::new();
     completions
         .into_iter()
-        .filter(|candidate| candidate.starts_with('/'))
+        .filter(|candidate| candidate.starts_with('/') || candidate.starts_with('@'))
         .filter(|candidate| seen.insert(candidate.clone()))
         .collect()
 }

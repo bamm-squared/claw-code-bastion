@@ -370,6 +370,27 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "attach",
+        aliases: &[],
+        summary: "Attach one explicit user-selected file to the next prompt",
+        argument_hint: Some("<file>"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "attachments",
+        aliases: &[],
+        summary: "List task attachments",
+        argument_hint: None,
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "detach",
+        aliases: &[],
+        summary: "Remove a task attachment",
+        argument_hint: Some("<number|all>"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
         name: "color",
         aliases: &[],
         summary: "Configure terminal color settings",
@@ -1152,6 +1173,13 @@ pub enum SlashCommand {
     Context {
         action: Option<String>,
     },
+    Attach {
+        path: Option<String>,
+    },
+    Attachments,
+    Detach {
+        target: Option<String>,
+    },
     Color {
         scheme: Option<String>,
     },
@@ -1269,6 +1297,9 @@ impl SlashCommand {
             Self::Copy { .. } => "/copy",
             Self::Hooks { .. } => "/hooks",
             Self::Context { .. } => "/context",
+            Self::Attach { .. } => "/attach",
+            Self::Attachments => "/attachments",
+            Self::Detach { .. } => "/detach",
             Self::Color { .. } => "/color",
             Self::Effort { .. } => "/effort",
             Self::Branch { .. } => "/branch",
@@ -1480,6 +1511,12 @@ pub fn validate_slash_command_input(
         "copy" => SlashCommand::Copy { target: remainder },
         "hooks" => SlashCommand::Hooks { args: remainder },
         "context" => SlashCommand::Context { action: remainder },
+        "attach" => SlashCommand::Attach { path: remainder },
+        "attachments" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Attachments
+        }
+        "detach" => SlashCommand::Detach { target: remainder },
         "color" => SlashCommand::Color { scheme: remainder },
         "effort" => SlashCommand::Effort { level: remainder },
         "branch" => SlashCommand::Branch { name: remainder },
@@ -4024,6 +4061,7 @@ fn mcp_server_json(name: &str, server: &ScopedMcpServerConfig) -> Value {
 }
 
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn handle_slash_command(
     input: &str,
     session: &Session,
@@ -4117,6 +4155,9 @@ pub fn handle_slash_command(
         | SlashCommand::Copy { .. }
         | SlashCommand::Hooks { .. }
         | SlashCommand::Context { .. }
+        | SlashCommand::Attach { .. }
+        | SlashCommand::Attachments
+        | SlashCommand::Detach { .. }
         | SlashCommand::Color { .. }
         | SlashCommand::Effort { .. }
         | SlashCommand::Branch { .. }
@@ -4663,7 +4704,7 @@ mod tests {
         assert!(help.contains("aliases: /skill"));
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
-        assert_eq!(slash_command_specs().len(), 139);
+        assert_eq!(slash_command_specs().len(), 142);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 

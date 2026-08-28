@@ -6,6 +6,7 @@
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
+mod attachments;
 mod context_reference;
 mod init;
 mod input;
@@ -14,6 +15,7 @@ mod render;
 
 use std::collections::BTreeSet;
 use std::env;
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::TcpListener;
@@ -3431,6 +3433,9 @@ fn run_resume_command(
         | SlashCommand::Copy { .. }
         | SlashCommand::Hooks { .. }
         | SlashCommand::Context { .. }
+        | SlashCommand::Attach { .. }
+        | SlashCommand::Attachments
+        | SlashCommand::Detach { .. }
         | SlashCommand::Color { .. }
         | SlashCommand::Effort { .. }
         | SlashCommand::Branch { .. }
@@ -3588,7 +3593,8 @@ fn run_repl(
                 }
                 editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
-                cli.run_turn(&trimmed)?;
+                let prompt = cli.prompt_with_context(&trimmed)?;
+                cli.run_turn(&prompt)?;
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
@@ -3627,6 +3633,14 @@ struct LiveCli {
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
     candidate_state: CandidateLifecycleState,
+    context_tray: Vec<ContextTrayItem>,
+    attachments: Vec<attachments::TaskAttachment>,
+}
+
+#[derive(Debug, Clone)]
+struct ContextTrayItem {
+    label: String,
+    kind: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4191,6 +4205,8 @@ impl LiveCli {
             session,
             prompt_history: Vec::new(),
             candidate_state: CandidateLifecycleState::Editing,
+            context_tray: Vec::new(),
+            attachments: Vec::new(),
         };
         cli.persist_session()?;
         Ok(cli)
@@ -4247,14 +4263,112 @@ impl LiveCli {
     }
 
     fn repl_completion_candidates(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        Ok(slash_command_completion_candidates_with_sessions(
+        let mut values = slash_command_completion_candidates_with_sessions(
             &self.model,
             Some(&self.session.id),
             list_managed_sessions()?
                 .into_iter()
                 .map(|session| session.id)
                 .collect(),
-        ))
+        );
+        values.extend([
+            "@git:status".to_string(),
+            "@git:diff".to_string(),
+            "@symbol:".to_string(),
+        ]);
+        for attachment in &self.attachments {
+            values.push(format!("@attach:{}", attachment.display_name));
+        }
+        Ok(values)
+    }
+
+    fn print_context(&self) {
+        println!("Context for next prompt");
+        if self.context_tray.is_empty() && self.attachments.is_empty() {
+            println!("  (empty)");
+            return;
+        }
+        for (index, item) in self.context_tray.iter().enumerate() {
+            println!("  {} [{}] {}", index + 1, item.kind, item.label);
+        }
+        for (index, attachment) in self.attachments.iter().enumerate() {
+            println!(
+                "  {} [attachment] {}",
+                self.context_tray.len() + index + 1,
+                attachment.summary()
+            );
+        }
+    }
+
+    fn attach_file(&mut self, raw: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        if self.attachments.len() >= attachments::MAX_ATTACHMENTS {
+            return Err("attachment limit reached".into());
+        }
+        let path = attachments::parse_attach_path(raw.unwrap_or_default())?;
+        let total: u64 = self.attachments.iter().map(|a| a.bytes.len() as u64).sum();
+        let attachment = attachments::TaskAttachment::snapshot(&path, self.attachments.len() + 1)?;
+        if total + attachment.bytes.len() as u64 > attachments::MAX_TOTAL_ATTACHMENT_BYTES {
+            return Err("total attachment byte limit reached".into());
+        }
+        println!("Attached {}", attachment.summary());
+        self.attachments.push(attachment);
+        Ok(())
+    }
+
+    fn detach(&mut self, raw: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        let value = raw.unwrap_or("all").trim();
+        if value == "all" {
+            self.attachments.clear();
+        } else {
+            let index: usize = value.parse().map_err(|_| "usage: /detach <n|all>")?;
+            if index == 0 || index > self.attachments.len() {
+                return Err("attachment number is out of range".into());
+            }
+            self.attachments.remove(index - 1);
+        }
+        Ok(())
+    }
+
+    fn prompt_with_context(&mut self, prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+        self.context_tray.clear();
+        for token in prompt
+            .split_whitespace()
+            .filter_map(|word| word.strip_prefix('@'))
+        {
+            if token == "git:status" || token == "git:diff" {
+                self.context_tray.push(ContextTrayItem {
+                    label: token.to_string(),
+                    kind: "GIT",
+                });
+            } else if let Some(symbol) = token.strip_prefix("symbol:") {
+                self.context_tray.push(ContextTrayItem {
+                    label: symbol.to_string(),
+                    kind: "SYMBOL",
+                });
+            } else if !token.is_empty() && !token.contains('@') {
+                self.context_tray.push(ContextTrayItem {
+                    label: token.to_string(),
+                    kind: "FILE",
+                });
+            }
+        }
+        let mut expanded = context_reference::expand_user_references(prompt)?;
+        for attachment in &self.attachments {
+            if let Some(text) = attachments::attachment_text(attachment) {
+                let _ = writeln!(
+                    expanded,
+                    "\n[Trusted user attachment: {}]\n{}",
+                    attachment.display_name, text
+                );
+            } else {
+                return Err(format!(
+                    "the selected model does not support image attachment {}",
+                    attachment.display_name
+                )
+                .into());
+            }
+        }
+        Ok(expanded)
     }
 
     fn prepare_turn_runtime(
@@ -4333,6 +4447,8 @@ impl LiveCli {
                     );
                 }
                 self.persist_session()?;
+                self.context_tray.clear();
+                self.attachments.clear();
                 Ok(())
             }
             Err(error) => {
@@ -4690,6 +4806,32 @@ impl LiveCli {
                 println!("{}", format_cost_report(usage));
                 false
             }
+            SlashCommand::Context { action } => {
+                match action.as_deref().unwrap_or("show") {
+                    "show" | "list" | "" => self.print_context(),
+                    "clear" => {
+                        self.context_tray.clear();
+                        self.attachments.clear();
+                        println!("Context cleared.");
+                    }
+                    other => {
+                        eprintln!("unknown context action `{other}`; use /context, /context clear");
+                    }
+                }
+                false
+            }
+            SlashCommand::Attach { path } => {
+                self.attach_file(path.as_deref())?;
+                false
+            }
+            SlashCommand::Attachments => {
+                self.print_context();
+                false
+            }
+            SlashCommand::Detach { target } => {
+                self.detach(target.as_deref())?;
+                false
+            }
             SlashCommand::Login
             | SlashCommand::Logout
             | SlashCommand::Vim
@@ -4719,7 +4861,6 @@ impl LiveCli {
             | SlashCommand::Rename { .. }
             | SlashCommand::Copy { .. }
             | SlashCommand::Hooks { .. }
-            | SlashCommand::Context { .. }
             | SlashCommand::Color { .. }
             | SlashCommand::Effort { .. }
             | SlashCommand::Branch { .. }
