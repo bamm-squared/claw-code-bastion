@@ -30,6 +30,12 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
+    Image {
+        attachment_id: usize,
+        display_name: String,
+        media_type: String,
+        data: Option<String>,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -737,6 +743,26 @@ impl ContentBlock {
                 object.insert("type".to_string(), JsonValue::String("text".to_string()));
                 object.insert("text".to_string(), JsonValue::String(text.clone()));
             }
+            Self::Image {
+                attachment_id,
+                display_name,
+                media_type,
+                ..
+            } => {
+                object.insert("type".to_string(), JsonValue::String("image".to_string()));
+                object.insert(
+                    "attachment_id".to_string(),
+                    JsonValue::Number(i64::try_from(*attachment_id).unwrap_or(i64::MAX)),
+                );
+                object.insert(
+                    "display_name".to_string(),
+                    JsonValue::String(display_name.clone()),
+                );
+                object.insert(
+                    "media_type".to_string(),
+                    JsonValue::String(media_type.clone()),
+                );
+            }
             Self::ToolUse { id, name, input } => {
                 object.insert(
                     "type".to_string(),
@@ -782,6 +808,12 @@ impl ContentBlock {
         {
             "text" => Ok(Self::Text {
                 text: required_string(object, "text")?,
+            }),
+            "image" => Ok(Self::Image {
+                attachment_id: required_usize(object, "attachment_id")?,
+                display_name: required_string(object, "display_name")?,
+                media_type: required_string(object, "media_type")?,
+                data: None,
             }),
             "tool_use" => Ok(Self::ToolUse {
                 id: required_string(object, "id")?,

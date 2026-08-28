@@ -966,6 +966,7 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
     payload
 }
 
+#[allow(clippy::single_match_else)]
 fn translate_message(message: &InputMessage) -> Vec<Value> {
     match message.role.as_str() {
         "assistant" => {
@@ -974,6 +975,7 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
             for block in &message.content {
                 match block {
                     InputContentBlock::Text { text: value } => text.push_str(value),
+                    InputContentBlock::Image { .. } | InputContentBlock::ToolResult { .. } => {}
                     InputContentBlock::ToolUse { id, name, input } => tool_calls.push(json!({
                         "id": id,
                         "type": "function",
@@ -982,7 +984,6 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                             "arguments": input.to_string(),
                         }
                     })),
-                    InputContentBlock::ToolResult { .. } => {}
                 }
             }
             if text.is_empty() && tool_calls.is_empty() {
@@ -1000,27 +1001,46 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                 vec![msg]
             }
         }
-        _ => message
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                InputContentBlock::Text { text } => Some(json!({
+        _ => {
+            if message
+                .content
+                .iter()
+                .any(|block| matches!(block, InputContentBlock::Image { .. }))
+            {
+                return vec![json!({
                     "role": "user",
-                    "content": text,
-                })),
-                InputContentBlock::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error,
-                } => Some(json!({
-                    "role": "tool",
-                    "tool_call_id": tool_use_id,
-                    "content": flatten_tool_result_content(content),
-                    "is_error": is_error,
-                })),
-                InputContentBlock::ToolUse { .. } => None,
-            })
-            .collect(),
+                    "content": message.content.iter().filter_map(|block| match block {
+                        InputContentBlock::Text { text } => Some(json!({ "type": "text", "text": text })),
+                        InputContentBlock::Image { media_type, data } => Some(json!({
+                            "type": "image_url",
+                            "image_url": { "url": format!("data:{media_type};base64,{data}") }
+                        })),
+                        _ => None,
+                    }).collect::<Vec<_>>(),
+                })];
+            }
+            message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    InputContentBlock::Text { text } => Some(json!({
+                        "role": "user",
+                        "content": text,
+                    })),
+                    InputContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } => Some(json!({
+                        "role": "tool",
+                        "tool_call_id": tool_use_id,
+                        "content": flatten_tool_result_content(content),
+                        "is_error": is_error,
+                    })),
+                    InputContentBlock::ToolUse { .. } | InputContentBlock::Image { .. } => None,
+                })
+                .collect()
+        }
     }
 }
 

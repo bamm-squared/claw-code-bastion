@@ -33,6 +33,7 @@ use api::{
     OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
+use base64::Engine;
 
 use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
@@ -235,6 +236,19 @@ fn provider_privacy_class(model: &str) -> ProviderPrivacyClass {
             ProviderPrivacyClass::RemoteStandard
         }
         _ => ProviderPrivacyClass::Unknown,
+    }
+}
+
+fn model_supports_images(model: &str) -> bool {
+    let normalized = model.to_ascii_lowercase();
+    match detect_provider_kind(model) {
+        ProviderKind::Anthropic => normalized.contains("claude"),
+        ProviderKind::OpenAi | ProviderKind::Xai => {
+            normalized.contains("gpt-4o")
+                || normalized.contains("gpt-4.1")
+                || normalized.contains("gpt-4-turbo")
+                || normalized.contains("vision")
+        }
     }
 }
 
@@ -4360,12 +4374,6 @@ impl LiveCli {
                     "\n[Trusted user attachment: {}]\n{}",
                     attachment.display_name, text
                 );
-            } else {
-                return Err(format!(
-                    "the selected model does not support image attachment {}",
-                    attachment.display_name
-                )
-                .into());
             }
         }
         Ok(expanded)
@@ -4413,6 +4421,10 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let image_blocks = self.image_blocks()?;
+        if !image_blocks.is_empty() && !model_supports_images(&self.model) {
+            return Err("The selected model does not support image input; choose a vision-capable model or detach the image.".into());
+        }
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
@@ -4428,7 +4440,8 @@ impl LiveCli {
             &mut stdout,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
+        let result =
+            runtime.run_turn_with_images(input, image_blocks, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
@@ -4463,6 +4476,40 @@ impl LiveCli {
                 Err(Box::new(error))
             }
         }
+    }
+
+    fn image_blocks(&self) -> Result<Vec<ContentBlock>, Box<dyn std::error::Error>> {
+        let raw_image_bytes: u64 = self
+            .attachments
+            .iter()
+            .filter(|attachment| attachment.kind == attachments::AttachmentKind::Image)
+            .map(|attachment| attachment.bytes.len() as u64)
+            .sum();
+        let encoded_image_bytes = raw_image_bytes
+            .saturating_mul(4)
+            .div_ceil(3)
+            .saturating_add(4);
+        let encoded_limit = attachments::MAX_TOTAL_ATTACHMENT_BYTES
+            .saturating_mul(4)
+            .div_ceil(3)
+            .saturating_add(4);
+        if encoded_image_bytes > encoded_limit {
+            return Err("image attachments exceed the provider request size limit".into());
+        }
+        Ok(self
+            .attachments
+            .iter()
+            .filter(|attachment| attachment.kind == attachments::AttachmentKind::Image)
+            .map(|attachment| {
+                let data = base64::engine::general_purpose::STANDARD.encode(&attachment.bytes);
+                ContentBlock::Image {
+                    attachment_id: attachment.id,
+                    display_name: attachment.display_name.clone(),
+                    media_type: attachment.media_type.clone(),
+                    data: Some(data),
+                }
+            })
+            .collect::<Vec<_>>())
     }
 
     fn run_turn_with_output(
@@ -6763,6 +6810,11 @@ fn render_export_text(session: &Session) -> String {
         for block in &message.blocks {
             match block {
                 ContentBlock::Text { text } => lines.push(text.clone()),
+                ContentBlock::Image {
+                    display_name,
+                    media_type,
+                    ..
+                } => lines.push(format!("[image attachment: {display_name} ({media_type})]")),
                 ContentBlock::ToolUse { id, name, input } => {
                     lines.push(format!("[tool_use id={id} name={name}] {input}"));
                 }
@@ -6948,6 +7000,16 @@ fn render_session_markdown(session: &Session, session_id: &str, session_path: &P
                         lines.push(trimmed.to_string());
                         lines.push(String::new());
                     }
+                }
+                ContentBlock::Image {
+                    display_name,
+                    media_type,
+                    ..
+                } => {
+                    lines.push(format!(
+                        "**Image attachment** `{display_name}` ({media_type})"
+                    ));
+                    lines.push(String::new());
                 }
                 ContentBlock::ToolUse { id, name, input } => {
                     lines.push(format!(
@@ -9149,26 +9211,37 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             let content = message
                 .blocks
                 .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => {
+                        Some(InputContentBlock::Text { text: text.clone() })
+                    }
+                    ContentBlock::Image {
+                        media_type,
+                        data: Some(data),
+                        ..
+                    } => Some(InputContentBlock::Image {
+                        media_type: media_type.clone(),
+                        data: data.clone(),
+                    }),
+                    ContentBlock::Image { data: None, .. } => None,
+                    ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: serde_json::from_str(input)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    },
+                    }),
                     ContentBlock::ToolResult {
                         tool_use_id,
                         output,
                         is_error,
                         ..
-                    } => InputContentBlock::ToolResult {
+                    } => Some(InputContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         content: vec![ToolResultContentBlock::Text {
                             text: output.clone(),
                         }],
                         is_error: *is_error,
-                    },
+                    }),
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {

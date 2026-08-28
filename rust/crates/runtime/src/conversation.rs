@@ -12,7 +12,7 @@ use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRun
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
-use crate::session::{ContentBlock, ConversationMessage, Session};
+use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 use crate::snapshot::CandidateChangeSet;
 use crate::usage::{TokenUsage, UsageTracker};
 use crate::validator::ValidationResult;
@@ -355,6 +355,16 @@ where
     pub fn run_turn(
         &mut self,
         user_input: impl Into<String>,
+        prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> Result<TurnSummary, RuntimeError> {
+        self.run_turn_with_images(user_input, Vec::new(), prompter)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn run_turn_with_images(
+        &mut self,
+        user_input: impl Into<String>,
+        images: Vec<ContentBlock>,
         mut prompter: Option<&mut dyn PermissionPrompter>,
     ) -> Result<TurnSummary, RuntimeError> {
         let user_input = user_input.into();
@@ -371,8 +381,14 @@ where
         }
 
         self.record_turn_started(&user_input);
+        let mut user_blocks = vec![ContentBlock::Text { text: user_input }];
+        user_blocks.extend(images);
         self.session
-            .push_user_text(user_input)
+            .push_message(ConversationMessage {
+                role: MessageRole::User,
+                blocks: user_blocks,
+                usage: None,
+            })
             .map_err(|error| RuntimeError::new(error.to_string()))?;
 
         let mut assistant_messages = Vec::new();

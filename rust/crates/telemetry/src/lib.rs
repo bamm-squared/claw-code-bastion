@@ -106,6 +106,7 @@ impl AnthropicRequestProfile {
 
     pub fn render_json_body<T: Serialize>(&self, request: &T) -> Result<Value, serde_json::Error> {
         let mut body = serde_json::to_value(request)?;
+        normalize_anthropic_images(&mut body);
         let object = body.as_object_mut().ok_or_else(|| {
             serde_json::Error::io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -122,6 +123,32 @@ impl AnthropicRequestProfile {
             );
         }
         Ok(body)
+    }
+}
+
+fn normalize_anthropic_images(value: &mut Value) {
+    let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for message in messages {
+        let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for block in content {
+            if block.get("type").and_then(Value::as_str) != Some("image") {
+                continue;
+            }
+            let Some(media_type) = block.get("media_type").cloned() else {
+                continue;
+            };
+            let Some(data) = block.get("data").cloned() else {
+                continue;
+            };
+            *block = serde_json::json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": media_type, "data": data }
+            });
+        }
     }
 }
 
