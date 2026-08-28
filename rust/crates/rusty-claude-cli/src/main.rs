@@ -330,6 +330,22 @@ fn classify_error_kind(message: &str) -> &'static str {
         "unsupported_command"
     } else if message.contains("unsupported resumed command") {
         "unsupported_resumed_command"
+    } else if message.contains("MCP server") && message.contains("could not start") {
+        "mcp_server_start_failed"
+    } else if message.contains("unknown MCP tool") {
+        "mcp_tool_not_found"
+    } else if message.contains("MCP server") {
+        "mcp_error"
+    } else if message.contains("hook") && message.contains("timed out") {
+        "hook_timeout"
+    } else if message.contains("hook") {
+        "hook_failed"
+    } else if message.contains("plugin tool") && message.contains("not found") {
+        "plugin_tool_not_found"
+    } else if message.contains("plugin manifest") && message.contains("invalid") {
+        "plugin_manifest_invalid"
+    } else if message.contains("plugin") {
+        "plugin_error"
     } else if message.contains("confirmation required") {
         "confirmation_required"
     } else if message.contains("api failed") || message.contains("api returned") {
@@ -9187,10 +9203,10 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 mod tests {
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        collect_session_prompt_history, create_managed_session_handle, default_permission_mode,
-        describe_tool_progress, endpoint_host, filter_tool_specs, format_bughunter_report,
-        format_commit_preflight_report, format_commit_skipped_report, format_compact_report,
-        format_connected_line, format_cost_report, format_history_timestamp,
+        classify_error_kind, collect_session_prompt_history, create_managed_session_handle,
+        default_permission_mode, describe_tool_progress, endpoint_host, filter_tool_specs,
+        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
+        format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
         format_internal_prompt_progress_line, format_issue_report, format_model_report,
         format_model_switch_report, format_permissions_report, format_permissions_switch_report,
         format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
@@ -9232,6 +9248,33 @@ mod tests {
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tools::GlobalToolRegistry;
+
+    #[test]
+    fn extension_errors_have_stable_json_categories() {
+        assert_eq!(
+            classify_error_kind(
+                "MCP server `probe` could not start command `missing` in isolated image `runtime`: No such file"
+            ),
+            "mcp_server_start_failed"
+        );
+        assert_eq!(
+            classify_error_kind("unknown MCP tool `probe/read`"),
+            "mcp_tool_not_found"
+        );
+        assert_eq!(
+            classify_error_kind("hook `pre.sh` timed out after 1000 ms"),
+            "hook_timeout"
+        );
+        assert_eq!(classify_error_kind("hook `pre.sh` failed"), "hook_failed");
+        assert_eq!(
+            classify_error_kind("plugin tool `inspect` not found in runtime"),
+            "plugin_tool_not_found"
+        );
+        assert_eq!(
+            classify_error_kind("plugin manifest is invalid"),
+            "plugin_manifest_invalid"
+        );
+    }
 
     fn registry_with_plugin_tool() -> GlobalToolRegistry {
         GlobalToolRegistry::with_plugin_tools(vec![PluginTool::new(
