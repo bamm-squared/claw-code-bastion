@@ -11772,7 +11772,7 @@ UU conflicted.rs",
     }
 
     #[test]
-    fn load_session_reference_rejects_workspace_mismatch() {
+    fn load_session_reference_rejects_explicit_path_outside_workspace() {
         let _guard = cwd_guard();
         let workspace_a = temp_workspace("session-mismatch-a");
         let workspace_b = temp_workspace("session-mismatch-b");
@@ -11795,22 +11795,10 @@ UU conflicted.rs",
             .expect("session should save");
 
         let error = crate::load_session_reference(&session_path.display().to_string())
-            .expect_err("mismatched workspace should fail");
+            .expect_err("outside workspace path should fail");
         assert!(
-            error.to_string().contains("session workspace mismatch"),
+            error.to_string().contains("outside the trusted workspace"),
             "unexpected error: {error}"
-        );
-        assert!(
-            error
-                .to_string()
-                .contains(&workspace_b.display().to_string()),
-            "expected current workspace in error: {error}"
-        );
-        assert!(
-            error
-                .to_string()
-                .contains(&workspace_a.display().to_string()),
-            "expected originating workspace in error: {error}"
         );
 
         std::env::set_current_dir(previous).expect("restore cwd");

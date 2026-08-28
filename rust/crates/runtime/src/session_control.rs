@@ -100,7 +100,30 @@ impl SessionStore {
         };
         let looks_like_path = direct.extension().is_some() || direct.components().count() > 1;
         let path = if candidate.exists() {
-            candidate
+            if looks_like_path {
+                let canonical_candidate = fs::canonicalize(&candidate)?;
+                let canonical_workspace = fs::canonicalize(&self.workspace_root)?;
+                let canonical_sessions = fs::canonicalize(&self.sessions_root)?;
+                let canonical_legacy_sessions = self
+                    .sessions_root
+                    .parent()
+                    .map(fs::canonicalize)
+                    .transpose()?;
+                if !canonical_candidate.starts_with(&canonical_workspace)
+                    && !canonical_candidate.starts_with(&canonical_sessions)
+                    && !canonical_legacy_sessions
+                        .as_ref()
+                        .is_some_and(|root| canonical_candidate.starts_with(root))
+                {
+                    return Err(SessionControlError::Format(format!(
+                        "session path is outside the trusted workspace: {}",
+                        candidate.display()
+                    )));
+                }
+                canonical_candidate
+            } else {
+                candidate
+            }
         } else if looks_like_path {
             return Err(SessionControlError::Format(
                 format_missing_session_reference(reference),
@@ -857,6 +880,30 @@ mod tests {
             }
             other => panic!("expected workspace mismatch, got {other:?}"),
         }
+        fs::remove_dir_all(base).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn session_store_rejects_explicit_session_path_outside_workspace() {
+        // given
+        let base = temp_dir();
+        let workspace = base.join("workspace");
+        let outside = base.join("outside.jsonl");
+        fs::create_dir_all(&workspace).expect("workspace should exist");
+        let store = SessionStore::from_cwd(&workspace).expect("store should build");
+        Session::new()
+            .with_workspace_root(workspace.clone())
+            .with_persistence_path(outside.clone())
+            .save_to_path(&outside)
+            .expect("outside fixture should persist");
+
+        // when
+        let error = store
+            .load_session(outside.to_str().expect("utf8 path"))
+            .expect_err("explicit outside session path must be rejected");
+
+        // then
+        assert!(error.to_string().contains("outside the trusted workspace"));
         fs::remove_dir_all(base).expect("temp dir should clean up");
     }
 
