@@ -89,6 +89,7 @@ fn show(input: &GitInput) -> Result<String, String> {
     validate_revision(revision)?;
     let mut args = vec![
         "show",
+        "--end-of-options",
         "--no-ext-diff",
         "--no-textconv",
         "--no-renames",
@@ -122,7 +123,6 @@ fn run(args: &[&str]) -> Result<String, String> {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_CONFIG_LOCAL", "/dev/null")
         .env("GIT_PAGER", "cat")
         .env("GIT_EDITOR", ":")
         .env("GIT_EXTERNAL_DIFF", "")
@@ -183,7 +183,10 @@ fn truncate(value: &str) -> String {
     if value.len() <= OUTPUT_LIMIT {
         return value.to_string();
     }
-    format!("{}\n[output truncated]", &value[..OUTPUT_LIMIT])
+    format!(
+        "{}\n[output truncated]",
+        value.chars().take(OUTPUT_LIMIT).collect::<String>()
+    )
 }
 
 #[cfg(test)]
