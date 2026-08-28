@@ -120,11 +120,19 @@ fn scan(
             .replace('\\', "/");
         let path_lower = relative.to_ascii_lowercase();
         let hits = terms.iter().filter(|term| lower.contains(**term)).count();
+        let identifier_hits = terms
+            .iter()
+            .filter(|term| is_identifier(term) && lower.contains(**term))
+            .count();
         let path_hits = terms
             .iter()
             .filter(|term| path_lower.contains(**term))
             .count();
-        let score = hits * 10 + path_hits * 15;
+        let proximity = terms
+            .windows(2)
+            .filter(|pair| lower.contains(&format!("{} {}", pair[0], pair[1])))
+            .count();
+        let score = hits * 10 + path_hits * 15 + identifier_hits * 12 + proximity * 8;
         if score == 0 {
             continue;
         }
@@ -208,6 +216,16 @@ fn is_text_file(path: &Path) -> bool {
                 | "sql"
         )
     )
+}
+
+fn is_identifier(term: &str) -> bool {
+    term.len() > 2
+        && term
+            .chars()
+            .all(|character| character == '_' || character.is_ascii_alphanumeric())
+        && term
+            .chars()
+            .any(|character| character.is_ascii_alphabetic())
 }
 
 fn is_sensitive_path(path: &Path) -> bool {
