@@ -34,6 +34,8 @@ jobs:
           workspaces: rust -> target
       - name: Verify Rust workspace
         run: |
+          # Real Podman security tests are intentionally ignored here and run
+          # by the dedicated self-hosted isolation-security workflow.
           cargo fmt --check
           cargo check --workspace
           cargo test --workspace

@@ -9215,6 +9215,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a working rootless Podman runtime and CLAW_REAL_PODMAN_IMAGE"]
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::items_after_statements)]
     fn private_provider_security_assertions() {
