@@ -33,6 +33,9 @@ use runtime::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+mod context_search;
+mod git_intelligence;
+
 /// Global task registry shared across tool invocations within a session.
 fn global_lsp_registry() -> &'static LspRegistry {
     use std::sync::OnceLock;
@@ -891,6 +894,13 @@ fn is_host_side_tool(name: &str) -> bool {
             | "StructuredOutput"
             | "EnterPlanMode"
             | "ExitPlanMode"
+            | "GitStatus"
+            | "GitDiff"
+            | "GitLog"
+            | "GitShow"
+            | "GitBlame"
+            | "GitBranches"
+            | "GitChangedFiles"
     )
 }
 
@@ -1690,6 +1700,14 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             }),
             required_permission: PermissionMode::DangerFullAccess,
         },
+        ToolSpec { name: "GitStatus", description: "Read trusted workspace Git status without running hooks or external diff tools.", input_schema: json!({"type":"object","additionalProperties":false}), required_permission: PermissionMode::ReadOnly },
+        ToolSpec { name: "GitDiff", description: "Read a bounded trusted workspace diff; candidate state is not inferred from hostile .git metadata.", input_schema: json!({"type":"object","properties":{"path":{"type":"string"},"staged":{"type":"boolean"}},"additionalProperties":false}), required_permission: PermissionMode::ReadOnly },
+        ToolSpec { name: "GitLog", description: "Read bounded trusted workspace history, optionally for one relative path.", input_schema: json!({"type":"object","properties":{"path":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100}},"additionalProperties":false}), required_permission: PermissionMode::ReadOnly },
+        ToolSpec { name: "GitShow", description: "Show bounded trusted metadata for one validated revision and optional relative path.", input_schema: json!({"type":"object","properties":{"revision":{"type":"string"},"path":{"type":"string"}},"required":["revision"],"additionalProperties":false}), required_permission: PermissionMode::ReadOnly },
+        ToolSpec { name: "GitBlame", description: "Read bounded blame output for one validated relative path.", input_schema: json!({"type":"object","properties":{"path":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":1000}},"required":["path"],"additionalProperties":false}), required_permission: PermissionMode::ReadOnly },
+        ToolSpec { name: "GitBranches", description: "List trusted local and remote-tracking branch names without contacting remotes.", input_schema: json!({"type":"object","additionalProperties":false}), required_permission: PermissionMode::ReadOnly },
+        ToolSpec { name: "GitChangedFiles", description: "List bounded trusted workspace changes relative to HEAD.", input_schema: json!({"type":"object","additionalProperties":false}), required_permission: PermissionMode::ReadOnly },
+        ToolSpec { name: "ContextSearch", description: "Search the current candidate/workspace view locally with bounded lexical ranking; no persistence, embeddings, or network.", input_schema: json!({"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer","minimum":1,"maximum":12},"path":{"type":"string"}},"required":["query"],"additionalProperties":false}), required_permission: PermissionMode::ReadOnly },
     ]
 }
 
@@ -1769,6 +1787,15 @@ fn execute_tool_with_enforcer(
             maybe_enforce_permission_check(Some(enforcer), name, input)?;
             from_value::<GrepSearchInput>(input)
                 .and_then(|value| run_grep_search(value, &filesystem))
+        }
+        "GitStatus" | "GitDiff" | "GitLog" | "GitShow" | "GitBlame" | "GitBranches"
+        | "GitChangedFiles" => {
+            maybe_enforce_permission_check(Some(enforcer), name, input)?;
+            git_intelligence::execute(name, input)
+        }
+        "ContextSearch" => {
+            maybe_enforce_permission_check(Some(enforcer), name, input)?;
+            context_search::execute(input)
         }
         "WebFetch" => {
             maybe_enforce_permission_check(Some(enforcer), name, input)?;
