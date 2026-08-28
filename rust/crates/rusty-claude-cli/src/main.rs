@@ -248,24 +248,28 @@ enum ImageCapability {
 
 fn image_capability(model: &str) -> ImageCapability {
     let normalized = model.to_ascii_lowercase();
-    if normalized.contains("gpt-3.5") {
+    if normalized.starts_with("gpt-3.5") {
         return ImageCapability::Unsupported;
     }
+    if model_matches_prefix(
+        &normalized,
+        &[
+            "claude-3-",
+            "claude-4-",
+            "claude-sonnet-",
+            "claude-opus-",
+            "claude-haiku-",
+        ],
+    ) || model_matches_prefix(&normalized, &["gpt-4o", "gpt-4.1", "gpt-4-turbo"])
+        || matches!(normalized.as_str(), "grok-2-vision" | "grok-vision-beta")
+    {
+        return ImageCapability::Supported;
+    }
     match detect_provider_kind(model) {
-        ProviderKind::Anthropic if normalized.contains("claude") => ImageCapability::Supported,
-        ProviderKind::Xai if normalized.contains("vision") => ImageCapability::Supported,
         ProviderKind::OpenAi
-            if normalized.contains("gpt-4o")
-                || normalized.contains("gpt-4.1")
-                || normalized.contains("gpt-4-turbo")
-                || normalized.contains("vision") =>
-        {
-            ImageCapability::Supported
-        }
-        ProviderKind::OpenAi
-            if normalized.contains("deepseek")
-                || normalized.contains("qwen")
-                || normalized.contains("llama") =>
+            if normalized.starts_with("deepseek-")
+                || normalized.starts_with("qwen-")
+                || normalized.starts_with("llama-") =>
         {
             ImageCapability::Unsupported
         }
@@ -273,6 +277,17 @@ fn image_capability(model: &str) -> ImageCapability {
             ImageCapability::Unknown
         }
     }
+}
+
+fn model_matches_prefix(model: &str, prefixes: &[&str]) -> bool {
+    prefixes.iter().any(|prefix| {
+        model == *prefix
+            || model.strip_prefix(prefix).is_some_and(|suffix| {
+                (prefix.ends_with('-') || suffix.starts_with('-'))
+                    && !suffix.starts_with("-disabled")
+                    && !suffix.starts_with("-fake")
+            })
+    })
 }
 
 fn image_capability_label(capability: ImageCapability) -> &'static str {
@@ -13252,6 +13267,21 @@ mod image_capability_tests {
             ImageCapability::Supported
         );
         assert_eq!(image_capability("grok-3"), ImageCapability::Unknown);
+    }
+
+    #[test]
+    fn rejects_adversarial_capability_names() {
+        for model in [
+            "not-gpt-4o",
+            "my-gpt-4o-fake",
+            "gpt-4o-disabled",
+            "not-vision-model",
+            "fake-vision",
+            "visionless",
+            "claude-fake-custom",
+        ] {
+            assert_eq!(image_capability(model), ImageCapability::Unknown, "{model}");
+        }
     }
 }
 
