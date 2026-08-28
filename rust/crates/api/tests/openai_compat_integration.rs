@@ -67,6 +67,101 @@ async fn send_message_uses_openai_compatible_endpoint_and_auth() {
 }
 
 #[tokio::test]
+async fn send_message_preserves_generic_reasoning_before_text() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{\"id\":\"chatcmpl_reasoning\",\"model\":\"qwen3:latest\",",
+        "\"choices\":[{\"message\":{\"role\":\"assistant\",",
+        "\"reasoning\":\"Think locally\",\"content\":\"Answer locally\",",
+        "\"tool_calls\":[]},\"finish_reason\":\"stop\"}],",
+        "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}"
+    );
+    let Some(server) = spawn_server(
+        state,
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await
+    else {
+        return;
+    };
+
+    let client = OpenAiCompatClient::new("ollama-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let response = client
+        .send_message(&sample_request(false))
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(
+        response.content,
+        vec![
+            OutputContentBlock::Thinking {
+                thinking: "Think locally".to_string(),
+                signature: None,
+            },
+            OutputContentBlock::Text {
+                text: "Answer locally".to_string(),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn stream_message_preserves_generic_reasoning_before_text() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = concat!(
+        "data: {\"id\":\"chatcmpl_reasoning_stream\",\"model\":\"qwen3:latest\",\"choices\":[{\"delta\":{\"reasoning\":\"Think\"}}]}\n\n",
+        "data: {\"id\":\"chatcmpl_reasoning_stream\",\"choices\":[{\"delta\":{\"content\":\" answer\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let Some(server) = spawn_server(
+        state,
+        vec![http_response("200 OK", "text/event-stream", sse)],
+    )
+    .await
+    else {
+        return;
+    };
+
+    let client = OpenAiCompatClient::new("ollama-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let mut stream = client
+        .stream_message(&sample_request(true))
+        .await
+        .expect("stream should start");
+    let mut events = Vec::new();
+    while let Some(event) = stream.next_event().await.expect("event should parse") {
+        events.push(event);
+    }
+
+    assert!(matches!(
+        events[1],
+        StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+            index: 0,
+            content_block: OutputContentBlock::Thinking { .. },
+        })
+    ));
+    assert!(matches!(
+        events[2],
+        StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            index: 0,
+            delta: ContentBlockDelta::ThinkingDelta { .. },
+        })
+    ));
+    assert!(matches!(
+        events[3],
+        StreamEvent::ContentBlockStop(ContentBlockStopEvent { index: 0 })
+    ));
+    assert!(matches!(
+        events[4],
+        StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+            index: 1,
+            content_block: OutputContentBlock::Text { .. },
+        })
+    ));
+}
+
+#[tokio::test]
 async fn send_message_blocks_oversized_xai_requests_before_the_http_call() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let Some(server) = spawn_server(

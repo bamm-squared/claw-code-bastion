@@ -202,6 +202,9 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     if let Some(metadata) = metadata_for_model(model) {
         return metadata.provider;
     }
+    if std::env::var_os("OLLAMA_HOST").is_some() {
+        return ProviderKind::OpenAi;
+    }
     // When OPENAI_BASE_URL is set, the user explicitly configured an
     // OpenAI-compatible endpoint. Prefer it over the Anthropic fallback
     // even when the model name has no recognized prefix — this is the

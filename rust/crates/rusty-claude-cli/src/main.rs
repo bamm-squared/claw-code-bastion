@@ -193,8 +193,14 @@ fn provider_endpoint(model: &str) -> String {
     match detect_provider_kind(model) {
         ProviderKind::Anthropic => api::read_base_url(),
         ProviderKind::Xai => api::read_xai_base_url(),
-        ProviderKind::OpenAi => env::var("OPENAI_BASE_URL")
-            .unwrap_or_else(|_| String::from("https://api.openai.com/v1")),
+        ProviderKind::OpenAi => {
+            if env::var_os("OLLAMA_HOST").is_some() {
+                api::read_ollama_base_url()
+            } else {
+                env::var("OPENAI_BASE_URL")
+                    .unwrap_or_else(|_| String::from("https://api.openai.com/v1"))
+            }
+        }
     }
 }
 

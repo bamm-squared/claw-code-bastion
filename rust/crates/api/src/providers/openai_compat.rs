@@ -19,6 +19,7 @@ use super::{preflight_message_request, Provider, ProviderFuture};
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_DASHSCOPE_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434/v1";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -69,6 +70,16 @@ impl OpenAiCompatConfig {
             api_key_env: "DASHSCOPE_API_KEY",
             base_url_env: "DASHSCOPE_BASE_URL",
             default_base_url: DEFAULT_DASHSCOPE_BASE_URL,
+        }
+    }
+
+    #[must_use]
+    pub const fn ollama() -> Self {
+        Self {
+            provider_name: "Ollama",
+            api_key_env: "OLLAMA_HOST",
+            base_url_env: "OLLAMA_HOST",
+            default_base_url: DEFAULT_OLLAMA_BASE_URL,
         }
     }
 
@@ -124,6 +135,27 @@ impl OpenAiCompatClient {
             ));
         };
         Ok(Self::new(api_key, config))
+    }
+
+    #[must_use]
+    pub fn from_ollama_env() -> Self {
+        let host =
+            std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+        let host = host.trim_end_matches('/');
+        let base_url = if host.ends_with("/v1") {
+            host.to_string()
+        } else {
+            format!("{host}/v1")
+        };
+        Self {
+            http: build_http_client_or_default(),
+            api_key: "ollama".to_string(),
+            config: OpenAiCompatConfig::ollama(),
+            base_url,
+            max_retries: DEFAULT_MAX_RETRIES,
+            initial_backoff: DEFAULT_INITIAL_BACKOFF,
+            max_backoff: DEFAULT_MAX_BACKOFF,
+        }
     }
 
     #[must_use]
@@ -418,6 +450,8 @@ impl OpenAiSseParser {
 struct StreamState {
     model: String,
     message_started: bool,
+    reasoning_started: bool,
+    reasoning_finished: bool,
     text_started: bool,
     text_finished: bool,
     finished: bool,
@@ -431,6 +465,8 @@ impl StreamState {
         Self {
             model,
             message_started: false,
+            reasoning_started: false,
+            reasoning_finished: false,
             text_started: false,
             text_finished: false,
             finished: false,
@@ -440,6 +476,7 @@ impl StreamState {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn ingest_chunk(&mut self, chunk: ChatCompletionChunk) -> Result<Vec<StreamEvent>, ApiError> {
         let mut events = Vec::new();
         if !self.message_started {
@@ -474,18 +511,54 @@ impl StreamState {
         }
 
         for choice in chunk.choices {
+            let reasoning = choice
+                .delta
+                .reasoning_content
+                .filter(|value| !value.is_empty())
+                .or(choice.delta.reasoning.filter(|value| !value.is_empty()))
+                .or_else(|| {
+                    choice
+                        .delta
+                        .thinking
+                        .and_then(|value| value.content)
+                        .filter(|value| !value.is_empty())
+                });
+            if let Some(reasoning) = reasoning {
+                if !self.reasoning_started {
+                    self.reasoning_started = true;
+                    events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                        index: 0,
+                        content_block: OutputContentBlock::Thinking {
+                            thinking: String::new(),
+                            signature: None,
+                        },
+                    }));
+                }
+                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                    index: 0,
+                    delta: ContentBlockDelta::ThinkingDelta {
+                        thinking: reasoning,
+                    },
+                }));
+            }
             if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
+                if self.reasoning_started && !self.reasoning_finished {
+                    self.reasoning_finished = true;
+                    events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                        index: 0,
+                    }));
+                }
                 if !self.text_started {
                     self.text_started = true;
                     events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
-                        index: 0,
+                        index: 1,
                         content_block: OutputContentBlock::Text {
                             text: String::new(),
                         },
                     }));
                 }
                 events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                    index: 0,
+                    index: 1,
                     delta: ContentBlockDelta::TextDelta { text: content },
                 }));
             }
@@ -493,16 +566,17 @@ impl StreamState {
             for tool_call in choice.delta.tool_calls {
                 let state = self.tool_calls.entry(tool_call.index).or_default();
                 state.apply(tool_call);
-                let block_index = state.block_index();
+                let block_offset = u32::from(self.reasoning_started);
+                let block_index = state.block_index(block_offset);
                 if !state.started {
-                    if let Some(start_event) = state.start_event()? {
+                    if let Some(start_event) = state.start_event(block_offset)? {
                         state.started = true;
                         events.push(StreamEvent::ContentBlockStart(start_event));
                     } else {
                         continue;
                     }
                 }
-                if let Some(delta_event) = state.delta_event() {
+                if let Some(delta_event) = state.delta_event(block_offset) {
                     events.push(StreamEvent::ContentBlockDelta(delta_event));
                 }
                 if choice.finish_reason.as_deref() == Some("tool_calls") && !state.stopped {
@@ -520,7 +594,7 @@ impl StreamState {
                         if state.started && !state.stopped {
                             state.stopped = true;
                             events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                                index: state.block_index(),
+                                index: state.block_index(u32::from(self.reasoning_started)),
                             }));
                         }
                     }
@@ -538,19 +612,26 @@ impl StreamState {
         self.finished = true;
 
         let mut events = Vec::new();
+        if self.reasoning_started && !self.reasoning_finished {
+            self.reasoning_finished = true;
+            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                index: 0,
+            }));
+        }
         if self.text_started && !self.text_finished {
             self.text_finished = true;
             events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                index: 0,
+                index: u32::from(self.reasoning_started),
             }));
         }
 
         for state in self.tool_calls.values_mut() {
             if !state.started {
-                if let Some(start_event) = state.start_event()? {
+                let block_offset = u32::from(self.reasoning_started);
+                if let Some(start_event) = state.start_event(block_offset)? {
                     state.started = true;
                     events.push(StreamEvent::ContentBlockStart(start_event));
-                    if let Some(delta_event) = state.delta_event() {
+                    if let Some(delta_event) = state.delta_event(block_offset) {
                         events.push(StreamEvent::ContentBlockDelta(delta_event));
                     }
                 }
@@ -558,7 +639,7 @@ impl StreamState {
             if state.started && !state.stopped {
                 state.stopped = true;
                 events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                    index: state.block_index(),
+                    index: state.block_index(u32::from(self.reasoning_started)),
                 }));
             }
         }
@@ -611,12 +692,12 @@ impl ToolCallState {
         }
     }
 
-    const fn block_index(&self) -> u32 {
-        self.openai_index + 1
+    const fn block_index(&self, offset: u32) -> u32 {
+        self.openai_index + 1 + offset
     }
 
     #[allow(clippy::unnecessary_wraps)]
-    fn start_event(&self) -> Result<Option<ContentBlockStartEvent>, ApiError> {
+    fn start_event(&self, offset: u32) -> Result<Option<ContentBlockStartEvent>, ApiError> {
         let Some(name) = self.name.clone() else {
             return Ok(None);
         };
@@ -625,7 +706,7 @@ impl ToolCallState {
             .clone()
             .unwrap_or_else(|| format!("tool_call_{}", self.openai_index));
         Ok(Some(ContentBlockStartEvent {
-            index: self.block_index(),
+            index: self.block_index(offset),
             content_block: OutputContentBlock::ToolUse {
                 id,
                 name,
@@ -634,14 +715,14 @@ impl ToolCallState {
         }))
     }
 
-    fn delta_event(&mut self) -> Option<ContentBlockDeltaEvent> {
+    fn delta_event(&mut self, offset: u32) -> Option<ContentBlockDeltaEvent> {
         if self.emitted_len >= self.arguments.len() {
             return None;
         }
         let delta = self.arguments[self.emitted_len..].to_string();
         self.emitted_len = self.arguments.len();
         Some(ContentBlockDeltaEvent {
-            index: self.block_index(),
+            index: self.block_index(offset),
             delta: ContentBlockDelta::InputJsonDelta {
                 partial_json: delta,
             },
@@ -670,6 +751,10 @@ struct ChatMessage {
     role: String,
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ResponseToolCall>,
 }
@@ -716,8 +801,20 @@ struct ChunkChoice {
 struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    thinking: Option<ThinkingDelta>,
     #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
     tool_calls: Vec<DeltaToolCall>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThinkingDelta {
+    #[serde(default)]
+    content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1076,6 +1173,17 @@ fn normalize_response(
             "chat completion response missing choices",
         ))?;
     let mut content = Vec::new();
+    if let Some(reasoning) = choice
+        .message
+        .reasoning_content
+        .filter(|value| !value.is_empty())
+        .or(choice.message.reasoning.filter(|value| !value.is_empty()))
+    {
+        content.push(OutputContentBlock::Thinking {
+            thinking: reasoning,
+            signature: None,
+        });
+    }
     if let Some(text) = choice.message.content.filter(|value| !value.is_empty()) {
         content.push(OutputContentBlock::Text { text });
     }
@@ -1214,6 +1322,18 @@ pub fn has_api_key(key: &str) -> bool {
 #[must_use]
 pub fn read_base_url(config: OpenAiCompatConfig) -> String {
     std::env::var(config.base_url_env).unwrap_or_else(|_| config.default_base_url.to_string())
+}
+
+#[must_use]
+pub fn read_ollama_base_url() -> String {
+    let host =
+        std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+    let host = host.trim_end_matches('/');
+    if host.ends_with("/v1") {
+        host.to_string()
+    } else {
+        format!("{host}/v1")
+    }
 }
 
 fn chat_completions_endpoint(base_url: &str) -> String {
