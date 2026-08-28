@@ -11,6 +11,39 @@ use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::{as_24_bit_terminal_escaped, LinesWithEndings};
 
+pub fn sanitize_terminal_text(value: &str) -> String {
+    let mut output = String::new();
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\u{1b}' {
+            if matches!(chars.peek(), Some(']' | 'P' | '^' | '_' | 'X')) {
+                chars.next();
+                while let Some(next) = chars.next() {
+                    if next == '\u{7}' {
+                        break;
+                    }
+                    if next == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            } else {
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() || next == '~' {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if character == '\r' || (character.is_control() && character != '\n' && character != '\t') {
+            continue;
+        }
+        output.push(character);
+    }
+    output
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ColorTheme {
     heading: Color,
@@ -912,7 +945,9 @@ fn strip_ansi(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_ansi, MarkdownStreamState, Spinner, TerminalRenderer};
+    use super::{
+        sanitize_terminal_text, strip_ansi, MarkdownStreamState, Spinner, TerminalRenderer,
+    };
 
     #[test]
     fn renders_markdown_with_styling_and_lists() {
@@ -1066,5 +1101,14 @@ mod tests {
 
         let output = String::from_utf8_lossy(&out);
         assert!(output.contains("Working"));
+    }
+
+    #[test]
+    fn sanitizes_terminal_control_sequences() {
+        let hostile = "safe\u{1b}]52;c;clipboard\u{7}\u{1b}[2J\rvisible";
+        let sanitized = sanitize_terminal_text(hostile);
+        assert_eq!(sanitized, "safevisible");
+        assert!(!sanitized.contains('\u{1b}'));
+        assert!(!sanitized.contains('\r'));
     }
 }
