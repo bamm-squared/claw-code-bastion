@@ -97,6 +97,7 @@ impl Spinner {
         out: &mut impl Write,
     ) -> io::Result<()> {
         let frame = Self::FRAMES[self.frame_index % Self::FRAMES.len()];
+        let label = sanitize_terminal_text(label);
         self.frame_index += 1;
         queue!(
             out,
@@ -118,6 +119,7 @@ impl Spinner {
         out: &mut impl Write,
     ) -> io::Result<()> {
         self.frame_index = 0;
+        let label = sanitize_terminal_text(label);
         execute!(
             out,
             MoveToColumn(0),
@@ -136,6 +138,7 @@ impl Spinner {
         out: &mut impl Write,
     ) -> io::Result<()> {
         self.frame_index = 0;
+        let label = sanitize_terminal_text(label);
         execute!(
             out,
             MoveToColumn(0),
@@ -1016,20 +1019,23 @@ mod tests {
 
     #[test]
     fn streaming_state_waits_for_complete_blocks() {
-        let renderer = TerminalRenderer::new();
+        let terminal_renderer = TerminalRenderer::new();
         let mut state = MarkdownStreamState::default();
 
-        assert_eq!(state.push(&renderer, "# Heading"), None);
+        assert_eq!(state.push(&terminal_renderer, "# Heading"), None);
         let flushed = state
-            .push(&renderer, "\n\nParagraph\n\n")
+            .push(&terminal_renderer, "\n\nParagraph\n\n")
             .expect("completed block");
         let plain_text = strip_ansi(&flushed);
         assert!(plain_text.contains("Heading"));
         assert!(plain_text.contains("Paragraph"));
 
-        assert_eq!(state.push(&renderer, "```rust\nfn main() {}\n"), None);
+        assert_eq!(
+            state.push(&terminal_renderer, "```rust\nfn main() {}\n"),
+            None
+        );
         let code = state
-            .push(&renderer, "```\n")
+            .push(&terminal_renderer, "```\n")
             .expect("closed code fence flushes");
         assert!(strip_ansi(&code).contains("fn main()"));
     }
@@ -1111,5 +1117,119 @@ mod tests {
         assert_eq!(sanitized, "safevisible");
         assert!(!sanitized.contains('\u{1b}'));
         assert!(!sanitized.contains('\r'));
+    }
+
+    #[test]
+    fn captured_hostile_corpus_is_inert_through_markdown_renderer() {
+        let terminal_renderer = TerminalRenderer::new();
+        let hostile = concat!(
+            "ESC\x1b CSI\x1b[2J\x1b[H\x1b[1A\x1b[K\x1b[0m ",
+            "OSC\x1b]0;title\x07 ",
+            "OSC8\x1b]8;;https://evil.invalid\x1b\\label\x1b]8;;\x1b\\ ",
+            "OSC52\x1b]52;c;secret\x07 ",
+            "BEL\x07 CR\r BS\x08 FF\x0c VT\x0b RESET\x1b[c"
+        );
+        let rendered = terminal_renderer.markdown_to_ansi(hostile);
+
+        assert!(!rendered.contains("\x1b]"));
+        assert!(!rendered.contains("\x1b[2J"));
+        assert!(!rendered.contains("\x1b[H"));
+        assert!(!rendered.contains("\x1b[K"));
+        assert!(!rendered.contains("https://evil.invalid"));
+        assert!(!rendered.contains('\r'));
+        assert!(!rendered.contains('\x07'));
+        assert!(rendered.contains("CSI"));
+    }
+
+    #[test]
+    fn hostile_text_is_safe_across_major_display_sources() {
+        let terminal_renderer = TerminalRenderer::new();
+        let sources = [
+            "model message",
+            "tool stdout",
+            "tool stderr",
+            "git branch",
+            "git commit subject",
+            "git filename",
+            "retrieval snippet",
+            "at reference label",
+            "MCP error",
+            "hook output",
+            "plugin result",
+            "provider error",
+            "session metadata",
+            "validation review",
+            "candidate filename",
+        ];
+        for source in sources {
+            let input = format!("{source}: PRIVATE\x1b[2J\x1b]52;c;clipboard\x07\rAPPLIED");
+            let rendered = terminal_renderer.markdown_to_ansi(&input);
+            assert!(!rendered.contains("\x1b[2J"), "unsafe {source}");
+            assert!(!rendered.contains("\x1b]52"), "unsafe {source}");
+            assert!(!rendered.contains('\r'), "unsafe {source}");
+            assert!(rendered.contains(source), "lost {source}");
+        }
+    }
+
+    #[test]
+    fn streaming_chunks_cannot_form_terminal_sequences() {
+        let terminal_renderer = TerminalRenderer::new();
+        let chunks = [
+            "text\x1b",
+            "[2J",
+            " title\x1b",
+            "]52;c;clipboard",
+            "\x07\n\n",
+        ];
+        let rendered = chunks
+            .iter()
+            .map(|chunk| terminal_renderer.markdown_to_ansi(chunk))
+            .collect::<String>();
+        assert!(!rendered.contains("\x1b[2J"));
+        assert!(!rendered.contains("\x1b]52"));
+
+        let mut state = MarkdownStreamState::default();
+        for chunk in chunks {
+            let _ = state.push(&terminal_renderer, chunk);
+        }
+        let flushed = state.flush(&terminal_renderer).unwrap_or_default();
+        assert!(!flushed.contains("\x1b[2J"));
+        assert!(!flushed.contains("\x1b]52"));
+    }
+
+    #[test]
+    fn spinner_labels_cannot_reposition_or_overwrite_terminal_state() {
+        let terminal_renderer = TerminalRenderer::new();
+        let hostile = "VALIDATION: PASS\x1b[H\x1b[2J\rAPPLIED\x1b]0;PRIVATE\x07";
+        let mut spinner = Spinner::new();
+        let mut output = Vec::new();
+        spinner
+            .tick(hostile, terminal_renderer.color_theme(), &mut output)
+            .expect("tick succeeds");
+        spinner
+            .finish(hostile, terminal_renderer.color_theme(), &mut output)
+            .expect("finish succeeds");
+        spinner
+            .fail(hostile, terminal_renderer.color_theme(), &mut output)
+            .expect("fail succeeds");
+        let output = String::from_utf8(output).expect("UTF-8 terminal output");
+        assert!(!output.contains("\x1b[H"));
+        assert!(!output.contains("\x1b[2J"));
+        assert!(!output.contains("\x1b]0;"));
+        assert!(!output.contains('\r'));
+        assert!(output.contains("VALIDATION: PASS"));
+    }
+
+    #[test]
+    fn sanitizer_preserves_unicode_and_trusted_renderer_formatting() {
+        let terminal_renderer = TerminalRenderer::new();
+        let rendered = terminal_renderer
+            .markdown_to_ansi("# e\u{301} \u{1f980}\n\n`code` \u{05d0}\u{200b}\x1b[2J");
+        let plain = strip_ansi(&rendered);
+        assert!(plain.contains("e\u{301}"));
+        assert!(plain.contains('\u{1f980}'));
+        assert!(plain.contains("code"));
+        assert!(!rendered.contains("\x1b[2J"));
+        assert!(rendered.contains('\x1b'));
     }
 }
