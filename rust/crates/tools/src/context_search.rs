@@ -118,7 +118,13 @@ fn scan(
         if metadata.len() > MAX_FILE_BYTES || !is_text_file(&path) || is_sensitive_path(&path) {
             continue;
         }
-        let Ok(content) = fs::read_to_string(&path) else {
+        let Ok(raw) = fs::read(&path) else {
+            continue;
+        };
+        if raw.contains(&0) {
+            continue;
+        }
+        let Ok(content) = String::from_utf8(raw) else {
             continue;
         };
         *bytes_read = bytes_read.saturating_add(content.len());
@@ -266,7 +272,9 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{execute_at, is_sensitive_path, is_text_file};
+    use runtime::{apply_approved_changes, create_disposable_snapshot};
+
+    use super::{execute_at, is_sensitive_path, is_text_file, scan};
 
     fn fixture() -> PathBuf {
         let id = SystemTime::now()
@@ -384,5 +392,335 @@ mod tests {
             assert_eq!(report["scanned_files"], repeat_report["scanned_files"]);
             fs::remove_dir_all(root).expect("cleanup");
         }
+    }
+
+    #[test]
+    fn candidate_request_changes_and_apply_keep_retrieval_current() {
+        let canonical = fixture();
+        fs::write(canonical.join("source.rs"), "ORIGINAL_TOKEN\n").expect("canonical source");
+        let task = create_disposable_snapshot(&canonical).expect("candidate snapshot");
+        let search = |root: &Path, query: &str| {
+            execute_at(root, &json!({"query": query, "max_results": 12})).expect("search")
+        };
+
+        fs::write(
+            task.candidate.root.join("source.rs"),
+            "FIRST_CANDIDATE_TOKEN\n",
+        )
+        .expect("first candidate edit");
+        assert!(search(&task.candidate.root, "FIRST_CANDIDATE_TOKEN").contains("source.rs"));
+        let first_review = task.scan().expect("first review");
+
+        fs::write(
+            task.candidate.root.join("source.rs"),
+            "SECOND_CANDIDATE_TOKEN\n",
+        )
+        .expect("request-changes edit");
+        assert!(search(&task.candidate.root, "SECOND_CANDIDATE_TOKEN").contains("source.rs"));
+        assert!(!search(&task.candidate.root, "FIRST_CANDIDATE_TOKEN").contains("source.rs"));
+        let original: serde_json::Value =
+            serde_json::from_str(&search(&task.candidate.root, "ORIGINAL_TOKEN"))
+                .expect("original report");
+        assert!(original["results"]
+            .as_array()
+            .expect("original results")
+            .is_empty());
+
+        let final_review = task.scan().expect("final review");
+        apply_approved_changes(
+            &final_review,
+            &task.canonical,
+            &task.baseline,
+            &task.candidate,
+        )
+        .expect("apply reviewed candidate");
+        assert_eq!(
+            fs::read_to_string(canonical.join("source.rs")).expect("applied source"),
+            "SECOND_CANDIDATE_TOKEN\n"
+        );
+        assert!(search(&canonical, "SECOND_CANDIDATE_TOKEN").contains("source.rs"));
+        assert!(!search(&canonical, "FIRST_CANDIDATE_TOKEN").contains("source.rs"));
+        assert!(!search(&canonical, "ORIGINAL_TOKEN").contains("source.rs"));
+        assert_eq!(first_review.changes.len(), final_review.changes.len());
+        task.discard().expect("discard task fixture");
+        fs::remove_dir_all(canonical).expect("cleanup canonical");
+    }
+
+    #[test]
+    fn private_retrieval_is_local_and_non_persistent() {
+        let root = fixture();
+        let canary = "PRIVATE_RETRIEVAL_CANARY_7f31";
+        fs::write(root.join("private.rs"), canary).expect("private source");
+        let previous = std::env::var_os("CLAW_PRIVATE_MODE");
+        std::env::set_var("CLAW_PRIVATE_MODE", "1");
+        let report = execute_at(&root, &json!({"query": canary})).expect("private search");
+        match previous {
+            Some(value) => std::env::set_var("CLAW_PRIVATE_MODE", value),
+            None => std::env::remove_var("CLAW_PRIVATE_MODE"),
+        }
+        let value: serde_json::Value = serde_json::from_str(&report).expect("search report");
+        assert_eq!(value["persistent"], false);
+        assert_eq!(value["network"], false);
+        assert!(report.contains(canary));
+        let persisted = fs::read_dir(&root)
+            .expect("state fixture")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path != &root.join("private.rs"))
+            .collect::<Vec<_>>();
+        assert!(
+            persisted.is_empty(),
+            "private retrieval created state: {persisted:?}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn retrieval_resource_bounds_cover_large_fixture_and_file_size() {
+        let root = fixture();
+        for index in 0..20_050 {
+            fs::write(
+                root.join(format!("module-{index:05}.rs")),
+                "CEILING_CONTEXT_TOKEN\n",
+            )
+            .expect("ceiling file");
+        }
+        fs::write(
+            root.join("below-limit.rs"),
+            "BELOW_LIMIT_TOKEN\n".repeat(8_000),
+        )
+        .expect("below-limit file");
+        fs::write(
+            root.join("above-limit.rs"),
+            format!(
+                "ALLOWED_PREFIX_TOKEN\n{}OVER_LIMIT_TOKEN\n",
+                "x".repeat(512 * 1024)
+            ),
+        )
+        .expect("above-limit file");
+        let report = execute_at(
+            &root,
+            &json!({"query":"CEILING_CONTEXT_TOKEN", "max_results":12}),
+        )
+        .expect("ceiling search");
+        let value: serde_json::Value = serde_json::from_str(&report).expect("ceiling report");
+        assert!(value["scanned_files"].as_u64().expect("scanned files") <= 20_000);
+        assert_eq!(value["results"].as_array().expect("results").len(), 12);
+        assert!(value["bytes_read"].as_u64().expect("bytes read") <= 20_000 * 32);
+
+        let size_root = fixture();
+        fs::write(
+            size_root.join("below-limit.rs"),
+            "BELOW_LIMIT_TOKEN\n".repeat(8_000),
+        )
+        .expect("below-limit file");
+        fs::write(
+            size_root.join("above-limit.rs"),
+            format!(
+                "ALLOWED_PREFIX_TOKEN\n{}OVER_LIMIT_TOKEN\n",
+                "x".repeat(512 * 1024)
+            ),
+        )
+        .expect("above-limit file");
+        let size_report =
+            execute_at(&size_root, &json!({"query":"OVER_LIMIT_TOKEN"})).expect("size search");
+        let size_value: serde_json::Value = serde_json::from_str(&size_report).expect("size JSON");
+        assert!(size_value["results"]
+            .as_array()
+            .expect("size results")
+            .is_empty());
+        assert!(size_value["bytes_read"].as_u64().expect("size bytes") < 512 * 1024);
+        fs::remove_dir_all(size_root).expect("cleanup size fixture");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn retrieval_benchmarks_five_and_twenty_thousand_files() {
+        for (label, file_count) in [("5k", 5_000), ("20k", 20_000)] {
+            let root = fixture();
+            let source = "ValidationIdentity provider fallback network redirect authorization\n";
+            for index in 0..file_count {
+                let path = root.join(format!("src/module-{index:05}.rs"));
+                if index == 0 {
+                    fs::create_dir_all(path.parent().expect("source parent")).expect("src dir");
+                }
+                fs::write(path, source).expect("benchmark source");
+            }
+            let input = json!({"query":"ValidationIdentity provider fallback", "max_results":12});
+            let started = Instant::now();
+            let cold = execute_at(&root, &input).expect("cold benchmark");
+            let cold_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let started = Instant::now();
+            let repeat = execute_at(&root, &input).expect("repeat benchmark");
+            let repeat_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            fs::write(root.join("src/module-00000.rs"), "EDIT_REFRESH_TOKEN\n")
+                .expect("benchmark edit");
+            let started = Instant::now();
+            let edit =
+                execute_at(&root, &json!({"query":"EDIT_REFRESH_TOKEN"})).expect("edit benchmark");
+            let edit_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let value: serde_json::Value = serde_json::from_str(&cold).expect("cold report");
+            let repeat_value: serde_json::Value =
+                serde_json::from_str(&repeat).expect("repeat report");
+            let edit_value: serde_json::Value = serde_json::from_str(&edit).expect("edit report");
+            assert_eq!(value["scanned_files"], repeat_value["scanned_files"]);
+            assert!(edit_value["results"]
+                .as_array()
+                .expect("edit results")
+                .iter()
+                .any(|item| item["path"] == "src/module-00000.rs"));
+            println!(
+                "CONTEXT_BENCHMARK {label} files={file_count} source_bytes={} scanned_files={} bytes_read={} cold_ms={cold_ms:.3} repeat_ms={repeat_ms:.3} edit_ms={edit_ms:.3}",
+                file_count * source.len(),
+                value["scanned_files"],
+                value["bytes_read"],
+            );
+            fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn retrieval_excludes_ignored_binary_unicode_and_handles_long_lines() {
+        let root = fixture();
+        fs::create_dir_all(root.join("target/generated")).expect("generated directory");
+        fs::create_dir_all(root.join("node_modules/pkg")).expect("node modules");
+        fs::create_dir_all(root.join(".git")).expect("git directory");
+        fs::write(
+            root.join("target/generated/IGNORED_TOKEN.rs"),
+            "IGNORED_TOKEN",
+        )
+        .expect("ignored");
+        fs::write(
+            root.join("node_modules/pkg/DEPENDENCY_TOKEN.js"),
+            "DEPENDENCY_TOKEN",
+        )
+        .expect("dependency");
+        fs::write(root.join(".git/metadata.rs"), "GIT_METADATA_TOKEN").expect("git metadata");
+        fs::write(root.join("binary.rs"), b"\0BINARY_TOKEN\0").expect("binary fixture");
+        fs::write(
+            root.join("unicode-世界.rs"),
+            "世界 UNICODE_TOKEN ".repeat(80),
+        )
+        .expect("unicode");
+        fs::write(
+            root.join("long.rs"),
+            format!("BEGIN_TOKEN {} END_TOKEN", "x".repeat(10_000)),
+        )
+        .expect("long line");
+        let search = |query: &str| {
+            execute_at(&root, &json!({"query":query, "max_results":12})).expect("search")
+        };
+        let has_result = |report: &str, token: &str| {
+            let value: serde_json::Value = serde_json::from_str(report).expect("search report");
+            value["results"]
+                .as_array()
+                .expect("results")
+                .iter()
+                .any(|result| result.to_string().contains(token))
+        };
+        assert!(!has_result(&search("IGNORED_TOKEN"), "IGNORED_TOKEN"));
+        assert!(!has_result(&search("DEPENDENCY_TOKEN"), "DEPENDENCY_TOKEN"));
+        assert!(!has_result(
+            &search("GIT_METADATA_TOKEN"),
+            "GIT_METADATA_TOKEN"
+        ));
+        assert!(!has_result(&search("BINARY_TOKEN"), "BINARY_TOKEN"));
+        let unicode = search("UNICODE_TOKEN");
+        assert!(unicode.contains("unicode-世界.rs"));
+        assert!(unicode.len() < 2_000);
+        let long = search("END_TOKEN");
+        let long_value: serde_json::Value = serde_json::from_str(&long).expect("long report");
+        assert!(
+            long_value["results"][0]["snippet"]
+                .as_str()
+                .expect("snippet")
+                .chars()
+                .count()
+                <= 700
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn retrieval_ranking_and_candidate_ceiling_are_deterministic() {
+        let root = fixture();
+        fs::create_dir_all(root.join("src/security")).expect("security directory");
+        fs::create_dir_all(root.join("src/providers")).expect("provider directory");
+        fs::create_dir_all(root.join("src/network")).expect("network directory");
+        fs::create_dir_all(root.join("src/candidate")).expect("candidate directory");
+        fs::write(
+            root.join("src/security/validation_identity.rs"),
+            "struct ValidationIdentity;\n",
+        )
+        .expect("validation fixture");
+        fs::write(
+            root.join("src/providers/fallback.rs"),
+            "fn provider_fallback() {}\n",
+        )
+        .expect("provider fixture");
+        fs::write(
+            root.join("src/network/redirect_authorization.rs"),
+            "fn network_redirect_authorization() {}\n",
+        )
+        .expect("network fixture");
+        fs::write(
+            root.join("src/candidate/lifecycle.rs"),
+            "fn candidate_lifecycle() {}\n",
+        )
+        .expect("candidate fixture");
+        fs::write(
+            root.join("incidental.rs"),
+            "Validation Identity appears apart\n",
+        )
+        .expect("incidental fixture");
+
+        let top_path = |query: &str| {
+            let value: serde_json::Value = serde_json::from_str(
+                &execute_at(&root, &json!({"query":query, "max_results":1}))
+                    .expect("ranking search"),
+            )
+            .expect("ranking JSON");
+            value["results"][0]["path"]
+                .as_str()
+                .expect("top path")
+                .to_string()
+        };
+        assert_eq!(
+            top_path("ValidationIdentity"),
+            "src/security/validation_identity.rs"
+        );
+        assert_eq!(top_path("provider fallback"), "src/providers/fallback.rs");
+        assert_eq!(
+            top_path("network redirect authorization"),
+            "src/network/redirect_authorization.rs"
+        );
+        assert_eq!(
+            top_path("candidate lifecycle"),
+            "src/candidate/lifecycle.rs"
+        );
+
+        let mut matches = Vec::new();
+        let mut scanned_files = 0;
+        let mut bytes_read = 0;
+        for index in 0..300 {
+            fs::write(
+                root.join(format!("match-{index}.rs")),
+                "CANDIDATE_CEILING_TOKEN\n",
+            )
+            .expect("candidate bound fixture");
+        }
+        scan(
+            &root,
+            &root,
+            &["candidate_ceiling_token"],
+            &mut matches,
+            &mut scanned_files,
+            &mut bytes_read,
+        )
+        .expect("bounded scan");
+        assert!(matches.len() <= 256);
+        assert_eq!(scanned_files, 305);
+        assert!(bytes_read > 0);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }
