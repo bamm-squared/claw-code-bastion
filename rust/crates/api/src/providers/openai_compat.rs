@@ -1482,6 +1482,40 @@ mod tests {
     }
 
     #[test]
+    fn image_content_uses_data_url_without_host_path() {
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![InputMessage {
+                role: "user".to_string(),
+                content: vec![
+                    InputContentBlock::Text {
+                        text: "describe this".to_string(),
+                    },
+                    InputContentBlock::Image {
+                        media_type: "image/png".to_string(),
+                        data: "AQID".to_string(),
+                    },
+                ],
+            }],
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let content = payload["messages"][0]["content"]
+            .as_array()
+            .expect("multimodal content should be an array");
+        assert_eq!(content[0], json!({"type": "text", "text": "describe this"}));
+        let url = content[1]["image_url"]["url"]
+            .as_str()
+            .expect("image URL should be present");
+        assert_eq!(url, "data:image/png;base64,AQID");
+        assert_eq!(
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, "AQID").unwrap(),
+            [1, 2, 3]
+        );
+        assert!(!payload.to_string().contains("/tmp/"));
+    }
+
+    #[test]
     fn tool_schema_object_gets_strict_fields_for_responses_endpoint() {
         // OpenAI /responses endpoint rejects object schemas missing
         // "properties" and "additionalProperties". Verify normalize_object_schema

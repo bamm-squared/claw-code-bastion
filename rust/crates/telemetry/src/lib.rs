@@ -500,6 +500,32 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_typed_image_content_for_anthropic() {
+        let profile = AnthropicRequestProfile::default();
+        let body = profile
+            .render_json_body(&serde_json::json!({
+                "model": "claude-sonnet-4-6",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe this"},
+                        {"type": "image", "media_type": "image/jpeg", "data": "AQID"}
+                    ]
+                }]
+            }))
+            .expect("body should serialize");
+        assert_eq!(body["messages"][0]["content"][0]["text"], "describe this");
+        assert_eq!(
+            body["messages"][0]["content"][1],
+            serde_json::json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": "AQID"}
+            })
+        );
+        assert!(!body.to_string().contains("/tmp/"));
+    }
+
+    #[test]
     fn session_tracer_records_structured_events_and_trace_sequence() {
         let sink = Arc::new(MemoryTelemetrySink::default());
         let tracer = SessionTracer::new("session-123", sink.clone());

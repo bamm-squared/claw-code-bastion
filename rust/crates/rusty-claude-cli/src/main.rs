@@ -4560,16 +4560,7 @@ impl LiveCli {
         Ok(self
             .attachments
             .iter()
-            .filter(|attachment| attachment.kind == attachments::AttachmentKind::Image)
-            .map(|attachment| {
-                let data = base64::engine::general_purpose::STANDARD.encode(&attachment.bytes);
-                ContentBlock::Image {
-                    attachment_id: attachment.id,
-                    display_name: attachment.display_name.clone(),
-                    media_type: attachment.media_type.clone(),
-                    data: Some(data),
-                }
-            })
+            .filter_map(attachment_image_block)
             .collect::<Vec<_>>())
     }
 
@@ -5639,6 +5630,18 @@ impl LiveCli {
         println!("{}", format_issue_report(context));
         Ok(())
     }
+}
+
+fn attachment_image_block(attachment: &attachments::TaskAttachment) -> Option<ContentBlock> {
+    (attachment.kind == attachments::AttachmentKind::Image).then(|| {
+        let data = base64::engine::general_purpose::STANDARD.encode(&attachment.bytes);
+        ContentBlock::Image {
+            attachment_id: attachment.id,
+            display_name: attachment.display_name.clone(),
+            media_type: attachment.media_type.clone(),
+            data: Some(data),
+        }
+    })
 }
 
 fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -13282,6 +13285,45 @@ mod image_capability_tests {
         ] {
             assert_eq!(image_capability(model), ImageCapability::Unknown, "{model}");
         }
+    }
+}
+
+#[cfg(test)]
+mod image_production_tests {
+    use super::{attachment_image_block, attachments, ContentBlock};
+    use base64::Engine;
+    use std::fs;
+
+    #[test]
+    fn snapshot_feeds_typed_image_without_host_path_or_toctou_reread() {
+        let root =
+            std::env::temp_dir().join(format!("claw-image-production-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("IMAGE_A.png");
+        let mut image_a = vec![
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0,
+            0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0,
+        ];
+        image_a.extend_from_slice(&[0; 4]);
+        fs::write(&path, &image_a).unwrap();
+        let attachment = attachments::TaskAttachment::snapshot(&path, 1).unwrap();
+        fs::write(&path, b"IMAGE_B").unwrap();
+
+        let block = attachment_image_block(&attachment).expect("image attachment should convert");
+        let ContentBlock::Image {
+            data: Some(data), ..
+        } = block
+        else {
+            panic!("expected typed image block");
+        };
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .unwrap(),
+            image_a
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }
 
