@@ -4300,8 +4300,9 @@ impl LiveCli {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
+        let hud = trusted_hud_line(&self.model, self.permission_mode, self.candidate_state);
         spinner.tick(
-            "🦀 Thinking...",
+            &format!("{hud} | Thinking..."),
             TerminalRenderer::new().color_theme(),
             &mut stdout,
         )?;
@@ -5764,6 +5765,31 @@ fn format_status_report(
         "
 
 ",
+    )
+}
+
+fn trusted_hud_line(
+    model: &str,
+    permission_mode: PermissionMode,
+    candidate_state: CandidateLifecycleState,
+) -> String {
+    let privacy = if PrivacyProfile::current().is_private() {
+        "PRIVATE"
+    } else {
+        "NORMAL"
+    };
+    let candidate = match candidate_state {
+        CandidateLifecycleState::Editing => "editing",
+        CandidateLifecycleState::ReviewReady => "review-ready",
+        CandidateLifecycleState::Applied => "applied",
+        CandidateLifecycleState::Discarded => "discarded",
+    };
+    format!(
+        "[{}] model={} permission={} candidate={}",
+        privacy,
+        model,
+        permission_mode.as_str(),
+        candidate
     )
 }
 
@@ -11361,6 +11387,18 @@ mod tests {
         assert!(report.contains("Previous         claude-sonnet"));
         assert!(report.contains("Current          claude-opus"));
         assert!(report.contains("Preserved msgs   9"));
+    }
+
+    #[test]
+    fn trusted_hud_reports_only_trusted_state() {
+        let line = super::trusted_hud_line(
+            "test-model",
+            PermissionMode::WorkspaceWrite,
+            CandidateLifecycleState::ReviewReady,
+        );
+        assert!(line.contains("model=test-model"));
+        assert!(line.contains("candidate=review-ready"));
+        assert!(!line.contains("validated"));
     }
 
     #[test]
