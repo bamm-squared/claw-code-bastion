@@ -45,12 +45,14 @@ pub fn execute(input: &serde_json::Value) -> Result<String, String> {
     let terms = query.split_whitespace().collect::<Vec<_>>();
     let mut matches = Vec::new();
     let mut scanned_files = 0;
+    let mut bytes_read = 0;
     scan(
         &root,
         &search_root,
         &terms,
         &mut matches,
         &mut scanned_files,
+        &mut bytes_read,
     )?;
     let limit = input.max_results.unwrap_or(5).clamp(1, MAX_RESULTS);
     matches.sort_by(|left, right| {
@@ -71,6 +73,8 @@ pub fn execute(input: &serde_json::Value) -> Result<String, String> {
         "scope": "current_workspace",
         "persistent": false,
         "network": false,
+        "scanned_files": scanned_files,
+        "bytes_read": bytes_read,
         "results": results,
     }))
     .map_err(|e| e.to_string())
@@ -82,6 +86,7 @@ fn scan(
     terms: &[&str],
     matches: &mut Vec<Match>,
     scanned_files: &mut usize,
+    bytes_read: &mut usize,
 ) -> Result<(), String> {
     let entries = fs::read_dir(dir).map_err(|e| format!("cannot search {}: {e}", dir.display()))?;
     for entry in entries {
@@ -98,7 +103,7 @@ fn scan(
             ) {
                 continue;
             }
-            scan(root, &path, terms, matches, scanned_files)?;
+            scan(root, &path, terms, matches, scanned_files, bytes_read)?;
             continue;
         }
         if *scanned_files >= MAX_SCANNED_FILES {
@@ -112,6 +117,7 @@ fn scan(
         let Ok(content) = fs::read_to_string(&path) else {
             continue;
         };
+        *bytes_read = bytes_read.saturating_add(content.len());
         let lower = content.to_ascii_lowercase();
         let relative = path
             .strip_prefix(root)
