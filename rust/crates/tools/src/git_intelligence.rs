@@ -122,7 +122,9 @@ fn run(args: &[&str]) -> Result<String, String> {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_LOCAL", "/dev/null")
         .env("GIT_PAGER", "cat")
+        .env("GIT_EDITOR", ":")
         .env("GIT_EXTERNAL_DIFF", "")
         .args([
             "--no-pager",
@@ -131,6 +133,10 @@ fn run(args: &[&str]) -> Result<String, String> {
             "core.fsmonitor=false",
             "-c",
             "core.hooksPath=/dev/null",
+            "-c",
+            "core.pager=cat",
+            "-c",
+            "credential.helper=",
             "-c",
             "diff.external=",
             "-c",
@@ -166,6 +172,7 @@ fn validate_revision(revision: &str) -> Result<(), String> {
         || revision.starts_with('-')
         || revision.chars().any(char::is_whitespace)
         || revision.contains('\0')
+        || revision.contains(':')
     {
         return Err("invalid Git revision".into());
     }
