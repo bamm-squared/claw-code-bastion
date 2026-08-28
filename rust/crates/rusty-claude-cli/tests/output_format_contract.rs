@@ -20,6 +20,34 @@ fn help_emits_json_when_requested() {
         .as_str()
         .expect("help text")
         .contains("Usage:"));
+    let commands = parsed["commands"].as_array().expect("command metadata");
+    assert_eq!(
+        parsed["total_commands"].as_u64(),
+        Some(commands.len() as u64)
+    );
+    assert!(commands.iter().all(|command| {
+        command["name"].is_string()
+            && command["summary"].is_string()
+            && command["resume_supported"].is_boolean()
+    }));
+}
+
+#[test]
+fn json_errors_include_stable_kind_and_hint() {
+    let root = unique_temp_dir("json-error-contract");
+    fs::create_dir_all(&root).expect("temp dir should exist");
+
+    let output = run_claw(
+        &root,
+        &["--output-format", "json", "--permission-mode", "invalid"],
+        &[],
+    );
+    assert!(!output.status.success());
+    let error: Value = serde_json::from_slice(&output.stderr).expect("stderr should be json");
+    assert_eq!(error["type"], "error");
+    assert_eq!(error["kind"], "unknown");
+    assert!(error["error"].is_string());
+    assert!(error["hint"].is_null());
 }
 
 #[test]

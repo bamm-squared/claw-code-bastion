@@ -276,11 +276,14 @@ fn main() {
             .any(|w| w[0] == "--output-format" && w[1] == "json")
             || argv.iter().any(|a| a == "--output-format=json");
         if json_output {
+            let (short_reason, hint) = split_error_hint(&message);
             eprintln!(
                 "{}",
                 serde_json::json!({
                     "type": "error",
-                    "error": message,
+                    "error": short_reason,
+                    "kind": classify_error_kind(&message),
+                    "hint": hint,
                 })
             );
         } else if message.contains("`claw --help`") {
@@ -293,6 +296,49 @@ Run `claw --help` for usage."
             );
         }
         std::process::exit(1);
+    }
+}
+
+/// Classify CLI failures into stable machine-readable categories.
+///
+/// This is intentionally a small compatibility layer over existing error
+/// messages. It improves automation without changing validation or dispatch.
+fn classify_error_kind(message: &str) -> &'static str {
+    if message.contains("missing Anthropic credentials") {
+        "missing_credentials"
+    } else if message.contains("Manifest source files are missing") {
+        "missing_manifests"
+    } else if message.contains("no worker state file found") {
+        "missing_worker_state"
+    } else if message.contains("session not found") {
+        "session_not_found"
+    } else if message.contains("failed to restore session") {
+        "session_load_failed"
+    } else if message.contains("no managed sessions found") {
+        "no_managed_sessions"
+    } else if message.contains("unrecognized argument") || message.contains("unknown option") {
+        "cli_parse"
+    } else if message.contains("invalid model syntax") {
+        "invalid_model_syntax"
+    } else if message.contains("is not yet implemented") {
+        "unsupported_command"
+    } else if message.contains("unsupported resumed command") {
+        "unsupported_resumed_command"
+    } else if message.contains("confirmation required") {
+        "confirmation_required"
+    } else if message.contains("api failed") || message.contains("api returned") {
+        "api_http_error"
+    } else if message.starts_with("interactive_only:") || message.contains("stdin is not a TTY") {
+        "interactive_only"
+    } else {
+        "unknown"
+    }
+}
+
+fn split_error_hint(message: &str) -> (String, Option<String>) {
+    match message.split_once('\n') {
+        Some((short, hint)) => (short.to_string(), Some(hint.trim().to_string())),
+        None => (message.to_string(), None),
     }
 }
 
@@ -9106,13 +9152,27 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
     let message = String::from_utf8(buffer)?;
     match output_format {
         CliOutputFormat::Text => print!("{message}"),
-        CliOutputFormat::Json => println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "kind": "help",
-                "message": message,
-            }))?
-        ),
+        CliOutputFormat::Json => {
+            let commands: Vec<serde_json::Value> = slash_command_specs()
+                .iter()
+                .map(|spec| {
+                    json!({
+                        "name": spec.name,
+                        "summary": spec.summary,
+                        "resume_supported": spec.resume_supported,
+                    })
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "help",
+                    "message": message,
+                    "commands": commands,
+                    "total_commands": commands.len(),
+                }))?
+            );
+        }
     }
     Ok(())
 }
