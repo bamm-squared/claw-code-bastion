@@ -3,10 +3,11 @@
 Claw Code Bastion is a security-hardened distribution derived from Claw Code.
 The model, candidate code, MCP, hooks, plugins, validation targets, and
 model-selected web URLs are treated as untrusted at their respective trust
-boundaries. The v0.1.0-rc.1 campaign passed 84/84 required capabilities on the
-tested Ubuntu/rootless-Podman environment; see
+boundaries. The v0.1.0-rc.1 campaign passed 84/84 required capabilities at its
+tested commit on the tested Ubuntu/rootless-Podman environment; see
 `artifacts/security-verification.json`. This evidence is environment-specific,
-not a universal security guarantee.
+not a universal security guarantee and does not automatically cover later
+changes on `main`.
 
 Claw distinguishes generated policy from empirical runtime verification.
 Normal Rust tests establish `UNIT-VERIFIED`. The stronger

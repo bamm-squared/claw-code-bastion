@@ -1,4 +1,4 @@
-# Claw Code Bastion v1 release and installation
+# Claw Code Bastion release and installation
 
 The controlled release namespace is `bamm-squared/claw-code-bastion`; the standard
 runtime package is `ghcr.io/bamm-squared/claw-bastion-runtime`. Release coordinates are
@@ -87,5 +87,7 @@ The helper verifies local archive checksums and version output, checks runtime
 availability, and reports product stages requiring manual confirmation. It is
 not a substitute for the dedicated hostile isolation gate. Promotion to
 `v0.1.0` requires Rust CI, release artifact/checksum acceptance, clean-machine
-acceptance, the combined real-container security gate, and consistent release
-documentation.
+acceptance, a fresh complete real-container security gate for the release
+commit, and consistent release documentation. The RC1 artifact records 84/84
+for its own tested commit; it does not automatically cover later changes on
+`main`.

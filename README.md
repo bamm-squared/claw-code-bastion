@@ -16,8 +16,6 @@ requires validation and review before authoritative Apply.
   <a href="./PARITY.md">Parity</a>
   ·
   <a href="./ROADMAP.md">Roadmap</a>
-  ·
-  <a href="https://discord.gg/jq6jnSGABY">UltraWorkers Discord</a>
 </p>
 
 <p align="center">
@@ -43,10 +41,12 @@ workspaces, strict private mode, isolated MCP/hooks/plugins, a trusted
 WebFetch/WebSearch broker with SSRF and DNS-rebinding defenses, local or
 confidential provider support, and real rootless-Podman security verification.
 
-The v0.1.0-rc.1 campaign passed 84/84 required capabilities on the tested
-Ubuntu/rootless-Podman environment. See [`artifacts/security-verification.json`](./artifacts/security-verification.json)
-for the recorded evidence; custom environments must preserve the documented
-isolation prerequisites.
+The v0.1.0-rc.1 campaign passed 84/84 required capabilities at its tested
+commit on the tested Ubuntu/rootless-Podman environment. See
+[`artifacts/security-verification.json`](./artifacts/security-verification.json)
+for the recorded RC1 evidence. Current `main` includes post-RC integration
+changes and requires a fresh 84/84 campaign at the next release gate. Custom
+environments must preserve the documented isolation prerequisites.
 
 ## Provenance
 
@@ -67,10 +67,12 @@ curl -fsSL https://raw.githubusercontent.com/bamm-squared/claw-code-bastion/main
 The installer uses `$HOME/.local/bin` and does not require `sudo`, modify shell
 profiles, install Podman, or store credentials. The secure isolated runtime is
 versioned with the CLI; see [`docs/release.md`](docs/release.md) for runtime
-setup, source installation, and uninstall guidance.
+setup, source installation, and uninstall guidance, and
+[`docs/distribution.md`](docs/distribution.md) for provider, private-mode,
+platform, extension, and troubleshooting guidance.
 
 > [!IMPORTANT]
-> Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows. Make `claw doctor` your first health check after building, use [`rust/README.md`](./rust/README.md) for crate-level details, read [`PARITY.md`](./PARITY.md) for the current Rust-port checkpoint, and see [`docs/container.md`](./docs/container.md) for the container-first workflow.
+> Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows. Make `claw doctor` your first health check after building, use [`rust/README.md`](./rust/README.md) for crate-level details, read [`PARITY.md`](./PARITY.md) for the current Rust-port checkpoint, and see [`docs/distribution.md`](./docs/distribution.md) for installation, providers, runtime, private mode, and troubleshooting.
 
 ## Current repository shape
 
@@ -154,6 +156,7 @@ cargo test --workspace
 - [`rust/MOCK_PARITY_HARNESS.md`](./rust/MOCK_PARITY_HARNESS.md) — deterministic mock-service harness details
 - [`ROADMAP.md`](./ROADMAP.md) — active roadmap and open cleanup work
 - [`PHILOSOPHY.md`](./PHILOSOPHY.md) — why the project exists and how it is operated
+- [`docs/distribution.md`](./docs/distribution.md) — installation, providers, runtime, support, and troubleshooting
 
 ## Ecosystem
 
@@ -163,7 +166,6 @@ Claw Code Bastion is built in the open alongside the broader UltraWorkers toolch
 - [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent)
 - [oh-my-claudecode](https://github.com/Yeachan-Heo/oh-my-claudecode)
 - [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex)
-- [UltraWorkers Discord](https://discord.gg/jq6jnSGABY)
 
 ## Ownership / affiliation disclaimer
 

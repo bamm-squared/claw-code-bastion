@@ -1,6 +1,8 @@
-# Claw Code Usage
+# Claw Code Bastion Usage
 
-This guide covers the current Rust workspace under `rust/` and the `claw` CLI binary. If you are brand new, make the doctor health check your first run: start `claw`, then run `/doctor`.
+This guide covers the current Claw Code Bastion Rust workspace under `rust/`
+and the `claw` CLI binary. If you are brand new, make the doctor health check
+your first run: start `claw`, then run `/doctor`.
 
 ## Quick-start health check
 

@@ -1,6 +1,8 @@
-# 🦞 Claw Code — Rust Implementation
+# Claw Code Bastion - Rust Implementation
 
-A high-performance Rust rewrite of the Claw Code CLI agent harness. Built for speed, safety, and native tool execution.
+A high-performance Rust implementation of the Claw Code Bastion CLI. It is
+derived from Claw Code and built for isolated execution, explicit review, and
+native tool orchestration.
 
 For a task-oriented guide with copy/paste examples, see [`../USAGE.md`](../USAGE.md).
 
