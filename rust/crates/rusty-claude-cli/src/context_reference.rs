@@ -11,7 +11,7 @@ type LineRange<'a> = (&'a str, Option<(usize, usize)>);
 pub fn reference_count(prompt: &str) -> usize {
     prompt
         .split_whitespace()
-        .filter(|word| word.starts_with('@') && word.len() > 1)
+        .filter(|word| word.strip_prefix('@').is_some_and(is_reference_token))
         .take(MAX_REFERENCES)
         .count()
 }
@@ -163,7 +163,6 @@ fn git_reference(root: &Path, name: &str, args: &[&str]) -> Result<(String, Stri
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_CONFIG_LOCAL", "/dev/null")
         .env("GIT_PAGER", "cat")
         .env("GIT_EXTERNAL_DIFF", "")
         .args(args)
@@ -260,9 +259,17 @@ fn is_text_file(path: &Path) -> bool {
     )
 }
 
+fn is_reference_token(value: &str) -> bool {
+    matches!(value, "git:status" | "git:diff")
+        || value.starts_with("symbol:")
+        || (!value.starts_with("candidate:") && !value.starts_with("canonical:"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{expand_user_references, split_line_range, validate_relative_path};
+    use super::{
+        expand_user_references, reference_count, split_line_range, validate_relative_path,
+    };
 
     #[test]
     fn parses_bounded_line_ranges() {
@@ -288,6 +295,14 @@ mod tests {
         assert_eq!(
             expand_user_references("plain prompt").unwrap(),
             "plain prompt"
+        );
+    }
+
+    #[test]
+    fn counts_only_supported_reference_tokens() {
+        assert_eq!(
+            reference_count("email@example.com @src/main.rs @git:status"),
+            2
         );
     }
 }

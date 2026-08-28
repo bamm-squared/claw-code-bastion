@@ -42,7 +42,7 @@ use commands::{
 use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
-use render::{MarkdownStreamState, Spinner, TerminalRenderer};
+use render::{sanitize_terminal_text, MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
     check_base_commit, create_disposable_snapshot, format_stale_base_warning, format_usd,
     load_oauth_credentials, load_system_prompt, pricing_for_model, render_change_summary,
@@ -5806,39 +5806,6 @@ fn trusted_hud_line(
         candidate,
         context
     )
-}
-
-fn sanitize_terminal_text(value: &str) -> String {
-    let mut output = String::new();
-    let mut chars = value.chars().peekable();
-    while let Some(character) = chars.next() {
-        if character == '\u{1b}' {
-            if matches!(chars.peek(), Some(']' | 'P' | '^' | '_' | 'X')) {
-                chars.next();
-                while let Some(next) = chars.next() {
-                    if next == '\u{7}' {
-                        break;
-                    }
-                    if next == '\u{1b}' && chars.peek() == Some(&'\\') {
-                        chars.next();
-                        break;
-                    }
-                }
-            } else {
-                for next in chars.by_ref() {
-                    if next.is_ascii_alphabetic() || next == '~' {
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-        if character == '\r' || (character.is_control() && character != '\n' && character != '\t') {
-            continue;
-        }
-        output.push(character);
-    }
-    output
 }
 
 fn format_sandbox_report(status: &runtime::SandboxStatus) -> String {
