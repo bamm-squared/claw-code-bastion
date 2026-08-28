@@ -173,21 +173,55 @@ impl PermissionEnforcer {
     }
 }
 
-/// Simple workspace boundary check via string prefix.
+/// Workspace boundary check for permission classification.
+///
+/// Normalize lexical `.`/`..` components before comparing path components so
+/// traversal cannot bypass the scope check, and require a component boundary
+/// rather than a raw string prefix. Windows absolute and UNC forms are
+/// rejected explicitly because this code also classifies path syntax on POSIX.
 fn is_within_workspace(path: &str, workspace_root: &str) -> bool {
-    let normalized = if path.starts_with('/') {
+    if looks_like_windows_absolute(path) || looks_like_windows_absolute(workspace_root) {
+        return false;
+    }
+
+    let combined = if path.starts_with('/') {
         path.to_owned()
     } else {
         format!("{workspace_root}/{path}")
     };
 
-    let root = if workspace_root.ends_with('/') {
-        workspace_root.to_owned()
-    } else {
-        format!("{workspace_root}/")
-    };
+    let normalized = lexically_normalize(&combined);
+    let root = lexically_normalize(workspace_root);
+    normalized == root || normalized.starts_with(&format!("{root}/"))
+}
 
-    normalized.starts_with(&root) || normalized == workspace_root.trim_end_matches('/')
+fn looks_like_windows_absolute(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\'))
+        || path.starts_with(r"\\")
+}
+
+fn lexically_normalize(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut components = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            other => components.push(other),
+        }
+    }
+    let joined = components.join("/");
+    if absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    }
 }
 
 /// Conservative heuristic: is this bash command read-only?
@@ -363,6 +397,25 @@ mod tests {
         assert!(is_within_workspace("/workspace", "/workspace"));
         assert!(!is_within_workspace("/etc/passwd", "/workspace"));
         assert!(!is_within_workspace("/workspacex/hack", "/workspace"));
+    }
+
+    #[test]
+    fn workspace_boundary_rejects_normalized_traversal_and_prefix_collisions() {
+        assert!(is_within_workspace("src/./main.rs", "/workspace"));
+        assert!(!is_within_workspace("src/../../etc/passwd", "/workspace"));
+        assert!(!is_within_workspace("/workspace-other/file", "/workspace"));
+        assert!(!is_within_workspace(
+            "/workspace/../workspace-other/file",
+            "/workspace"
+        ));
+    }
+
+    #[test]
+    fn workspace_boundary_rejects_windows_absolute_forms() {
+        assert!(!is_within_workspace(r"C:\Users\user\secret", "/workspace"));
+        assert!(!is_within_workspace(r"C:/Users/user/secret", "/workspace"));
+        assert!(!is_within_workspace(r"\\server\share\secret", "/workspace"));
+        assert!(!is_within_workspace(r"\\?\C:\secret", "/workspace"));
     }
 
     #[test]
