@@ -6,6 +6,7 @@
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
+mod context_reference;
 mod init;
 mod input;
 mod provider;
@@ -525,6 +526,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
+            let effective_prompt = context_reference::expand_user_references(&effective_prompt)?;
             let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
             cli.set_reasoning_effort(reasoning_effort);
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
@@ -4300,7 +4302,12 @@ impl LiveCli {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
-        let hud = trusted_hud_line(&self.model, self.permission_mode, self.candidate_state);
+        let hud = trusted_hud_line(
+            &self.model,
+            self.permission_mode,
+            self.candidate_state,
+            context_reference::reference_count(input),
+        );
         spinner.tick(
             &format!("{hud} | Thinking..."),
             TerminalRenderer::new().color_theme(),
@@ -5772,6 +5779,7 @@ fn trusted_hud_line(
     model: &str,
     permission_mode: PermissionMode,
     candidate_state: CandidateLifecycleState,
+    context_count: usize,
 ) -> String {
     let privacy = if PrivacyProfile::current().is_private() {
         "PRIVATE"
@@ -5784,13 +5792,53 @@ fn trusted_hud_line(
         CandidateLifecycleState::Applied => "applied",
         CandidateLifecycleState::Discarded => "discarded",
     };
+    let safe_model = sanitize_terminal_text(model);
+    let context = if context_count == 0 {
+        String::new()
+    } else {
+        format!(" context={context_count}")
+    };
     format!(
-        "[{}] model={} permission={} candidate={}",
+        "[{}] model={} permission={} candidate={}{}",
         privacy,
-        model,
+        safe_model,
         permission_mode.as_str(),
-        candidate
+        candidate,
+        context
     )
+}
+
+fn sanitize_terminal_text(value: &str) -> String {
+    let mut output = String::new();
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\u{1b}' {
+            if matches!(chars.peek(), Some(']' | 'P' | '^' | '_' | 'X')) {
+                chars.next();
+                while let Some(next) = chars.next() {
+                    if next == '\u{7}' {
+                        break;
+                    }
+                    if next == '\u{1b}' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            } else {
+                for next in chars.by_ref() {
+                    if next.is_ascii_alphabetic() || next == '~' {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if character == '\r' || (character.is_control() && character != '\n' && character != '\t') {
+            continue;
+        }
+        output.push(character);
+    }
+    output
 }
 
 fn format_sandbox_report(status: &runtime::SandboxStatus) -> String {
@@ -11395,10 +11443,12 @@ mod tests {
             "test-model",
             PermissionMode::WorkspaceWrite,
             CandidateLifecycleState::ReviewReady,
+            2,
         );
         assert!(line.contains("model=test-model"));
         assert!(line.contains("candidate=review-ready"));
         assert!(!line.contains("validated"));
+        assert!(line.contains("context=2"));
     }
 
     #[test]
