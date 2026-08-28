@@ -45,7 +45,7 @@ pub fn execute(name: &str, input: &serde_json::Value) -> Result<String, String> 
     };
     serde_json::to_string_pretty(&json!({
         "kind": "git_intelligence",
-        "source": "trusted_workspace",
+        "source": "canonical_git",
         "tool": name,
         "output": truncate(&output),
     }))

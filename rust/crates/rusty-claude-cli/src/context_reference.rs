@@ -164,7 +164,24 @@ fn git_reference(root: &Path, name: &str, args: &[&str]) -> Result<(String, Stri
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_PAGER", "cat")
+        .env("GIT_EDITOR", ":")
         .env("GIT_EXTERNAL_DIFF", "")
+        .args([
+            "--no-pager",
+            "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.pager=cat",
+            "-c",
+            "credential.helper=",
+            "-c",
+            "diff.external=",
+            "-c",
+            "interactive.diffFilter=",
+        ])
         .args(args)
         .output()
         .map_err(|error| error.to_string())?;

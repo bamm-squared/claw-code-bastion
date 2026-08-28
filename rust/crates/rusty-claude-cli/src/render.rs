@@ -282,7 +282,8 @@ impl TerminalRenderer {
 
     #[must_use]
     pub fn render_markdown(&self, markdown: &str) -> String {
-        let normalized = normalize_nested_fences(markdown);
+        let sanitized = sanitize_terminal_text(markdown);
+        let normalized = normalize_nested_fences(&sanitized);
         let mut output = String::new();
         let mut state = RenderState::default();
         let mut code_language = String::new();
