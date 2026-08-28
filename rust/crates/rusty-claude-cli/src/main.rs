@@ -239,16 +239,47 @@ fn provider_privacy_class(model: &str) -> ProviderPrivacyClass {
     }
 }
 
-fn model_supports_images(model: &str) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageCapability {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+fn image_capability(model: &str) -> ImageCapability {
     let normalized = model.to_ascii_lowercase();
+    if normalized.contains("gpt-3.5") {
+        return ImageCapability::Unsupported;
+    }
     match detect_provider_kind(model) {
-        ProviderKind::Anthropic => normalized.contains("claude"),
-        ProviderKind::OpenAi | ProviderKind::Xai => {
-            normalized.contains("gpt-4o")
+        ProviderKind::Anthropic if normalized.contains("claude") => ImageCapability::Supported,
+        ProviderKind::Xai if normalized.contains("vision") => ImageCapability::Supported,
+        ProviderKind::OpenAi
+            if normalized.contains("gpt-4o")
                 || normalized.contains("gpt-4.1")
                 || normalized.contains("gpt-4-turbo")
-                || normalized.contains("vision")
+                || normalized.contains("vision") =>
+        {
+            ImageCapability::Supported
         }
+        ProviderKind::OpenAi
+            if normalized.contains("deepseek")
+                || normalized.contains("qwen")
+                || normalized.contains("llama") =>
+        {
+            ImageCapability::Unsupported
+        }
+        ProviderKind::Anthropic | ProviderKind::Xai | ProviderKind::OpenAi => {
+            ImageCapability::Unknown
+        }
+    }
+}
+
+fn image_capability_label(capability: ImageCapability) -> &'static str {
+    match capability {
+        ImageCapability::Supported => "image input: supported",
+        ImageCapability::Unsupported => "WARNING: current model does not support image input",
+        ImageCapability::Unknown => "image input capability: unknown",
     }
 }
 
@@ -4311,6 +4342,12 @@ impl LiveCli {
                 self.context_tray.len() + index + 1,
                 attachment.summary()
             );
+            if attachment.kind == attachments::AttachmentKind::Image {
+                println!(
+                    "      {} · original bytes · metadata stripping: no",
+                    image_capability_label(image_capability(&self.model))
+                );
+            }
         }
     }
 
@@ -4326,6 +4363,7 @@ impl LiveCli {
         }
         println!("Attached {}", attachment.summary());
         self.attachments.push(attachment);
+        self.print_context();
         Ok(())
     }
 
@@ -4422,8 +4460,16 @@ impl LiveCli {
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let image_blocks = self.image_blocks()?;
-        if !image_blocks.is_empty() && !model_supports_images(&self.model) {
-            return Err("The selected model does not support image input; choose a vision-capable model or detach the image.".into());
+        if !image_blocks.is_empty() {
+            match image_capability(&self.model) {
+                ImageCapability::Supported => {}
+                ImageCapability::Unsupported => {
+                    return Err("The selected model does not support image input; choose a vision-capable model or detach the image.".into());
+                }
+                ImageCapability::Unknown => {
+                    return Err("Image capability for the selected model is unknown; choose a known vision-capable model or detach the image.".into());
+                }
+            }
         }
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
@@ -5064,6 +5110,9 @@ impl LiveCli {
             "{}",
             format_model_switch_report(&previous, &model, message_count)
         );
+        if !self.attachments.is_empty() {
+            self.print_context();
+        }
         Ok(true)
     }
 
@@ -13172,6 +13221,37 @@ mod sandbox_report_tests {
         monitor.stop();
 
         assert!(abort_signal.is_aborted());
+    }
+}
+
+#[cfg(test)]
+mod image_capability_tests {
+    use super::{image_capability, ImageCapability};
+
+    #[test]
+    fn classifies_supported_text_only_and_unknown_models() {
+        assert_eq!(
+            image_capability("claude-sonnet-4-6"),
+            ImageCapability::Supported
+        );
+        assert_eq!(image_capability("gpt-4o-mini"), ImageCapability::Supported);
+        assert_eq!(
+            image_capability("gpt-3.5-turbo"),
+            ImageCapability::Unsupported
+        );
+        assert_eq!(
+            image_capability("custom-openai-compatible-model"),
+            ImageCapability::Unknown
+        );
+    }
+
+    #[test]
+    fn xai_requires_an_explicit_vision_model_name() {
+        assert_eq!(
+            image_capability("grok-vision-beta"),
+            ImageCapability::Supported
+        );
+        assert_eq!(image_capability("grok-3"), ImageCapability::Unknown);
     }
 }
 
