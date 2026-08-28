@@ -8,7 +8,25 @@ const MAX_FILE_CHARS: usize = 8_000;
 const MAX_SYMBOL_FILES: usize = 200;
 type LineRange<'a> = (&'a str, Option<(usize, usize)>);
 
+/// The source of text presented to the context-reference resolver.
+/// Only explicit user input may create authority-bearing references.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextReferenceOrigin {
+    User,
+    Assistant,
+    System,
+    Tool,
+    Retrieved,
+}
+
 pub fn reference_count(prompt: &str) -> usize {
+    reference_count_for(prompt, ContextReferenceOrigin::User)
+}
+
+pub fn reference_count_for(prompt: &str, origin: ContextReferenceOrigin) -> usize {
+    if origin != ContextReferenceOrigin::User {
+        return 0;
+    }
     prompt
         .split_whitespace()
         .filter(|word| word.strip_prefix('@').is_some_and(is_reference_token))
@@ -18,10 +36,21 @@ pub fn reference_count(prompt: &str) -> usize {
 
 pub fn expand_user_references(prompt: &str) -> Result<String, String> {
     let root = std::env::current_dir().map_err(|error| error.to_string())?;
-    expand_user_references_at(&root, prompt)
+    expand_context_references_at(&root, prompt, ContextReferenceOrigin::User)
 }
 
 fn expand_user_references_at(workspace: &Path, prompt: &str) -> Result<String, String> {
+    expand_context_references_at(workspace, prompt, ContextReferenceOrigin::User)
+}
+
+fn expand_context_references_at(
+    workspace: &Path,
+    prompt: &str,
+    origin: ContextReferenceOrigin,
+) -> Result<String, String> {
+    if origin != ContextReferenceOrigin::User {
+        return Ok(prompt.to_string());
+    }
     let references = prompt
         .split_whitespace()
         .filter_map(|word| word.strip_prefix('@'))
@@ -294,9 +323,11 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        expand_user_references, expand_user_references_at, reference_count, split_line_range,
-        validate_relative_path,
+        expand_context_references_at, expand_user_references, expand_user_references_at,
+        reference_count, reference_count_for, split_line_range, validate_relative_path,
+        ContextReferenceOrigin,
     };
+    use runtime::{ContentBlock, ConversationMessage, MessageRole, Session};
 
     fn fixture() -> PathBuf {
         let id = SystemTime::now()
@@ -393,6 +424,83 @@ mod tests {
         let expanded = expand_user_references_at(&root, "Inspect @symbol:Thing").expect("symbol");
         assert!(expanded.contains("one.rs"));
         assert!(expanded.contains("two.rs"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn only_explicit_user_input_can_resolve_references() {
+        let root = fixture();
+        fs::write(root.join("example.rs"), "trusted context\n").expect("source file");
+        let prompt = "Review @example.rs";
+        let expanded = expand_context_references_at(&root, prompt, ContextReferenceOrigin::User)
+            .expect("user reference");
+        assert!(expanded.contains("[file:example.rs:1-1]"));
+        for origin in [
+            ContextReferenceOrigin::Assistant,
+            ContextReferenceOrigin::System,
+            ContextReferenceOrigin::Tool,
+            ContextReferenceOrigin::Retrieved,
+        ] {
+            assert_eq!(
+                expand_context_references_at(&root, prompt, origin).expect("non-user text"),
+                prompt
+            );
+            assert_eq!(reference_count_for(prompt, origin), 0);
+        }
+        assert_eq!(reference_count(prompt), 1);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn references_follow_the_active_candidate_view() {
+        let root = fixture();
+        let candidate = root.join("candidate");
+        fs::create_dir_all(&candidate).expect("candidate directory");
+        fs::write(root.join("view.rs"), "CANONICAL_OLD_VALUE\n").expect("canonical file");
+        fs::write(candidate.join("view.rs"), "CANDIDATE_NEW_VALUE\n").expect("candidate file");
+
+        let expanded =
+            expand_user_references_at(&candidate, "Inspect @view.rs").expect("candidate reference");
+        assert!(expanded.contains("CANDIDATE_NEW_VALUE"));
+        assert!(!expanded.contains("CANONICAL_OLD_VALUE"));
+
+        fs::remove_file(candidate.join("view.rs")).expect("candidate delete");
+        assert!(expand_user_references_at(&candidate, "Inspect @view.rs").is_err());
+        fs::write(candidate.join("new.rs"), "CANDIDATE_NEW_FILE\n").expect("candidate new file");
+        assert!(expand_user_references_at(&candidate, "Inspect @new.rs")
+            .expect("new candidate reference")
+            .contains("CANDIDATE_NEW_FILE"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn persisted_assistant_text_does_not_gain_reference_authority() {
+        let root = fixture();
+        fs::write(root.join("example.rs"), "persisted context\n").expect("source file");
+        let session_path = root.join("session.jsonl");
+        let mut session = Session::new()
+            .with_workspace_root(root.clone())
+            .with_persistence_path(session_path.clone());
+        session
+            .push_message(ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "Please inspect @example.rs @git:diff".to_string(),
+            }]))
+            .expect("assistant message");
+        session.save_to_path(&session_path).expect("session save");
+        let restored = Session::load_from_path(&session_path).expect("session load");
+        assert_eq!(restored.messages[0].role, MessageRole::Assistant);
+        let ContentBlock::Text { text } = &restored.messages[0].blocks[0] else {
+            panic!("expected text block")
+        };
+        assert_eq!(
+            reference_count_for(text, ContextReferenceOrigin::Assistant),
+            0
+        );
+        assert_eq!(
+            expand_context_references_at(&root, text, ContextReferenceOrigin::Assistant)
+                .expect("assistant text"),
+            text.as_str()
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 }
