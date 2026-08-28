@@ -320,6 +320,7 @@ fn is_reference_token(value: &str) -> bool {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
@@ -502,5 +503,85 @@ mod tests {
             text.as_str()
         );
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn reference_authority_survives_session_resume_only_for_new_user_input() {
+        if std::env::var_os("CLAW_REFERENCE_CHILD").is_some() {
+            return;
+        }
+        let root = fixture();
+        fs::write(root.join("example.rs"), "resumed context\n").expect("source file");
+        let session_path = root.join("session.jsonl");
+        let exe = std::env::current_exe().expect("test executable");
+        let stage_one = Command::new(&exe)
+            .arg("--exact")
+            .arg("context_reference::tests::reference_resume_child")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("CLAW_REFERENCE_CHILD", "write")
+            .env("CLAW_REFERENCE_ROOT", &root)
+            .env("CLAW_REFERENCE_SESSION", &session_path)
+            .output()
+            .expect("stage one");
+        assert!(stage_one.status.success(), "stage one failed");
+        let stage_two = Command::new(&exe)
+            .arg("--exact")
+            .arg("context_reference::tests::reference_resume_child")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("CLAW_REFERENCE_CHILD", "resume")
+            .env("CLAW_REFERENCE_ROOT", &root)
+            .env("CLAW_REFERENCE_SESSION", &session_path)
+            .output()
+            .expect("stage two");
+        assert!(
+            stage_two.status.success(),
+            "stage two failed: {}",
+            String::from_utf8_lossy(&stage_two.stderr)
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn reference_resume_child() {
+        let Ok(stage) = std::env::var("CLAW_REFERENCE_CHILD") else {
+            return;
+        };
+        let root = PathBuf::from(std::env::var_os("CLAW_REFERENCE_ROOT").expect("root"));
+        let session_path =
+            PathBuf::from(std::env::var_os("CLAW_REFERENCE_SESSION").expect("session path"));
+        if stage == "write" {
+            let mut session = Session::new()
+                .with_workspace_root(root.clone())
+                .with_persistence_path(session_path.clone());
+            session
+                .push_message(ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: "Use @example.rs and @git:diff".to_string(),
+                }]))
+                .expect("assistant message");
+            session.save_to_path(&session_path).expect("session save");
+        } else {
+            let session = Session::load_from_path(&session_path).expect("session resume");
+            let ContentBlock::Text { text } = &session.messages[0].blocks[0] else {
+                panic!("expected assistant text")
+            };
+            assert_eq!(
+                reference_count_for(text, ContextReferenceOrigin::Assistant),
+                0
+            );
+            assert_eq!(
+                expand_context_references_at(&root, text, ContextReferenceOrigin::Assistant)
+                    .expect("assistant text"),
+                text.as_str()
+            );
+            assert!(expand_context_references_at(
+                &root,
+                "Review @example.rs",
+                ContextReferenceOrigin::User
+            )
+            .expect("new user reference")
+            .contains("resumed context"));
+        }
     }
 }
