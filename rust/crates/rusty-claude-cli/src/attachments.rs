@@ -1,5 +1,5 @@
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 pub const MAX_ATTACHMENTS: usize = 8;
@@ -42,7 +42,7 @@ impl TaskAttachment {
         let capacity = usize::try_from(metadata.len())
             .map_err(|_| "attachment is too large for this platform".to_string())?;
         let mut bytes = Vec::with_capacity(capacity);
-        File::open(path)
+        let file = open_snapshot_file(path)
             .map_err(|e| format!("cannot open attachment: {e}"))?
             .take(MAX_ATTACHMENT_BYTES + 1)
             .read_to_end(&mut bytes)
@@ -78,6 +78,21 @@ impl TaskAttachment {
             self.media_type,
             self.bytes.len().div_ceil(1024)
         )
+    }
+}
+
+fn open_snapshot_file(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        OpenOptions::new().read(true).open(path)
     }
 }
 
@@ -158,6 +173,39 @@ mod tests {
         let blob = root.join("blob.bin");
         fs::write(&blob, [0, 1, 2]).unwrap();
         assert!(TaskAttachment::snapshot(&blob, 1).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn enforces_size_limit_and_distinguishes_snapshots() {
+        let root = std::env::temp_dir().join(format!("claw-attach-bounds-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("snapshot.txt");
+        fs::write(&file, "VERSION_A").unwrap();
+        let first = TaskAttachment::snapshot(&file, 1).unwrap();
+        fs::write(&file, "VERSION_B").unwrap();
+        let second = TaskAttachment::snapshot(&file, 2).unwrap();
+        assert_ne!(first.content_identity, second.content_identity);
+        assert_eq!(first.bytes, b"VERSION_A");
+        let oversized = root.join("oversized.txt");
+        let oversized_len = usize::try_from(super::MAX_ATTACHMENT_BYTES).unwrap() + 1;
+        fs::write(&oversized, vec![b'x'; oversized_len]).unwrap();
+        assert!(TaskAttachment::snapshot(&oversized, 3).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_even_when_target_is_regular() {
+        let root = std::env::temp_dir().join(format!("claw-attach-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let target = root.join("target.txt");
+        let link = root.join("link.txt");
+        fs::write(&target, "target").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(TaskAttachment::snapshot(&link, 1).is_err());
         let _ = fs::remove_dir_all(root);
     }
 }
