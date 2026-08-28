@@ -264,9 +264,14 @@ fn truncate(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::process::Command;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
 
@@ -385,6 +390,124 @@ mod tests {
             let result = execute_at(&root, name, &input).expect("Git tool should succeed");
             assert!(result.contains("canonical_git"));
             assert!(!canary.exists(), "{name} executed hostile configuration");
+        }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn read_only_git_tools_never_contact_configured_remotes() {
+        let root = fixture();
+        git(&root, &["init"]);
+        git(&root, &["config", "user.email", "test@example.invalid"]);
+        git(&root, &["config", "user.name", "Test"]);
+        fs::write(root.join("file.rs"), "fn main() {}\n").expect("source");
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "fixture"]);
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let address = listener.local_addr().expect("listener address");
+        let connections = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_connections = Arc::clone(&connections);
+        let thread_stop = Arc::clone(&stop);
+        let accept_thread = std::thread::spawn(move || {
+            while !thread_stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        thread_connections.fetch_add(1, Ordering::Relaxed);
+                        drop(stream);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        TcpStream::connect(address).expect("baseline listener connection");
+        for _ in 0..100 {
+            if connections.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(connections.load(Ordering::Relaxed) > 0);
+        connections.store(0, Ordering::Relaxed);
+        let remote = format!("http://{address}/repo.git");
+        git(&root, &["remote", "add", "origin", &remote]);
+        git(&root, &["remote", "add", "secondary", &remote]);
+
+        for (name, input) in [
+            ("GitStatus", json!({})),
+            ("GitDiff", json!({})),
+            ("GitLog", json!({})),
+            ("GitShow", json!({"revision":"HEAD"})),
+            ("GitBlame", json!({"path":"file.rs"})),
+            ("GitBranches", json!({})),
+            ("GitChangedFiles", json!({})),
+        ] {
+            execute_at(&root, name, &input).expect("local Git tool");
+            std::thread::sleep(Duration::from_millis(20));
+            println!(
+                "GIT_NETWORK_ZERO tool={name} connections={}",
+                connections.load(Ordering::Relaxed)
+            );
+            assert_eq!(
+                connections.load(Ordering::Relaxed),
+                0,
+                "{name} contacted remote"
+            );
+        }
+        assert_eq!(connections.load(Ordering::Relaxed), 0);
+        stop.store(true, Ordering::Relaxed);
+        accept_thread.join().expect("listener thread");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn production_git_boundary_rejects_option_injection() {
+        let root = fixture();
+        git(&root, &["init"]);
+        git(&root, &["config", "user.email", "test@example.invalid"]);
+        git(&root, &["config", "user.name", "Test"]);
+        fs::write(root.join("file.rs"), "fn main() {}\n").expect("source");
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "fixture"]);
+
+        for revision in [
+            "--help",
+            "-c",
+            "--config-env=FOO",
+            "--git-dir=/tmp/evil",
+            "--work-tree=/tmp/evil",
+            "--exec-path",
+            "--no-pager",
+            "--paginate",
+        ] {
+            assert!(
+                execute_at(&root, "GitShow", &json!({"revision": revision})).is_err(),
+                "accepted option-shaped revision {revision}"
+            );
+        }
+        for path in [
+            "--help",
+            "-c",
+            "--config-env=FOO",
+            "--git-dir=/tmp/evil",
+            "--work-tree=/tmp/evil",
+            "--exec-path",
+            "--no-pager",
+            "--paginate",
+        ] {
+            let diff = execute_at(&root, "GitDiff", &json!({"path": path}));
+            let log = execute_at(&root, "GitLog", &json!({"path": path}));
+            let blame = execute_at(&root, "GitBlame", &json!({"path": path}));
+            assert!(diff.is_err() || !diff.unwrap().contains("usage: git"));
+            assert!(log.is_err() || !log.unwrap().contains("usage: git"));
+            assert!(blame.is_err() || !blame.unwrap().contains("usage: git"));
         }
         fs::remove_dir_all(root).expect("cleanup");
     }
