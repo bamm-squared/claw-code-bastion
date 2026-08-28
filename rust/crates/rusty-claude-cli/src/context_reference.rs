@@ -17,13 +17,17 @@ pub fn reference_count(prompt: &str) -> usize {
 }
 
 pub fn expand_user_references(prompt: &str) -> Result<String, String> {
+    let root = std::env::current_dir().map_err(|error| error.to_string())?;
+    expand_user_references_at(&root, prompt)
+}
+
+fn expand_user_references_at(workspace: &Path, prompt: &str) -> Result<String, String> {
     let references = prompt
         .split_whitespace()
         .filter_map(|word| word.strip_prefix('@'))
         .filter(|reference| !reference.is_empty())
         .take(MAX_REFERENCES);
-    let root = std::env::current_dir()
-        .map_err(|error| error.to_string())?
+    let root = workspace
         .canonicalize()
         .map_err(|error| format!("workspace unavailable: {error}"))?;
     let mut bundle = String::from("\n\n[Trusted user context references]\n");
@@ -163,6 +167,7 @@ fn git_reference(root: &Path, name: &str, args: &[&str]) -> Result<(String, Stri
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_LOCAL", "/dev/null")
         .env("GIT_PAGER", "cat")
         .env("GIT_EDITOR", ":")
         .env("GIT_EXTERNAL_DIFF", "")
@@ -284,9 +289,24 @@ fn is_reference_token(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::{
-        expand_user_references, reference_count, split_line_range, validate_relative_path,
+        expand_user_references, expand_user_references_at, reference_count, split_line_range,
+        validate_relative_path,
     };
+
+    fn fixture() -> PathBuf {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("claw-reference-test-{id}"));
+        fs::create_dir_all(&root).expect("fixture directory");
+        root
+    }
 
     #[test]
     fn parses_bounded_line_ranges() {
@@ -321,5 +341,58 @@ mod tests {
             reference_count("email@example.com @src/main.rs @git:status"),
             2
         );
+    }
+
+    #[test]
+    fn user_references_resolve_and_reject_unsafe_or_unknown_git_values() {
+        let root = fixture();
+        fs::create_dir_all(root.join("src")).expect("source directory");
+        fs::write(root.join("src/example.rs"), "first\nThing\nthird\n").expect("source file");
+        let expanded =
+            expand_user_references_at(&root, "Review @src/example.rs:2").expect("reference");
+        assert!(expanded.contains("[file:src/example.rs:2-2]"));
+        assert!(expanded.contains("Thing"));
+        for reference in [
+            "@../outside",
+            "@/etc/passwd",
+            "@C:\\Users\\secret",
+            "@git:fetch",
+            "@git:--help",
+        ] {
+            assert!(
+                expand_user_references_at(&root, reference).is_err(),
+                "accepted {reference}"
+            );
+        }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn aggregate_context_budget_is_enforced() {
+        let root = fixture();
+        for index in 0..8 {
+            fs::write(
+                root.join(format!("file-{index}.rs")),
+                "context ".repeat(5_000),
+            )
+            .expect("large source file");
+        }
+        let prompt = (0..8)
+            .map(|index| format!("@file-{index}.rs"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(expand_user_references_at(&root, &prompt).is_err());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn symbol_resolution_returns_bounded_ambiguous_hits() {
+        let root = fixture();
+        fs::write(root.join("one.rs"), "struct Thing;\n").expect("one");
+        fs::write(root.join("two.rs"), "struct Thing;\n").expect("two");
+        let expanded = expand_user_references_at(&root, "Inspect @symbol:Thing").expect("symbol");
+        assert!(expanded.contains("one.rs"));
+        assert!(expanded.contains("two.rs"));
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }

@@ -29,13 +29,17 @@ struct Match {
 }
 
 pub fn execute(input: &serde_json::Value) -> Result<String, String> {
+    let root = std::env::current_dir().map_err(|e| e.to_string())?;
+    execute_at(&root, input)
+}
+
+fn execute_at(workspace: &Path, input: &serde_json::Value) -> Result<String, String> {
     let input: SearchInput = serde_json::from_value(input.clone()).map_err(|e| e.to_string())?;
     let query = input.query.trim().to_ascii_lowercase();
     if query.is_empty() {
         return Err("ContextSearch query must not be empty".into());
     }
-    let root = std::env::current_dir().map_err(|e| e.to_string())?;
-    let root = root
+    let root = workspace
         .canonicalize()
         .map_err(|e| format!("workspace unavailable: {e}"))?;
     let search_root = input
@@ -256,8 +260,23 @@ fn is_sensitive_path(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_sensitive_path, is_text_file};
-    use std::path::Path;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    use serde_json::json;
+
+    use super::{execute_at, is_sensitive_path, is_text_file};
+
+    fn fixture() -> PathBuf {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("claw-context-test-{id}"));
+        fs::create_dir_all(&root).expect("fixture directory");
+        root
+    }
 
     #[test]
     fn excludes_sensitive_files_from_indexing() {
@@ -280,5 +299,90 @@ mod tests {
     fn only_indexes_supported_text_extensions() {
         assert!(is_text_file(Path::new("src/main.rs")));
         assert!(!is_text_file(Path::new("assets/archive.bin")));
+    }
+
+    #[test]
+    fn search_is_fresh_and_skips_escape_symlinks() {
+        let root = fixture();
+        let outside = root.with_extension("outside");
+        fs::create_dir_all(&outside).expect("outside directory");
+        fs::write(outside.join("secret.txt"), "OUTSIDE_CONTEXT_TOKEN").expect("outside file");
+        fs::write(root.join("main.rs"), "OLD_CONTEXT_TOKEN").expect("source file");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("outside.txt"))
+            .expect("outside symlink");
+
+        let search = |query: &str| {
+            execute_at(&root, &json!({"query": query, "max_results": 12})).expect("search")
+        };
+        assert!(search("OLD_CONTEXT_TOKEN").contains("main.rs"));
+        assert!(!search("OUTSIDE_CONTEXT_TOKEN").contains("secret.txt"));
+        fs::write(root.join("main.rs"), "NEW_CONTEXT_TOKEN").expect("updated source");
+        assert!(!search("OLD_CONTEXT_TOKEN").contains("main.rs"));
+        assert!(search("NEW_CONTEXT_TOKEN").contains("main.rs"));
+        fs::write(root.join("new.rs"), "NEW_FILE_CONTEXT_TOKEN").expect("new source");
+        assert!(search("NEW_FILE_CONTEXT_TOKEN").contains("new.rs"));
+        fs::remove_file(root.join("main.rs")).expect("delete source");
+        assert!(!search("NEW_CONTEXT_TOKEN").contains("main.rs"));
+        assert!(execute_at(&root, &json!({"query":"x", "path":"../outside"})).is_err());
+        fs::remove_dir_all(root).expect("cleanup root");
+        fs::remove_dir_all(outside).expect("cleanup outside");
+    }
+
+    #[test]
+    fn search_reports_hard_result_bounds() {
+        let root = fixture();
+        for index in 0..300 {
+            fs::write(
+                root.join(format!("match-{index}.rs")),
+                "BOUND_CONTEXT_TOKEN\n",
+            )
+            .expect("fixture file");
+        }
+        let report = execute_at(
+            &root,
+            &json!({"query":"BOUND_CONTEXT_TOKEN", "max_results": 12}),
+        )
+        .expect("bounded search");
+        let value: serde_json::Value = serde_json::from_str(&report).expect("JSON report");
+        assert_eq!(value["results"].as_array().expect("results").len(), 12);
+        assert!(value["scanned_files"].as_u64().expect("scan count") <= 20_000);
+        assert!(value["bytes_read"].as_u64().expect("bytes") <= 300 * 32);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn reports_scan_benchmark_for_representative_repositories() {
+        for (label, file_count) in [("small", 20), ("medium", 200), ("large-ish", 1_000)] {
+            let root = fixture();
+            let source = "ValidationIdentity provider fallback network redirect authorization\n";
+            for index in 0..file_count {
+                fs::write(root.join(format!("module-{index}.rs")), source).expect("source file");
+            }
+            let input = json!({"query":"ValidationIdentity provider fallback", "max_results":12});
+            let started = Instant::now();
+            let cold = execute_at(&root, &input).expect("cold search");
+            let cold_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let started = Instant::now();
+            let repeat = execute_at(&root, &input).expect("repeat search");
+            let repeat_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            fs::write(root.join("module-0.rs"), "NEW_CANDIDATE_TOKEN\n").expect("candidate edit");
+            let started = Instant::now();
+            let edited =
+                execute_at(&root, &json!({"query":"NEW_CANDIDATE_TOKEN"})).expect("edit search");
+            let edit_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let report: serde_json::Value = serde_json::from_str(&cold).expect("cold JSON");
+            let repeat_report: serde_json::Value =
+                serde_json::from_str(&repeat).expect("repeat JSON");
+            assert!(edited.contains("module-0.rs"));
+            println!(
+                "CONTEXT_BENCHMARK {label} files={file_count} source_bytes={} scanned_files={} bytes_read={} cold_ms={cold_ms:.3} repeat_ms={repeat_ms:.3} edit_ms={edit_ms:.3}",
+                file_count * source.len(),
+                report["scanned_files"],
+                report["bytes_read"],
+            );
+            assert_eq!(report["scanned_files"], repeat_report["scanned_files"]);
+            fs::remove_dir_all(root).expect("cleanup");
+        }
     }
 }

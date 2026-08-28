@@ -1,10 +1,14 @@
+use std::io::Read;
 use std::path::{Component, Path};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::json;
 
 const OUTPUT_LIMIT: usize = 24 * 1024;
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Deserialize)]
 struct GitInput {
@@ -19,28 +23,39 @@ struct GitInput {
 }
 
 pub fn execute(name: &str, input: &serde_json::Value) -> Result<String, String> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    execute_at(&cwd, name, input)
+}
+
+fn execute_at(cwd: &Path, name: &str, input: &serde_json::Value) -> Result<String, String> {
     let input: GitInput = serde_json::from_value(input.clone()).map_err(|e| e.to_string())?;
     let output = match name {
-        "GitStatus" => run(&["status", "--short", "--branch"])?,
-        "GitDiff" => diff(&input)?,
-        "GitLog" => log(&input)?,
-        "GitShow" => show(&input)?,
-        "GitBlame" => blame(&input)?,
-        "GitBranches" => run(&[
-            "for-each-ref",
-            "--format=%(refname:short)",
-            "refs/heads",
-            "refs/remotes",
-        ])?,
-        "GitChangedFiles" => run(&[
-            "diff",
-            "--name-status",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-renames",
-            "HEAD",
-            "--",
-        ])?,
+        "GitStatus" => run_at(cwd, &["status", "--short", "--branch"])?,
+        "GitDiff" => diff(cwd, &input)?,
+        "GitLog" => log(cwd, &input)?,
+        "GitShow" => show(cwd, &input)?,
+        "GitBlame" => blame(cwd, &input)?,
+        "GitBranches" => run_at(
+            cwd,
+            &[
+                "for-each-ref",
+                "--format=%(refname:short)",
+                "refs/heads",
+                "refs/remotes",
+            ],
+        )?,
+        "GitChangedFiles" => run_at(
+            cwd,
+            &[
+                "diff",
+                "--name-status",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "HEAD",
+                "--",
+            ],
+        )?,
         _ => return Err(format!("unsupported Git intelligence tool: {name}")),
     };
     serde_json::to_string_pretty(&json!({
@@ -52,7 +67,7 @@ pub fn execute(name: &str, input: &serde_json::Value) -> Result<String, String> 
     .map_err(|e| e.to_string())
 }
 
-fn diff(input: &GitInput) -> Result<String, String> {
+fn diff(cwd: &Path, input: &GitInput) -> Result<String, String> {
     let mut args = vec!["diff", "--no-ext-diff", "--no-textconv", "--no-renames"];
     if input.staged {
         args.push("--cached");
@@ -61,10 +76,10 @@ fn diff(input: &GitInput) -> Result<String, String> {
         validate_path(path)?;
         args.extend(["--", path]);
     }
-    run(&args)
+    run_at(cwd, &args)
 }
 
-fn log(input: &GitInput) -> Result<String, String> {
+fn log(cwd: &Path, input: &GitInput) -> Result<String, String> {
     let limit = input.limit.unwrap_or(20).clamp(1, 100).to_string();
     let mut args = vec![
         "log",
@@ -78,10 +93,10 @@ fn log(input: &GitInput) -> Result<String, String> {
         validate_path(path)?;
         args.extend(["--", path]);
     }
-    run(&args)
+    run_at(cwd, &args)
 }
 
-fn show(input: &GitInput) -> Result<String, String> {
+fn show(cwd: &Path, input: &GitInput) -> Result<String, String> {
     let revision = input
         .revision
         .as_deref()
@@ -89,25 +104,25 @@ fn show(input: &GitInput) -> Result<String, String> {
     validate_revision(revision)?;
     let mut args = vec![
         "show",
-        "--end-of-options",
         "--no-ext-diff",
         "--no-textconv",
         "--no-renames",
         "--stat",
+        "--end-of-options",
         revision,
     ];
     if let Some(path) = &input.path {
         validate_path(path)?;
         args.extend(["--", path]);
     }
-    run(&args)
+    run_at(cwd, &args)
 }
 
-fn blame(input: &GitInput) -> Result<String, String> {
+fn blame(cwd: &Path, input: &GitInput) -> Result<String, String> {
     let path = input.path.as_deref().ok_or("GitBlame requires path")?;
     validate_path(path)?;
     let limit = input.limit.unwrap_or(200).clamp(1, 1000).to_string();
-    run(&["blame", "--", path]).map(|output| {
+    run_at(cwd, &["blame", "--no-textconv", "--", path]).map(|output| {
         output
             .lines()
             .take(limit.parse().unwrap_or(200))
@@ -116,13 +131,14 @@ fn blame(input: &GitInput) -> Result<String, String> {
     })
 }
 
-fn run(args: &[&str]) -> Result<String, String> {
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let output = Command::new("git")
+fn run_at(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    let mut command = Command::new("git");
+    command
         .current_dir(cwd)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_LOCAL", "/dev/null")
         .env("GIT_PAGER", "cat")
         .env("GIT_EDITOR", ":")
         .env("GIT_EXTERNAL_DIFF", "")
@@ -143,13 +159,69 @@ fn run(args: &[&str]) -> Result<String, String> {
             "interactive.diffFilter=",
         ])
         .args(args)
-        .output()
-        .map_err(|e| format!("git operation unavailable: {e}"))?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output =
+        run_bounded(&mut command).map_err(|e| format!("git operation unavailable: {e}"))?;
     if !output.status.success() {
         let detail = String::from_utf8_lossy(&output.stderr);
         return Err(format!("git operation failed: {}", truncate(detail.trim())));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+struct BoundedOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn run_bounded(command: &mut Command) -> Result<BoundedOutput, String> {
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let stdout = child.stdout.take().ok_or("Git stdout pipe unavailable")?;
+    let stderr = child.stderr.take().ok_or("Git stderr pipe unavailable")?;
+    let stdout_thread = thread::spawn(|| read_bounded(stdout));
+    let stderr_thread = thread::spawn(|| read_bounded(stderr));
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            break status;
+        }
+        if started.elapsed() >= COMMAND_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+            return Err("Git operation timed out".into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| "Git stdout reader failed".to_string())??;
+    let stderr = stderr_thread
+        .join()
+        .map_err(|_| "Git stderr reader failed".to_string())??;
+    Ok(BoundedOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_bounded(mut reader: impl Read) -> Result<Vec<u8>, String> {
+    let mut retained = Vec::with_capacity(OUTPUT_LIMIT.min(8192));
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            return Ok(retained);
+        }
+        let remaining = OUTPUT_LIMIT.saturating_sub(retained.len());
+        retained.extend_from_slice(&buffer[..read.min(remaining)]);
+    }
 }
 
 fn validate_path(path: &str) -> Result<(), String> {
@@ -191,7 +263,33 @@ fn truncate(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_path, validate_revision};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use serde_json::json;
+
+    use super::{execute_at, run_bounded, validate_path, validate_revision, OUTPUT_LIMIT};
+
+    fn fixture() -> PathBuf {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("claw-git-test-{id}"));
+        fs::create_dir_all(&root).expect("fixture directory");
+        root
+    }
+
+    fn git(root: &PathBuf, args: &[&str]) {
+        let status = Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .status()
+            .expect("git available");
+        assert!(status.success(), "git command failed: {args:?}");
+    }
 
     #[test]
     fn rejects_unsafe_paths() {
@@ -209,5 +307,85 @@ mod tests {
         assert!(validate_revision("--exec=evil").is_err());
         assert!(validate_revision("HEAD\n").is_err());
         assert!(validate_revision("HEAD").is_ok());
+    }
+
+    #[test]
+    fn bounded_reader_caps_large_child_output() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "yes output | head -c 100000"]);
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+        let output = run_bounded(&mut command).expect("bounded command");
+        assert_eq!(output.stdout.len(), OUTPUT_LIMIT);
+        assert!(output.stderr.is_empty());
+    }
+
+    #[test]
+    fn all_git_tools_use_sterile_local_dispatch() {
+        let root = fixture();
+        git(&root, &["init"]);
+        git(&root, &["config", "user.email", "test@example.invalid"]);
+        git(&root, &["config", "user.name", "Test"]);
+        let canary = root.join("executed");
+        let script = root.join("canary.sh");
+        fs::write(&script, format!("#!/bin/sh\ntouch {}\n", canary.display())).expect("script");
+        let mut permissions = fs::metadata(&script)
+            .expect("script metadata")
+            .permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o700);
+        }
+        fs::set_permissions(&script, permissions).expect("script permissions");
+        git(
+            &root,
+            &["config", "core.fsmonitor", script.to_str().unwrap()],
+        );
+        git(
+            &root,
+            &[
+                "config",
+                "core.hooksPath",
+                root.join("hooks").to_str().unwrap(),
+            ],
+        );
+        git(&root, &["config", "core.pager", script.to_str().unwrap()]);
+        git(
+            &root,
+            &["config", "diff.external", script.to_str().unwrap()],
+        );
+        git(
+            &root,
+            &["config", "diff.evil.textconv", script.to_str().unwrap()],
+        );
+        git(
+            &root,
+            &["config", "credential.helper", script.to_str().unwrap()],
+        );
+        fs::create_dir_all(root.join("hooks")).expect("hooks");
+        fs::write(root.join("hooks/pre-commit"), "#!/bin/sh\ntouch executed\n").expect("hook");
+        fs::write(root.join(".gitattributes"), "*.txt diff=evil\n").expect("attributes");
+        fs::write(root.join("file.txt"), "before\n").expect("file");
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "fixture"]);
+        fs::write(root.join("file.txt"), "after\n").expect("changed file");
+        let _ = fs::remove_file(&canary);
+
+        for (name, input) in [
+            ("GitStatus", json!({})),
+            ("GitDiff", json!({})),
+            ("GitLog", json!({})),
+            ("GitShow", json!({"revision":"HEAD"})),
+            ("GitBlame", json!({"path":"file.txt"})),
+            ("GitBranches", json!({})),
+            ("GitChangedFiles", json!({})),
+        ] {
+            let _ = fs::remove_file(&canary);
+            let result = execute_at(&root, name, &input).expect("Git tool should succeed");
+            assert!(result.contains("canonical_git"));
+            assert!(!canary.exists(), "{name} executed hostile configuration");
+        }
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }
