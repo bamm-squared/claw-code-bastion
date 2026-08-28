@@ -13292,6 +13292,7 @@ mod image_capability_tests {
 mod image_production_tests {
     use super::{attachment_image_block, attachments, ContentBlock};
     use base64::Engine;
+    use runtime::{ConversationMessage, MessageRole, Session};
     use std::fs;
 
     #[test]
@@ -13323,6 +13324,40 @@ mod image_production_tests {
                 .unwrap(),
             image_a
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn persisted_image_metadata_cannot_restore_bytes_or_host_authority() {
+        let root = std::env::temp_dir().join(format!("claw-image-session-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let session_path = root.join("session.jsonl");
+        let mut session = Session::new();
+        session
+            .push_message(ConversationMessage {
+                role: MessageRole::User,
+                blocks: vec![ContentBlock::Image {
+                    attachment_id: 7,
+                    display_name: "photo.png".into(),
+                    media_type: "image/png".into(),
+                    data: Some("AQID".into()),
+                }],
+                usage: None,
+            })
+            .unwrap();
+        session.save_to_path(&session_path).unwrap();
+        let persisted = fs::read_to_string(&session_path).unwrap();
+        assert!(persisted.contains("photo.png"));
+        assert!(!persisted.contains("AQID"));
+        assert!(!persisted.contains("/tmp/"));
+
+        let resumed = Session::load_from_path(&session_path).unwrap();
+        let converted = super::convert_messages(&resumed.messages);
+        assert!(converted.iter().all(|message| message
+            .content
+            .iter()
+            .all(|block| !matches!(block, api::InputContentBlock::Image { .. }))));
         let _ = fs::remove_dir_all(root);
     }
 }
