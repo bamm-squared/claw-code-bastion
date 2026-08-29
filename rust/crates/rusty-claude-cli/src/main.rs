@@ -3841,6 +3841,53 @@ fn format_validation_status(status: runtime::ValidationStatus) -> &'static str {
     }
 }
 
+fn render_review_overview(
+    changes: &CandidateChangeSet,
+    validation: &runtime::validator::ValidationResult,
+) -> String {
+    let added = changes
+        .changes
+        .iter()
+        .filter(|change| matches!(change, CandidateChange::Add { .. }))
+        .count();
+    let modified = changes
+        .changes
+        .iter()
+        .filter(|change| matches!(change, CandidateChange::Modify { .. }))
+        .count();
+    let deleted = changes
+        .changes
+        .iter()
+        .filter(|change| matches!(change, CandidateChange::Delete { .. }))
+        .count();
+    let mut output = format!(
+        "Review Candidate\n\nFiles: {} ({} added, {} modified, {} deleted)\nCandidate: {}\nValidation: {}\nReview: CURRENT\n\n",
+        changes.changes.len(), added, modified, deleted, changes.id, validation_status(validation)
+    );
+    output.push_str(&render_change_summary(changes, 12 * 1024));
+    output
+}
+
+fn validation_status(validation: &runtime::validator::ValidationResult) -> &'static str {
+    if validation.checks.iter().any(|check| {
+        matches!(
+            check.status,
+            ValidationStatus::Fail | ValidationStatus::Timeout | ValidationStatus::Error
+        )
+    }) {
+        "FAIL"
+    } else if validation.checks.iter().any(|check| {
+        matches!(
+            check.status,
+            ValidationStatus::Blocked | ValidationStatus::Skipped
+        )
+    }) {
+        "BLOCKED"
+    } else {
+        "PASS"
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ToolSearchRequest {
     query: String,
@@ -4680,37 +4727,7 @@ impl LiveCli {
         let blocked_apply_allowed = validation.allows_apply(changes.id, policy, true);
 
         let action = loop {
-            println!("\nCandidate change set detected (id: {})", changes.id);
-            println!(
-                "  Added:   {}",
-                changes
-                    .changes
-                    .iter()
-                    .filter(|c| matches!(c, CandidateChange::Add { .. }))
-                    .count()
-            );
-            println!(
-                "  Modified: {}",
-                changes
-                    .changes
-                    .iter()
-                    .filter(|c| matches!(c, CandidateChange::Modify { .. }))
-                    .count()
-            );
-            println!(
-                "  Deleted: {}",
-                changes
-                    .changes
-                    .iter()
-                    .filter(|c| matches!(c, CandidateChange::Delete { .. }))
-                    .count()
-            );
-            let review_summary = render_change_summary(&changes, 12 * 1024);
-            if review_summary.is_empty() {
-                println!("  Changes:  unavailable for summary");
-            } else {
-                println!("\n{review_summary}");
-            }
+            println!("\n{}", render_review_overview(&changes, &validation));
             println!("\nValidation (id: {})", validation.validation_identity);
             for check in &validation.checks {
                 println!(
@@ -4787,6 +4804,74 @@ impl LiveCli {
             }
         }
 
+        Ok(())
+    }
+
+    fn run_review_command(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(changes) = self.runtime.finish_candidate()? else {
+            println!("No candidate changes to review.");
+            return Ok(());
+        };
+        let validation = self.runtime.validate_candidate(&changes)?;
+        self.candidate_state = CandidateLifecycleState::ReviewReady;
+        if !io::stdin().is_terminal() {
+            println!("{}", render_review_overview(&changes, &validation));
+            return Ok(());
+        }
+        self.review_candidate_changes_with_state(&changes, &validation)
+    }
+
+    fn review_candidate_changes_with_state(
+        &mut self,
+        changes: &CandidateChangeSet,
+        validation: &runtime::validator::ValidationResult,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let policy = runtime::ValidationPolicy::default();
+        let normal_apply_allowed = validation.allows_apply(changes.id, policy, false);
+        let blocked_apply_allowed = validation.allows_apply(changes.id, policy, true);
+        println!("{}", render_review_overview(changes, validation));
+        println!("\nActions: [a] Apply  [r] Request Changes  [d] Discard");
+        if blocked_apply_allowed {
+            println!("        [x] Apply Anyway");
+        }
+        print!(
+            "Select [a/r/d{}] [default: r]: ",
+            if blocked_apply_allowed { "/x" } else { "" }
+        );
+        io::stdout().flush()?;
+        let mut response = String::new();
+        io::stdin().read_line(&mut response)?;
+        let action = match response.trim().to_lowercase().as_str() {
+            "a" if normal_apply_allowed => CandidateReviewAction::Apply,
+            "x" if blocked_apply_allowed => CandidateReviewAction::ApplyAnyway,
+            "d" | "discard" => CandidateReviewAction::Discard,
+            _ => CandidateReviewAction::RequestChanges,
+        };
+        match action {
+            CandidateReviewAction::Apply => {
+                self.runtime
+                    .apply_candidate_changes(changes, validation, false)?;
+                self.runtime.discard_candidate()?;
+                self.candidate_state = CandidateLifecycleState::Applied;
+                println!("Candidate changes applied.");
+            }
+            CandidateReviewAction::ApplyAnyway => {
+                self.runtime
+                    .apply_candidate_changes(changes, validation, true)?;
+                self.runtime.discard_candidate()?;
+                self.candidate_state = CandidateLifecycleState::Applied;
+                println!("Candidate changes applied with validation override.");
+            }
+            CandidateReviewAction::RequestChanges => {
+                self.candidate_state = CandidateLifecycleState::Editing;
+                println!("Candidate retained. Enter the next refinement for the agent.");
+            }
+            CandidateReviewAction::Discard => {
+                self.runtime.discard_candidate()?;
+                self.candidate_state = CandidateLifecycleState::Discarded;
+                println!("Candidate discarded.");
+            }
+        }
         Ok(())
     }
 
@@ -4872,6 +4957,10 @@ impl LiveCli {
             }
             SlashCommand::Diff => {
                 Self::print_diff()?;
+                false
+            }
+            SlashCommand::Review { .. } => {
+                self.run_review_command()?;
                 false
             }
             SlashCommand::Version => {
@@ -4961,7 +5050,6 @@ impl LiveCli {
             | SlashCommand::Keybindings
             | SlashCommand::PrivacySettings
             | SlashCommand::Plan { .. }
-            | SlashCommand::Review { .. }
             | SlashCommand::Tasks { .. }
             | SlashCommand::Theme { .. }
             | SlashCommand::Voice { .. }
