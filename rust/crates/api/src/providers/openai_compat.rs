@@ -177,6 +177,14 @@ impl OpenAiCompatClient {
         self
     }
 
+    /// Render the provider payload without performing transport.  This is the
+    /// same body builder used by the live request path and is useful to callers
+    /// that need a deterministic preflight or capture boundary.
+    #[must_use]
+    pub fn render_request_body(&self, request: &MessageRequest) -> Value {
+        build_chat_completion_request(request, self.config)
+    }
+
     pub async fn send_message(
         &self,
         request: &MessageRequest,

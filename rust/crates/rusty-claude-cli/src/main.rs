@@ -12209,7 +12209,7 @@ UU conflicted.rs",
         assert!(usage.contains("/session list"));
     }
 
-    fn cwd_lock() -> &'static Mutex<()> {
+    pub(super) fn cwd_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
@@ -13359,6 +13359,196 @@ mod image_production_tests {
             .iter()
             .all(|block| !matches!(block, api::InputContentBlock::Image { .. }))));
         let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod multimodal_command_integration_tests {
+    use super::{attachments, convert_messages, ContentBlock, LiveCli};
+    use api::{
+        AnthropicRequestProfile, InputContentBlock, MessageRequest, OpenAiCompatClient,
+        OpenAiCompatConfig,
+    };
+    use base64::Engine;
+    use commands::SlashCommand;
+    use runtime::{ConversationMessage, MessageRole};
+    use std::fs;
+    use std::sync::{Mutex, OnceLock};
+
+    struct HarnessDir {
+        root: std::path::PathBuf,
+        previous: std::path::PathBuf,
+    }
+
+    impl HarnessDir {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "claw-multimodal-command-harness-{}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).expect("harness directory should be created");
+            let previous = std::env::current_dir().expect("current directory should be available");
+            std::env::set_current_dir(&root).expect("harness directory should become current");
+            Self { root, previous }
+        }
+    }
+
+    impl Drop for HarnessDir {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.previous);
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn valid_png() -> Vec<u8> {
+        let mut bytes = vec![
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0,
+            0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0,
+        ];
+        bytes.extend_from_slice(&[0; 4]);
+        bytes
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn full_user_attach_command_reaches_both_provider_serializers() {
+        let _cwd_guard = super::tests::cwd_lock().lock().unwrap();
+        let _env_guard = env_lock().lock().unwrap();
+        let _dir = HarnessDir::new();
+        std::env::set_var("ANTHROPIC_API_KEY", "test-production-harness-key");
+        let external = std::env::temp_dir().join(format!(
+            "claw-multimodal-external-{}.png",
+            std::process::id()
+        ));
+        let source = valid_png();
+        fs::write(&external, &source).expect("external image should be written");
+
+        let mut cli = LiveCli::new(
+            "claude-sonnet-4-6".to_string(),
+            false,
+            None,
+            runtime::PermissionMode::ReadOnly,
+        )
+        .expect("test CLI should initialize");
+        let parsed = SlashCommand::parse(&format!("/attach {}", external.display()))
+            .expect("attach command should parse")
+            .expect("input should be a slash command");
+        cli.handle_repl_command(parsed)
+            .expect("production attach command should succeed");
+        assert_eq!(cli.attachments.len(), 1);
+        assert_eq!(cli.attachments[0].source, external);
+        assert_eq!(cli.attachments[0].bytes, source);
+
+        let prompt = cli
+            .prompt_with_context("What is shown in this image?")
+            .expect("prompt context should build");
+        let image_blocks = cli.image_blocks().expect("image blocks should build");
+        assert_eq!(image_blocks.len(), 1);
+        let ContentBlock::Image {
+            attachment_id,
+            display_name,
+            media_type,
+            data: Some(data),
+        } = image_blocks[0].clone()
+        else {
+            panic!("production attachment should become an image block");
+        };
+        assert_eq!(attachment_id, cli.attachments[0].id);
+        assert_eq!(
+            display_name,
+            "claw-multimodal-external-{}.png".replace("{}", &std::process::id().to_string())
+        );
+        assert_eq!(media_type, "image/png");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .unwrap(),
+            source
+        );
+        assert!(!prompt.contains(&external.display().to_string()));
+
+        let message = ConversationMessage {
+            role: MessageRole::User,
+            blocks: {
+                let mut blocks = vec![ContentBlock::Text { text: prompt }];
+                blocks.extend(image_blocks);
+                blocks
+            },
+            usage: None,
+        };
+        let request = MessageRequest {
+            model: "claude-sonnet-4-6".into(),
+            max_tokens: 128,
+            messages: convert_messages(&[message]),
+            ..MessageRequest::default()
+        };
+        assert!(request.messages[0]
+            .content
+            .iter()
+            .any(|block| matches!(block, InputContentBlock::Image { .. })));
+
+        let anthropic = AnthropicRequestProfile::default()
+            .render_json_body(&request)
+            .expect("Anthropic body should serialize");
+        let anthropic_image = &anthropic["messages"][0]["content"][1];
+        assert_eq!(anthropic_image["type"], "image");
+        assert_eq!(anthropic_image["source"]["media_type"], "image/png");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(anthropic_image["source"]["data"].as_str().unwrap())
+                .unwrap(),
+            source
+        );
+        assert!(!anthropic
+            .to_string()
+            .contains(&external.display().to_string()));
+
+        let openai = OpenAiCompatClient::new("test", OpenAiCompatConfig::openai());
+        let openai_body = openai.render_request_body(&request);
+        let openai_image = &openai_body["messages"][0]["content"][1]["image_url"]["url"];
+        let encoded = openai_image.as_str().unwrap();
+        assert!(encoded.starts_with("data:image/png;base64,"));
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded.trim_start_matches("data:image/png;base64,"))
+                .unwrap(),
+            source
+        );
+        assert!(!openai_body
+            .to_string()
+            .contains(&external.display().to_string()));
+
+        cli.attachments.clear();
+        assert!(
+            cli.attachments.is_empty(),
+            "successful handoff clears queued context"
+        );
+        let _ = fs::remove_file(external);
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn assistant_attach_text_does_not_enter_user_command_dispatch() {
+        let _cwd_guard = super::tests::cwd_lock().lock().unwrap();
+        let _dir = HarnessDir::new();
+        let assistant_text = ConversationMessage {
+            role: MessageRole::Assistant,
+            blocks: vec![ContentBlock::Text {
+                text: "/attach /tmp/not-authorized.png".into(),
+            }],
+            usage: None,
+        };
+        let converted = convert_messages(&[assistant_text]);
+        assert_eq!(converted.len(), 1);
+        assert!(converted[0].content.iter().all(|block| {
+            matches!(block, InputContentBlock::Text { text } if text.contains("/attach"))
+        }));
     }
 }
 
