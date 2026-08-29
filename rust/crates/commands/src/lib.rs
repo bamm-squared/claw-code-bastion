@@ -72,6 +72,20 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "palette",
+        aliases: &[],
+        summary: "Browse available commands",
+        argument_hint: Some("[filter|run <n>]"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "palette",
+        aliases: &[],
+        summary: "Browse available commands",
+        argument_hint: Some("[filter]"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
         name: "sandbox",
         aliases: &[],
         summary: "Show sandbox isolation status",
@@ -216,6 +230,20 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         aliases: &[],
         summary: "Export the current conversation to a file",
         argument_hint: Some("[file]"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "tools",
+        aliases: &[],
+        summary: "Inspect recent tool activity",
+        argument_hint: Some("[number]"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
+        name: "tools",
+        aliases: &[],
+        summary: "Inspect recent tool activity",
+        argument_hint: Some("[number]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -1061,6 +1089,9 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
 pub enum SlashCommand {
     Help,
     Status,
+    Palette {
+        filter: Option<String>,
+    },
     Sandbox,
     Compact,
     Bughunter {
@@ -1080,6 +1111,9 @@ pub enum SlashCommand {
         target: Option<String>,
     },
     DebugToolCall,
+    Tools {
+        number: Option<String>,
+    },
     Model {
         model: Option<String>,
     },
@@ -1252,6 +1286,7 @@ impl SlashCommand {
             Self::History { .. } => "/history",
             Self::Diff => "/diff",
             Self::Status => "/status",
+            Self::Palette { .. } => "/palette",
             Self::Stats => "/stats",
             Self::Version => "/version",
             Self::Commit { .. } => "/commit",
@@ -1262,6 +1297,7 @@ impl SlashCommand {
             Self::Ultraplan { .. } => "/ultraplan",
             Self::Teleport { .. } => "/teleport",
             Self::DebugToolCall { .. } => "/debug-tool-call",
+            Self::Tools { .. } => "/tools",
             Self::Resume { .. } => "/resume",
             Self::Model { .. } => "/model",
             Self::Permissions { .. } => "/permissions",
@@ -1346,6 +1382,7 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::Status
         }
+        "palette" => SlashCommand::Palette { filter: remainder },
         "sandbox" => {
             validate_no_args(command, &args)?;
             SlashCommand::Sandbox
@@ -1369,6 +1406,7 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::DebugToolCall
         }
+        "tools" => SlashCommand::Tools { number: remainder },
         "model" => SlashCommand::Model {
             model: optional_single_arg(command, &args, "[model]")?,
         },
@@ -4099,6 +4137,7 @@ pub fn handle_slash_command(
             session: session.clone(),
         }),
         SlashCommand::Status
+        | SlashCommand::Palette { .. }
         | SlashCommand::Bughunter { .. }
         | SlashCommand::Commit
         | SlashCommand::Pr { .. }
@@ -4106,6 +4145,7 @@ pub fn handle_slash_command(
         | SlashCommand::Ultraplan { .. }
         | SlashCommand::Teleport { .. }
         | SlashCommand::DebugToolCall
+        | SlashCommand::Tools { .. }
         | SlashCommand::Sandbox
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
@@ -4704,7 +4744,7 @@ mod tests {
         assert!(help.contains("aliases: /skill"));
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
-        assert_eq!(slash_command_specs().len(), 142);
+        assert_eq!(slash_command_specs().len(), 146);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 

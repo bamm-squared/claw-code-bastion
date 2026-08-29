@@ -3483,6 +3483,8 @@ fn run_resume_command(
         | SlashCommand::SecurityReview
         | SlashCommand::Keybindings
         | SlashCommand::PrivacySettings
+        | SlashCommand::Palette { .. }
+        | SlashCommand::Tools { .. }
         | SlashCommand::Plan { .. }
         | SlashCommand::Review { .. }
         | SlashCommand::Tasks { .. }
@@ -4592,6 +4594,49 @@ impl LiveCli {
         Ok(values)
     }
 
+    fn print_command_palette(&mut self, filter: Option<&str>) {
+        let entries = palette_entries(self.candidate_state, is_private_mode());
+        let query = filter.unwrap_or_default().trim();
+        println!(
+            "Command palette{}",
+            if query.is_empty() {
+                String::new()
+            } else {
+                format!(" · {query}")
+            }
+        );
+        let mut shown = 0usize;
+        for (index, (name, summary, category, disabled)) in entries.iter().enumerate() {
+            if !palette_matches(query, name, summary, category) {
+                continue;
+            }
+            let state = disabled
+                .as_deref()
+                .map_or(String::new(), |reason| format!(" [disabled: {reason}]"));
+            println!(
+                "  {:>2}. /{name:<16} {category:<9} {summary}{state}",
+                index + 1
+            );
+            shown += 1;
+            if shown == 20 {
+                break;
+            }
+        }
+        if shown == 0 {
+            println!("  No matching commands.");
+        } else {
+            println!("\nUse /palette <filter> to narrow this list.");
+        }
+    }
+
+    fn print_tools(&self, number: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        println!(
+            "{}",
+            render_tool_activity_report(self.runtime.session(), number)?
+        );
+        Ok(())
+    }
+
     fn print_context(&self) {
         println!("Context for next prompt");
         if self.context_tray.is_empty() && self.attachments.is_empty() {
@@ -5137,6 +5182,10 @@ impl LiveCli {
                 self.print_status();
                 false
             }
+            SlashCommand::Palette { filter } => {
+                self.print_command_palette(filter.as_deref());
+                false
+            }
             SlashCommand::Bughunter { scope } => {
                 self.run_bughunter(scope.as_deref())?;
                 false
@@ -5163,6 +5212,10 @@ impl LiveCli {
             }
             SlashCommand::DebugToolCall => {
                 self.run_debug_tool_call(None)?;
+                false
+            }
+            SlashCommand::Tools { number } => {
+                self.print_tools(number.as_deref())?;
                 false
             }
             SlashCommand::Sandbox => {
@@ -5348,6 +5401,17 @@ impl LiveCli {
                 },
                 self.permission_mode.as_str(),
                 &status_context(Some(&self.session.path)).expect("status context should load"),
+            )
+        );
+        println!(
+            "\n{}",
+            render_task_inspector(
+                self.candidate_state,
+                &self.model,
+                self.permission_mode.as_str(),
+                self.context_tray.len() + self.attachments.len(),
+                self.runtime.session(),
+                is_private_mode(),
             )
         );
     }
@@ -6883,6 +6947,174 @@ fn render_teleport_report(target: &str) -> Result<String, Box<dyn std::error::Er
         lines.push("  Result           no matches found".to_string());
     }
 
+    Ok(lines.join("\n"))
+}
+
+fn palette_entries(
+    candidate_state: CandidateLifecycleState,
+    private: bool,
+) -> Vec<(
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+)> {
+    let names = [
+        ("review", "Review current candidate", "Review"),
+        ("context", "Inspect queued trusted context", "Context"),
+        ("attach", "Attach one external file", "Context"),
+        ("attachments", "Show task attachments", "Context"),
+        ("detach", "Remove a task attachment", "Context"),
+        ("status", "Show task and session status", "Task"),
+        ("tools", "Inspect recent tool activity", "Task"),
+        ("diff", "Show canonical Git diff", "Git"),
+        ("model", "Show or change the model", "Provider"),
+        ("permissions", "Show or change permissions", "Security"),
+        ("resume", "Resume a saved session", "Session"),
+        ("help", "Show command help", "Help"),
+    ];
+    names
+        .into_iter()
+        .map(|(name, summary, category)| {
+            let disabled = match name {
+                "review" if !matches!(candidate_state, CandidateLifecycleState::ReviewReady) => {
+                    Some("no review-ready candidate")
+                }
+                "resume" if private => Some("disabled in private mode"),
+                _ => None,
+            };
+            (name, summary, category, disabled)
+        })
+        .collect()
+}
+
+fn palette_matches(query: &str, name: &str, summary: &str, category: &str) -> bool {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let haystacks = [name, summary, category];
+    haystacks.iter().any(|value| {
+        let value = value.to_ascii_lowercase();
+        value.contains(&query) || query.chars().all(|character| value.contains(character))
+    })
+}
+
+fn render_task_inspector(
+    candidate_state: CandidateLifecycleState,
+    model: &str,
+    permission_mode: &str,
+    context_count: usize,
+    session: &Session,
+    private: bool,
+) -> String {
+    let tool_count = session
+        .messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter(|block| matches!(block, ContentBlock::ToolUse { .. }))
+        .count();
+    format!(
+        "Task\n  Candidate       {}\n  Validation      managed by trusted validation state\n  Provider        {} · {}\n  Runtime         permissions={} · private={}\n  Context         {} queued item(s)\n  Activity        {} recorded tool call(s)",
+        candidate_state_label(candidate_state),
+        model,
+        provider_privacy_class(model).label(),
+        permission_mode,
+        if private { "on" } else { "off" },
+        context_count,
+        tool_count,
+    )
+}
+
+fn candidate_state_label(state: CandidateLifecycleState) -> &'static str {
+    match state {
+        CandidateLifecycleState::Editing => "editing",
+        CandidateLifecycleState::ReviewReady => "review-ready",
+        CandidateLifecycleState::Applied => "applied",
+        CandidateLifecycleState::Discarded => "discarded",
+    }
+}
+
+fn render_tool_activity_report(
+    session: &Session,
+    detail: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut calls = Vec::new();
+    for message in &session.messages {
+        for block in &message.blocks {
+            if let ContentBlock::ToolUse { id, name, input } = block {
+                let result = session
+                    .messages
+                    .iter()
+                    .flat_map(|message| message.blocks.iter())
+                    .find_map(|block| match block {
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            output,
+                            is_error,
+                            ..
+                        } if tool_use_id == id => Some((output.as_str(), *is_error)),
+                        _ => None,
+                    });
+                calls.push((id.as_str(), name.as_str(), input.as_str(), result));
+            }
+        }
+    }
+    let mut lines = vec!["Tools".to_string()];
+    if let Some(detail) = detail.filter(|value| !value.trim().is_empty()) {
+        let index: usize = detail
+            .trim()
+            .parse()
+            .map_err(|_| "usage: /tools [number]")?;
+        let Some((id, name, input, result)) = calls.get(index.saturating_sub(1)) else {
+            return Err("tool number is out of range".into());
+        };
+        lines.push(format!(
+            "  Tool {} · {}",
+            index,
+            sanitize_terminal_text(name)
+        ));
+        lines.push(format!("  Id       {}", sanitize_terminal_text(id)));
+        lines.push(format!(
+            "  Input    {}",
+            truncate_for_prompt(&sanitize_terminal_text(input), 240)
+        ));
+        match result {
+            Some((output, is_error)) => lines.push(format!(
+                "  Result   {}\n{}",
+                if *is_error { "error" } else { "ok" },
+                indent_block(
+                    &truncate_for_prompt(&sanitize_terminal_text(output), 1_000),
+                    11
+                )
+            )),
+            None => lines.push("  Result   RUNNING".to_string()),
+        }
+        return Ok(lines.join("\n"));
+    }
+    if calls.is_empty() {
+        lines.push("  (no recorded tool calls)".to_string());
+        return Ok(lines.join("\n"));
+    }
+    let start = calls.len().saturating_sub(20);
+    for (index, (_, name, input, result)) in calls.iter().enumerate().skip(start) {
+        let status = result.map_or(
+            "RUNNING",
+            |(_, is_error)| if is_error { "error" } else { "ok" },
+        );
+        let subject = truncate_for_prompt(&sanitize_terminal_text(input), 80);
+        lines.push(format!(
+            "  {:>2}  {:<12} {:<8} {}",
+            index + 1,
+            sanitize_terminal_text(name),
+            status,
+            subject
+        ));
+    }
+    if start > 0 {
+        lines.push(format!("  showing last 20 of {} calls", calls.len()));
+    }
+    lines.push("  Use /tools <number> for bounded details.".to_string());
     Ok(lines.join("\n"))
 }
 
