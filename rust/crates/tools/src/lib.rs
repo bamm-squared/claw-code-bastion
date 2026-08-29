@@ -125,6 +125,10 @@ pub trait ExecutionBackend: Send + std::fmt::Debug {
         None
     }
 
+    fn candidate_review_roots(&self) -> Option<(PathBuf, PathBuf)> {
+        None
+    }
+
     fn execute_plugin(&mut self, _tool: &PluginTool, _input: &Value) -> Result<String, String> {
         Err(String::from(
             "plugin execution is unavailable through the selected execution backend",
@@ -324,6 +328,13 @@ impl IsolatedExecutionBackend {
 impl ExecutionBackend for IsolatedExecutionBackend {
     fn isolated_workspace_root(&self) -> Option<PathBuf> {
         Some(self.workspace.candidate.root.clone())
+    }
+
+    fn candidate_review_roots(&self) -> Option<(PathBuf, PathBuf)> {
+        Some((
+            self.workspace.baseline.root.clone(),
+            self.workspace.candidate.root.clone(),
+        ))
     }
 
     fn execute(&mut self, tool_name: &str, input: &Value) -> Result<String, String> {
@@ -608,6 +619,16 @@ impl GlobalToolRegistry {
                 .lock()
                 .ok()
                 .and_then(|backend| backend.isolated_workspace_root())
+        })
+    }
+
+    #[must_use]
+    pub fn candidate_review_roots(&self) -> Option<(PathBuf, PathBuf)> {
+        self.execution_backend.as_ref().and_then(|backend| {
+            backend
+                .lock()
+                .ok()
+                .and_then(|backend| backend.candidate_review_roots())
         })
     }
 

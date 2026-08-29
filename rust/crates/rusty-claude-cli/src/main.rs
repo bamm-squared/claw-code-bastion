@@ -51,7 +51,7 @@ use runtime::{
     load_oauth_credentials, load_system_prompt, pricing_for_model, render_change_summary,
     require_podman, resolve_expected_base, resolve_sandbox_status, ApiClient, ApiRequest,
     AssistantEvent, CandidateChange, CandidateChangeSet, CompactionConfig, ConfigLoader,
-    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServer,
+    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, EntryKind, McpServer,
     McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode,
     PermissionPolicy, PodmanWorkerClient, PodmanWorkerSpec, ProjectContext, PromptCacheEvent,
     ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
@@ -3693,6 +3693,7 @@ struct LiveCli {
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
     candidate_state: CandidateLifecycleState,
+    review_file_index: Option<usize>,
     context_tray: Vec<ContextTrayItem>,
     attachments: Vec<attachments::TaskAttachment>,
 }
@@ -3795,6 +3796,12 @@ impl BuiltRuntime {
             .as_ref()
             .and_then(|runtime| runtime.tool_executor().execution_backend())
     }
+
+    fn candidate_review_roots(&self) -> Option<(PathBuf, PathBuf)> {
+        self.runtime
+            .as_ref()
+            .and_then(|runtime| runtime.tool_executor().candidate_review_roots())
+    }
 }
 
 impl Deref for BuiltRuntime {
@@ -3841,6 +3848,10 @@ fn format_validation_status(status: runtime::ValidationStatus) -> &'static str {
     }
 }
 
+const REVIEW_DIFF_MAX_BYTES: usize = 64 * 1024;
+const REVIEW_SOURCE_MAX_BYTES: u64 = 256 * 1024;
+const REVIEW_LINE_MAX_CHARS: usize = 400;
+
 fn render_review_overview(
     changes: &CandidateChangeSet,
     validation: &runtime::validator::ValidationResult,
@@ -3861,11 +3872,202 @@ fn render_review_overview(
         .filter(|change| matches!(change, CandidateChange::Delete { .. }))
         .count();
     let mut output = format!(
-        "Review Candidate\n\nFiles: {} ({} added, {} modified, {} deleted)\nCandidate: {}\nValidation: {}\nReview: CURRENT\n\n",
+        "CANDIDATE REVIEW\nCanonical -> Candidate\n\nFiles: {} ({} added, {} modified, {} deleted)\nCandidate: {}\nValidation: {}\nReview: NOT REVIEWED\n\n",
         changes.changes.len(), added, modified, deleted, changes.id, validation_status(validation)
     );
-    output.push_str(&render_change_summary(changes, 12 * 1024));
+    for (index, change) in changes.changes.iter().enumerate() {
+        let (kind, size) = match change {
+            CandidateChange::Add { candidate } => ("A", candidate.size),
+            CandidateChange::Modify { candidate, .. } => ("M", candidate.size),
+            CandidateChange::Delete { baseline } => ("D", baseline.size),
+        };
+        let _ = writeln!(
+            output,
+            "{}  {}  {} ({} bytes)",
+            index + 1,
+            kind,
+            change.path().display(),
+            size
+        );
+    }
+    sanitize_terminal_text(&output)
+}
+
+fn truncate_review_line(line: &str) -> String {
+    let mut output = line.chars().take(REVIEW_LINE_MAX_CHARS).collect::<String>();
+    if line.chars().count() > REVIEW_LINE_MAX_CHARS {
+        output.push_str(" ... [line truncated]");
+    }
     output
+}
+
+fn read_review_text(root: &Path, path: &Path) -> Result<Option<Vec<String>>, String> {
+    let metadata = fs::metadata(root.join(path))
+        .map_err(|error| format!("unable to inspect {}: {error}", path.display()))?;
+    if metadata.len() > REVIEW_SOURCE_MAX_BYTES {
+        return Err(format!(
+            "{} exceeds the {}-byte display read bound",
+            path.display(),
+            REVIEW_SOURCE_MAX_BYTES
+        ));
+    }
+    let bytes = fs::read(root.join(path))
+        .map_err(|error| format!("unable to read {}: {error}", path.display()))?;
+    let Ok(text) = String::from_utf8(bytes) else {
+        return Ok(None);
+    };
+    Ok(Some(text.lines().map(truncate_review_line).collect()))
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_candidate_file_diff(
+    change: &CandidateChange,
+    baseline_root: &Path,
+    candidate_root: &Path,
+) -> String {
+    let path = change.path();
+    let mut output = format!(
+        "CANDIDATE REVIEW\nCanonical -> Candidate\n\n--- canonical/{}\n+++ candidate/{}\n",
+        path.display(),
+        path.display()
+    );
+    let (old, new) = match change {
+        CandidateChange::Add { candidate } => {
+            if candidate.kind != EntryKind::File {
+                return format!(
+                    "CANDIDATE REVIEW\n{}\nAdded {:?} entry\n",
+                    path.display(),
+                    candidate.kind
+                );
+            }
+            (Ok(Some(Vec::new())), read_review_text(candidate_root, path))
+        }
+        CandidateChange::Delete { baseline } => {
+            if baseline.kind != EntryKind::File {
+                return format!(
+                    "CANDIDATE REVIEW\n{}\nDeleted {:?} entry\n",
+                    path.display(),
+                    baseline.kind
+                );
+            }
+            (read_review_text(baseline_root, path), Ok(Some(Vec::new())))
+        }
+        CandidateChange::Modify {
+            baseline,
+            candidate,
+        } => {
+            if baseline.kind != EntryKind::File || candidate.kind != EntryKind::File {
+                return format!(
+                    "CANDIDATE REVIEW\n{}\nType changed: {:?} -> {:?}\n",
+                    path.display(),
+                    baseline.kind,
+                    candidate.kind
+                );
+            }
+            (
+                read_review_text(baseline_root, path),
+                read_review_text(candidate_root, path),
+            )
+        }
+    };
+    let old = match old {
+        Ok(Some(lines)) => lines,
+        Ok(None) => {
+            return format!(
+                "CANDIDATE REVIEW\n{}\nBinary file changed\n",
+                path.display()
+            )
+        }
+        Err(error) => {
+            return format!(
+                "CANDIDATE REVIEW\n{}\nDiff unavailable: {error}\n",
+                path.display()
+            )
+        }
+    };
+    let new = match new {
+        Ok(Some(lines)) => lines,
+        Ok(None) => {
+            return format!(
+                "CANDIDATE REVIEW\n{}\nBinary file changed\n",
+                path.display()
+            )
+        }
+        Err(error) => {
+            return format!(
+                "CANDIDATE REVIEW\n{}\nDiff unavailable: {error}\n",
+                path.display()
+            )
+        }
+    };
+    let prefix = old
+        .iter()
+        .zip(&new)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let suffix = old[prefix..]
+        .iter()
+        .rev()
+        .zip(new[prefix..].iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let old_end = old.len().saturating_sub(suffix);
+    let new_end = new.len().saturating_sub(suffix);
+    let context_start = prefix.saturating_sub(3);
+    let old_context_end = (old_end + 3).min(old.len());
+    let new_context_end = (new_end + 3).min(new.len());
+    let old_hunk_count = old_context_end.saturating_sub(context_start);
+    let new_hunk_count = new_context_end.saturating_sub(context_start);
+    let _ = writeln!(
+        output,
+        "@@ -{},{} +{},{} @@",
+        context_start + 1,
+        old_hunk_count,
+        context_start + 1,
+        new_hunk_count
+    );
+    for line in &old[context_start..prefix] {
+        let _ = writeln!(output, " {line}");
+    }
+    for line in &old[prefix..old_end] {
+        let _ = writeln!(output, "-{line}");
+    }
+    for line in &new[prefix..new_end] {
+        let _ = writeln!(output, "+{line}");
+    }
+    for line in &old[old_end..old_context_end] {
+        let _ = writeln!(output, " {line}");
+    }
+    if output.len() > REVIEW_DIFF_MAX_BYTES {
+        output.truncate(REVIEW_DIFF_MAX_BYTES);
+        output.push_str(
+            "\n... Diff truncated for display. Candidate identity covers the complete change.\n",
+        );
+    }
+    output
+}
+
+fn render_candidate_file_selection(
+    changes: &CandidateChangeSet,
+    baseline_root: &Path,
+    candidate_root: &Path,
+    selection: &str,
+) -> String {
+    if matches!(selection.trim(), "next" | "prev" | "previous") {
+        return "File navigation is stateless between commands; use /review file <n> from the numbered overview.".to_string();
+    }
+    let index = selection
+        .strip_prefix("file ")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .or_else(|| selection.trim().parse::<usize>().ok());
+    let Some(index) = index else {
+        return "Use /review file <n> to inspect a changed file, or /review for the overview."
+            .to_string();
+    };
+    let Some(change) = changes.changes.get(index.saturating_sub(1)) else {
+        return format!("No candidate file numbered {index}.");
+    };
+    render_candidate_file_diff(change, baseline_root, candidate_root)
 }
 
 fn validation_status(validation: &runtime::validator::ValidationResult) -> &'static str {
@@ -4312,6 +4514,7 @@ impl LiveCli {
             session,
             prompt_history: Vec::new(),
             candidate_state: CandidateLifecycleState::Editing,
+            review_file_index: None,
             context_tray: Vec::new(),
             attachments: Vec::new(),
         };
@@ -4807,13 +5010,58 @@ impl LiveCli {
         Ok(())
     }
 
-    fn run_review_command(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn run_review_command(
+        &mut self,
+        scope: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let Some(changes) = self.runtime.finish_candidate()? else {
             println!("No candidate changes to review.");
             return Ok(());
         };
         let validation = self.runtime.validate_candidate(&changes)?;
         self.candidate_state = CandidateLifecycleState::ReviewReady;
+        if let Some(scope) = scope.filter(|scope| !scope.trim().is_empty()) {
+            let Some((baseline_root, candidate_root)) = self.runtime.candidate_review_roots()
+            else {
+                println!("Candidate file diffs are unavailable for this runtime.");
+                return Ok(());
+            };
+            let requested = scope.trim();
+            let selected = if requested == "next" {
+                self.review_file_index
+                    .map_or(1, |index| index.saturating_add(2))
+                    .min(changes.changes.len())
+            } else if matches!(requested, "prev" | "previous") {
+                self.review_file_index
+                    .map_or(1, |index| index.saturating_sub(1).saturating_add(1))
+                    .max(1)
+            } else {
+                requested
+                    .strip_prefix("file ")
+                    .unwrap_or(requested)
+                    .trim()
+                    .parse::<usize>()
+                    .unwrap_or(0)
+            };
+            let selection = if selected > 0 && selected <= changes.changes.len() {
+                self.review_file_index = Some(selected - 1);
+                format!("file {selected}")
+            } else {
+                requested.to_string()
+            };
+            println!(
+                "Candidate: {}\nValidation: {}\nReview: NOT REVIEWED\n\n{}",
+                changes.id,
+                validation_status(&validation),
+                sanitize_terminal_text(&render_candidate_file_selection(
+                    &changes,
+                    &baseline_root,
+                    &candidate_root,
+                    &selection,
+                ))
+            );
+            return Ok(());
+        }
         if !io::stdin().is_terminal() {
             println!("{}", render_review_overview(&changes, &validation));
             return Ok(());
@@ -4959,8 +5207,8 @@ impl LiveCli {
                 Self::print_diff()?;
                 false
             }
-            SlashCommand::Review { .. } => {
-                self.run_review_command()?;
+            SlashCommand::Review { scope } => {
+                self.run_review_command(scope.as_deref())?;
                 false
             }
             SlashCommand::Version => {
@@ -6522,7 +6770,7 @@ fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Erro
         .is_ok_and(|o| o.status.success());
     if !in_git_repo {
         return Ok(format!(
-            "Diff\n  Result           no git repository\n  Detail           {} is not inside a git project",
+            "Canonical Git Diff\n  Source           canonical_git\n  Result           no git repository\n  Detail           {} is not inside a git project",
             cwd.display()
         ));
     }
@@ -6530,7 +6778,7 @@ fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Erro
     let unstaged = run_git_diff_command_in(cwd, &["diff"])?;
     if staged.trim().is_empty() && unstaged.trim().is_empty() {
         return Ok(
-            "Diff\n  Result           clean working tree\n  Detail           no current changes"
+            "Canonical Git Diff\n  Source           canonical_git\n  Result           clean working tree\n  Detail           no current changes"
                 .to_string(),
         );
     }
@@ -6543,7 +6791,10 @@ fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Erro
         sections.push(format!("Unstaged changes:\n{}", unstaged.trim_end()));
     }
 
-    Ok(format!("Diff\n\n{}", sections.join("\n\n")))
+    Ok(format!(
+        "Canonical Git Diff\nSource: canonical_git\n\n{}",
+        sections.join("\n\n")
+    ))
 }
 
 fn render_diff_json_for(cwd: &Path) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
@@ -6563,6 +6814,7 @@ fn render_diff_json_for(cwd: &Path) -> Result<serde_json::Value, Box<dyn std::er
     let unstaged = run_git_diff_command_in(cwd, &["diff"])?;
     Ok(serde_json::json!({
         "kind": "diff",
+        "source": "canonical_git",
         "result": if staged.trim().is_empty() && unstaged.trim().is_empty() { "clean" } else { "changes" },
         "staged": staged.trim(),
         "unstaged": unstaged.trim(),
@@ -9178,6 +9430,10 @@ impl CliToolExecutor {
 
     fn execution_backend(&self) -> Option<Arc<Mutex<dyn ExecutionBackend>>> {
         self.tool_registry.execution_backend()
+    }
+
+    fn candidate_review_roots(&self) -> Option<(PathBuf, PathBuf)> {
+        self.tool_registry.candidate_review_roots()
     }
 
     fn stop_isolated_mcp(&mut self) -> Result<(), ToolError> {
@@ -13973,5 +14229,110 @@ mod dump_manifests_tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod candidate_review_diff_tests {
+    use super::render_candidate_file_diff;
+    use runtime::{create_disposable_snapshot, CandidateChange, EntryKind};
+    use std::fmt::Write as _;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn fixture_root() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "claw-review-diff-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn renders_candidate_modified_added_and_deleted_files_without_git() {
+        let root = fixture_root();
+        fs::create_dir_all(&root).expect("fixture root should exist");
+        fs::write(root.join("modified.rs"), "before\nkeep\nafter\n")
+            .expect("modified fixture should write");
+        fs::write(root.join("deleted.rs"), "remove me\n").expect("deleted fixture should write");
+
+        let snapshot = create_disposable_snapshot(&root).expect("snapshot should be created");
+        fs::write(
+            snapshot.candidate.root.join("modified.rs"),
+            "before\nchanged\nafter\n",
+        )
+        .expect("candidate modification should write");
+        fs::remove_file(snapshot.candidate.root.join("deleted.rs"))
+            .expect("candidate deletion should apply");
+        fs::write(snapshot.candidate.root.join("added.rs"), "new candidate\n")
+            .expect("candidate addition should write");
+
+        let changes = snapshot.scan().expect("candidate scan should succeed");
+        let mut rendered = String::new();
+        for change in &changes.changes {
+            rendered.push_str(&render_candidate_file_diff(
+                change,
+                &snapshot.baseline.root,
+                &snapshot.candidate.root,
+            ));
+        }
+
+        assert!(rendered.contains("Canonical -> Candidate"));
+        assert!(rendered.contains("-before") || rendered.contains("-remove me"));
+        assert!(rendered.contains("+changed"));
+        assert!(rendered.contains("+new candidate"));
+        assert!(rendered.contains("-remove me"));
+        assert!(changes
+            .changes
+            .iter()
+            .any(|change| matches!(change, CandidateChange::Add { candidate } if candidate.kind == EntryKind::File)));
+        snapshot.discard().expect("snapshot should clean up");
+        fs::remove_dir_all(root).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn bounds_native_diff_display_and_reports_binary_content() {
+        let root = fixture_root();
+        fs::create_dir_all(&root).expect("fixture root should exist");
+        fs::write(root.join("large.txt"), "old\n").expect("large fixture should write");
+        fs::write(root.join("binary.dat"), [0_u8, 159, 146, 150])
+            .expect("binary fixture should write");
+
+        let snapshot = create_disposable_snapshot(&root).expect("snapshot should be created");
+        let mut large_candidate = String::new();
+        for index in 0..10_000 {
+            writeln!(large_candidate, "candidate line {index}").expect("line should format");
+        }
+        fs::write(snapshot.candidate.root.join("large.txt"), large_candidate)
+            .expect("large candidate should write");
+        fs::write(snapshot.candidate.root.join("binary.dat"), [1_u8, 2, 3, 4])
+            .expect("candidate binary should change");
+        let changes = snapshot.scan().expect("candidate scan should succeed");
+        let large = changes
+            .changes
+            .iter()
+            .find(|change| change.path() == std::path::Path::new("large.txt"))
+            .expect("large change should exist");
+        let large_diff =
+            render_candidate_file_diff(large, &snapshot.baseline.root, &snapshot.candidate.root);
+        assert!(large_diff.contains("Diff truncated for display"));
+        assert!(large_diff.len() <= super::REVIEW_DIFF_MAX_BYTES + 128);
+
+        let binary = changes
+            .changes
+            .iter()
+            .find(|change| change.path() == std::path::Path::new("binary.dat"))
+            .expect("binary change should exist");
+        assert!(render_candidate_file_diff(
+            binary,
+            &snapshot.baseline.root,
+            &snapshot.candidate.root,
+        )
+        .contains("Binary file changed"));
+        snapshot.discard().expect("snapshot should clean up");
+        fs::remove_dir_all(root).expect("fixture should clean up");
     }
 }

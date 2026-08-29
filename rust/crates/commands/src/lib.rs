@@ -151,7 +151,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "diff",
         aliases: &[],
-        summary: "Show git diff for current workspace changes",
+        summary: "Show canonical Git diff for current workspace changes",
         argument_hint: None,
         resume_supported: true,
     },
@@ -267,8 +267,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "review",
         aliases: &[],
-        summary: "Run a code review on current changes",
-        argument_hint: Some("[scope]"),
+        summary: "Review the current Bastion candidate proposal",
+        argument_hint: Some("[file <n>|next|prev]"),
         resume_supported: false,
     },
     SlashCommandSpec {
