@@ -4474,7 +4474,7 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let image_blocks = self.image_blocks()?;
+        let (_prompt, image_blocks) = self.prepare_user_turn(input)?;
         if !image_blocks.is_empty() {
             match image_capability(&self.model) {
                 ImageCapability::Supported => {}
@@ -4537,6 +4537,15 @@ impl LiveCli {
                 Err(Box::new(error))
             }
         }
+    }
+
+    fn prepare_user_turn(
+        &mut self,
+        input: &str,
+    ) -> Result<(String, Vec<ContentBlock>), Box<dyn std::error::Error>> {
+        let prompt = self.prompt_with_context(input)?;
+        let image_blocks = self.image_blocks()?;
+        Ok((prompt, image_blocks))
     }
 
     fn image_blocks(&self) -> Result<Vec<ContentBlock>, Box<dyn std::error::Error>> {
@@ -13364,7 +13373,9 @@ mod image_production_tests {
 
 #[cfg(test)]
 mod multimodal_command_integration_tests {
-    use super::{attachments, convert_messages, ContentBlock, LiveCli};
+    use super::{
+        attachments, convert_messages, image_capability, ContentBlock, ImageCapability, LiveCli,
+    };
     use api::{
         AnthropicRequestProfile, InputContentBlock, MessageRequest, OpenAiCompatClient,
         OpenAiCompatConfig,
@@ -13419,7 +13430,9 @@ mod multimodal_command_integration_tests {
     #[allow(clippy::too_many_lines)]
     fn full_user_attach_command_reaches_both_provider_serializers() {
         let _cwd_guard = super::tests::cwd_lock().lock().unwrap();
-        let _env_guard = env_lock().lock().unwrap();
+        let _env_guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _dir = HarnessDir::new();
         std::env::set_var("ANTHROPIC_API_KEY", "test-production-harness-key");
         let external = std::env::temp_dir().join(format!(
@@ -13549,6 +13562,250 @@ mod multimodal_command_integration_tests {
         assert!(converted[0].content.iter().all(|block| {
             matches!(block, InputContentBlock::Text { text } if text.contains("/attach"))
         }));
+    }
+
+    struct EnvRestore {
+        key: &'static str,
+        value: Option<String>,
+    }
+
+    impl EnvRestore {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self {
+                key,
+                value: previous,
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            if let Some(value) = &self.value {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn attach_to_cli(cli: &mut LiveCli, path: &std::path::Path) {
+        let command = SlashCommand::parse(&format!("/attach {}", path.display()))
+            .expect("attach command should parse")
+            .expect("input should be a slash command");
+        cli.handle_repl_command(command)
+            .expect("production attach command should succeed");
+    }
+
+    #[test]
+    fn private_image_snapshot_and_typed_request_leave_no_persistent_canary() {
+        let _cwd_guard = super::tests::cwd_lock().lock().unwrap();
+        let _env_guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _dir = HarnessDir::new();
+        let _private = EnvRestore::set("CLAW_PRIVATE_MODE", "1");
+        let _openai_key = EnvRestore::set("OPENAI_API_KEY", "test-private-harness-key");
+        let _ollama_host = EnvRestore::set("OLLAMA_HOST", "http://127.0.0.1:11434");
+        let image_path =
+            std::env::temp_dir().join(format!("claw-private-image-{}.png", std::process::id()));
+        let canary = b"PRIVATE_IMAGE_CANARY";
+        let mut image = valid_png();
+        image.extend_from_slice(canary);
+        fs::write(&image_path, &image).expect("private image should be written");
+
+        let mut cli = LiveCli::new(
+            "ollama/llava".into(),
+            false,
+            None,
+            runtime::PermissionMode::ReadOnly,
+        )
+        .expect("private local CLI should initialize");
+        attach_to_cli(&mut cli, &image_path);
+        let (_, blocks) = cli
+            .prepare_user_turn("describe this image")
+            .expect("private image turn should prepare");
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(
+            blocks[0],
+            ContentBlock::Image { data: Some(_), .. }
+        ));
+
+        let state = fs::read_dir(".claw")
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| fs::read_dir(entry.path()).ok())
+                    .flat_map(|entries| entries.filter_map(Result::ok))
+                    .filter_map(|entry| fs::read(entry.path()).ok())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        assert!(state
+            .iter()
+            .all(|bytes| !bytes.windows(canary.len()).any(|w| w == canary)));
+        assert!(state
+            .iter()
+            .all(|bytes| !bytes.windows(24).any(|w| w == b"PRIVATE_IMAGE_CANARY")));
+        let _ = fs::remove_file(image_path);
+    }
+
+    #[test]
+    fn normal_resume_does_not_restore_image_attachment_or_reread_host_path() {
+        let _cwd_guard = super::tests::cwd_lock().lock().unwrap();
+        let _env_guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _dir = HarnessDir::new();
+        let _credential = EnvRestore::set("ANTHROPIC_API_KEY", "test-resume-harness-key");
+        let image_path =
+            std::env::temp_dir().join(format!("claw-resume-image-{}.png", std::process::id()));
+        let image_a = valid_png();
+        fs::write(&image_path, &image_a).expect("image A should be written");
+        let mut cli = LiveCli::new(
+            "claude-sonnet-4-6".into(),
+            false,
+            None,
+            runtime::PermissionMode::ReadOnly,
+        )
+        .expect("normal CLI should initialize");
+        attach_to_cli(&mut cli, &image_path);
+        let (prompt, blocks) = cli
+            .prepare_user_turn("describe this image")
+            .expect("image turn should prepare");
+        cli.runtime
+            .session_mut()
+            .push_message(ConversationMessage {
+                role: MessageRole::User,
+                blocks: {
+                    let mut all = vec![ContentBlock::Text { text: prompt }];
+                    all.extend(blocks);
+                    all
+                },
+                usage: None,
+            })
+            .expect("image turn should enter session");
+        let session_id = cli.session.id.clone();
+        cli.persist_session().expect("session should persist");
+        fs::write(&image_path, b"IMAGE_B").expect("replacement image should be written");
+
+        let (_, persisted) =
+            super::load_session_reference(&session_id).expect("session should load");
+        assert!(persisted.messages.iter().any(|message| message
+            .blocks
+            .iter()
+            .any(|block| { matches!(block, ContentBlock::Image { data: None, .. }) })));
+        let converted = convert_messages(&persisted.messages);
+        assert!(converted.iter().all(|message| {
+            message
+                .content
+                .iter()
+                .all(|block| !matches!(block, InputContentBlock::Image { .. }))
+        }));
+        let mut resumed = LiveCli::new(
+            "claude-sonnet-4-6".into(),
+            false,
+            None,
+            runtime::PermissionMode::ReadOnly,
+        )
+        .expect("second CLI should initialize");
+        resumed
+            .resume_session(Some(session_id))
+            .expect("session should resume");
+        assert!(resumed.attachments.is_empty());
+        assert!(resumed.runtime.session().messages.iter().all(|message| {
+            message
+                .blocks
+                .iter()
+                .all(|block| !matches!(block, ContentBlock::Image { data: Some(_), .. }))
+        }));
+        let _ = fs::remove_file(image_path);
+    }
+
+    #[test]
+    fn image_capability_blocks_unsupported_and_unknown_before_provider_runtime() {
+        let _cwd_guard = super::tests::cwd_lock().lock().unwrap();
+        let _env_guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _dir = HarnessDir::new();
+        let _credential = EnvRestore::set("ANTHROPIC_API_KEY", "test-capability-harness-key");
+        let _openai_key = EnvRestore::set("OPENAI_API_KEY", "test-capability-harness-key");
+        let image_path =
+            std::env::temp_dir().join(format!("claw-capability-image-{}.png", std::process::id()));
+        fs::write(&image_path, valid_png()).expect("image should be written");
+        for (model, expected) in [
+            ("gpt-3.5-turbo", ImageCapability::Unsupported),
+            ("custom-image-model", ImageCapability::Unknown),
+        ] {
+            let mut cli =
+                LiveCli::new(model.into(), false, None, runtime::PermissionMode::ReadOnly)
+                    .expect("capability test CLI should initialize");
+            attach_to_cli(&mut cli, &image_path);
+            assert_eq!(image_capability(model), expected);
+            let error = cli
+                .run_turn("send image")
+                .expect_err("unsupported image must block locally");
+            assert!(error.to_string().contains("image"));
+            assert_eq!(cli.attachments.len(), 1);
+        }
+        let _ = fs::remove_file(image_path);
+    }
+
+    #[test]
+    fn active_image_history_uses_snapshot_after_host_file_is_deleted() {
+        let _cwd_guard = super::tests::cwd_lock().lock().unwrap();
+        let _env_guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _dir = HarnessDir::new();
+        let _credential = EnvRestore::set("ANTHROPIC_API_KEY", "test-history-harness-key");
+        let image_path =
+            std::env::temp_dir().join(format!("claw-history-image-{}.png", std::process::id()));
+        let image_a = valid_png();
+        fs::write(&image_path, &image_a).expect("image should be written");
+        let mut cli = LiveCli::new(
+            "claude-sonnet-4-6".into(),
+            false,
+            None,
+            runtime::PermissionMode::ReadOnly,
+        )
+        .expect("history CLI should initialize");
+        attach_to_cli(&mut cli, &image_path);
+        let (prompt, blocks) = cli
+            .prepare_user_turn("describe this image")
+            .expect("turn should prepare");
+        let image_block = blocks[0].clone();
+        cli.runtime
+            .session_mut()
+            .push_message(ConversationMessage {
+                role: MessageRole::User,
+                blocks: vec![ContentBlock::Text { text: prompt }, image_block],
+                usage: None,
+            })
+            .expect("history message should be stored");
+        cli.attachments.clear();
+        fs::remove_file(&image_path).expect("host image should be deleted");
+        let history = convert_messages(&cli.runtime.session().messages);
+        let image = history
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .find_map(|block| match block {
+                InputContentBlock::Image { data, .. } => Some(data),
+                _ => None,
+            })
+            .expect("active history should retain image");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(image)
+                .unwrap(),
+            image_a
+        );
+        assert!(
+            cli.attachments.is_empty(),
+            "tray is separate from active history"
+        );
     }
 }
 
