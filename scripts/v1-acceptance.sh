@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version="0.1.0-rc.1"
+version="0.1.0-rc.2"
 artifacts_dir=""
 binary="${CLAW_BINARY:-}"
 non_interactive=0
@@ -15,7 +15,7 @@ artifacts, pulls arbitrary images, changes shell profiles, or modifies a
 project outside its disposable test fixtures.
 
 Options:
-  --version VERSION       Expected CLI version (default: 0.1.0-rc.1)
+  --version VERSION       Expected CLI version (default: 0.1.0-rc.2)
   --artifacts-dir DIR     Verify and use a locally prepared release archive
   --binary PATH           Use an already installed/local claw binary
   --non-interactive       Run deterministic checks without prompting (default)

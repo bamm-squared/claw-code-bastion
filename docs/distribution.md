@@ -8,7 +8,7 @@ interfaces such as `~/.claw` and `CLAW_*` remain unchanged.
 
 | Environment | CLI | Isolated execution | Verification |
 | --- | --- | --- | --- |
-| Ubuntu/Linux x86_64 | Supported | Supported with rootless Podman | RC1 real-container campaign: 84/84 |
+| Ubuntu/Linux x86_64 | Supported | Supported with rootless Podman | RC2 real-container campaign: 90/90 |
 | Other Linux architectures | Build may work | Not covered by RC1 campaign | Verify locally |
 | macOS | Source/build experimentation | Not covered by RC1 campaign | No equivalent containment claim |
 | Windows | Source/build experimentation or WSL2 | Not covered by RC1 campaign | No native-Windows containment claim |
@@ -32,9 +32,9 @@ the archive, and installs `claw` under `$HOME/.local/bin`. It does not require
 `sudo` or modify shell profiles. Add that directory to `PATH` using your
 shell's normal configuration if needed.
 
-Pin a version with `CLAW_VERSION=0.1.0-rc.1` or
-`--version 0.1.0-rc.1`. The RC1 archive is
-`claw-code-bastion-v0.1.0-rc.1-linux-x86_64.tar.gz`.
+Pin a version with `CLAW_VERSION=0.1.0-rc.2` or
+`--version 0.1.0-rc.2`. The RC2 archive is
+`claw-code-bastion-v0.1.0-rc.2-linux-x86_64.tar.gz`.
 
 ### Developer/source installation
 

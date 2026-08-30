@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "api"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "base64",
  "reqwest",
@@ -111,7 +111,7 @@ dependencies = [
 
 [[package]]
 name = "commands"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "plugins",
  "runtime",
@@ -120,7 +120,7 @@ dependencies = [
 
 [[package]]
 name = "compat-harness"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "commands",
  "runtime",
@@ -240,7 +240,7 @@ checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
 
 [[package]]
 name = "execution-worker"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "runtime",
  "serde",
@@ -731,7 +731,7 @@ dependencies = [
 
 [[package]]
 name = "mock-anthropic-service"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "api",
  "serde_json",
@@ -849,7 +849,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -1119,7 +1119,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "glob",
  "plugins",
@@ -1208,7 +1208,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rusty-claude-cli"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "api",
  "base64",
@@ -1468,7 +1468,7 @@ dependencies = [
 
 [[package]]
 name = "telemetry"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -1589,7 +1589,7 @@ dependencies = [
 
 [[package]]
 name = "tools"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "api",
  "commands",
