@@ -107,13 +107,17 @@ def main() -> int:
         send("a\r")
         if not read_until(b"Candidate changes applied", TIMEOUT):
             return fail("trusted Apply did not complete", transcript)
-        # EOF is the line editor's supported exit path. It avoids matching a
-        # stale startup prompt in the accumulated transcript while the
-        # successful turn is still being flushed.
-        send("\x04")
+        # Allow the successful turn to finish restoring the editor, then use
+        # the normal exit command. Do not search the accumulated transcript
+        # for a prompt: the startup prompt would be a stale match.
+        time.sleep(1)
+        send("/exit\r")
         try:
             exit_status = process.wait(timeout=15)
         except subprocess.TimeoutExpired:
+            # EOF remains a bounded fallback for line-discipline variants
+            # that consume the slash command while output is still flushing.
+            send("\x04")
             exit_status = process.wait(timeout=15)
         if exit_status != 0:
             return fail(f"CLI exited with status {process.returncode}", transcript)
