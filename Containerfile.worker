@@ -13,6 +13,7 @@ RUN cargo build --manifest-path /build/rust/Cargo.toml --release -p execution-wo
 
 FROM docker.io/library/debian:bookworm-slim
 ARG CLAW_VERSION=dev
+ARG CLAW_SOURCE_REVISION=unknown
 LABEL org.opencontainers.image.title="Claw Code Bastion isolated runtime" \
       org.opencontainers.image.version="$CLAW_VERSION" \
       org.opencontainers.image.revision="$CLAW_SOURCE_REVISION" \
