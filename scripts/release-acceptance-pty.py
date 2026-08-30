@@ -107,18 +107,13 @@ def main() -> int:
         send("a\r")
         if not read_until(b"Candidate changes applied", TIMEOUT):
             return fail("trusted Apply did not complete", transcript)
-        # Wait for the REPL to regain control after candidate teardown before
-        # sending the exit command; otherwise the command can be consumed
-        # while the runtime is still flushing the successful turn.
-        read_until(b"> ", 10)
-        send("/exit\r")
+        # EOF is the line editor's supported exit path. It avoids matching a
+        # stale startup prompt in the accumulated transcript while the
+        # successful turn is still being flushed.
+        send("\x04")
         try:
             exit_status = process.wait(timeout=15)
         except subprocess.TimeoutExpired:
-            # Some line-discipline implementations consume CR and LF as
-            # separate input events. EOF is the supported editor exit path
-            # and remains bounded if the slash command was not submitted.
-            send("\x04")
             exit_status = process.wait(timeout=15)
         if exit_status != 0:
             return fail(f"CLI exited with status {process.returncode}", transcript)
