@@ -83,14 +83,17 @@ Before publishing, prepare local artifacts and run:
   --non-interactive
 ```
 
-The helper verifies local archive checksums and version output, checks runtime
-availability, and reports product stages requiring manual confirmation. It is
-not a substitute for the dedicated hostile isolation gate. Promotion to
-`v0.1.0` requires Rust CI, release artifact/checksum acceptance, clean-machine
-acceptance, a fresh complete real-container security gate for the release
-commit, and consistent release documentation. The historical RC1 artifact
-records 84/84 for its own tested commit; it does not automatically cover later
-changes on `main`.
+The helper verifies local archive checksums and version output, resolves the
+selected runtime, starts the checked-in localhost mock provider, and drives the
+packaged binary through a PTY. The deterministic acceptance creates a disposable
+candidate with a real isolated tool-call, validation/review, and Apply lifecycle;
+it uses only test-owned HOME/configuration and a synthetic provider key. It never
+uses external provider traffic. It is not a substitute for the dedicated hostile
+isolation gate. Promotion to `v0.1.0` requires Rust CI, release
+artifact/checksum acceptance, clean-machine acceptance, a fresh complete
+real-container security gate for the release commit, and consistent release
+documentation. The historical RC1 artifact records 84/84 for its own tested
+commit; it does not automatically cover later changes on `main`.
 
 The current release verifier includes six additional composite assertions for
 post-RC boundaries: trusted Git, retrieval, trusted `@` context, terminal

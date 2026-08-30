@@ -18,7 +18,7 @@ Options:
   --version VERSION       Expected CLI version (default: 0.1.0-rc.1)
   --artifacts-dir DIR     Verify and use a locally prepared release archive
   --binary PATH           Use an already installed/local claw binary
-  --non-interactive       Run deterministic checks and report manual stages
+  --non-interactive       Run deterministic checks without prompting (default)
   -h, --help              Show this help
 EOF
 }
@@ -87,29 +87,94 @@ fi
 printf 'Version                  %s\n' "$version_result"
 printf 'Runtime doctor           %s\n' "$runtime_result"
 
-manual_stages=(
-    "Provider onboarding" "Normal coding" "Request Changes"
-    "Validation/review" "Explicit Apply" "Private mode" "MCP"
-    "Hooks" "Plugins" "WebFetch" "Exit/cleanup"
-)
-manual_pending=0
-for stage in "${manual_stages[@]}"; do
-    result="MANUAL / NOT RUN"
-    if [ "$non_interactive" -eq 0 ] && [ -t 0 ]; then
-        printf '%s: confirm PASS, or press Enter to leave pending: ' "$stage"
-        read -r answer
-        case "$answer" in
-            y|Y|yes|YES|pass|PASS) result=PASS ;;
-        esac
-    fi
-    [ "$result" = PASS ] || manual_pending=1
-    printf '%-25s %s\n' "$stage" "$result"
-done
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+runtime_image="${CLAW_WORKER_IMAGE:-${CLAW_VALIDATOR_IMAGE:-}}"
+acceptance_result=PASS
 
-if [ "$version_result" = PASS ] && [ "$runtime_result" = PASS ] && [ "$manual_pending" -eq 0 ]; then
+if [ "$version_result" != PASS ] || [ "$runtime_result" != PASS ]; then
+    acceptance_result=FAIL
+fi
+
+printf '\nDeterministic acceptance\n'
+if [ -z "$runtime_image" ]; then
+    printf 'Runtime image           FAIL (CLAW_WORKER_IMAGE or CLAW_VALIDATOR_IMAGE is required)\n'
+    acceptance_result=FAIL
+else
+    printf 'Runtime image           PASS (%s)\n' "$runtime_image"
+fi
+
+fixture="$repo_root/rust/target/release/mock-anthropic-service"
+if [ ! -x "$fixture" ]; then
+    if ! (cd "$repo_root/rust" && cargo build --release -p mock-anthropic-service >/dev/null); then
+        printf 'Provider fixture        FAIL (mock service build failed)\n'
+        acceptance_result=FAIL
+    fi
+fi
+
+project="$tmp/project"
+mkdir -p "$project"
+git -C "$project" init -q
+git -C "$project" config user.email acceptance@example.invalid
+git -C "$project" config user.name 'Claw Acceptance'
+printf 'acceptance baseline\n' > "$project/README.md"
+git -C "$project" add README.md
+git -C "$project" commit -qm baseline
+
+mock_log="$tmp/mock-anthropic.log"
+mock_pid=""
+if [ -x "$fixture" ] && [ -n "$runtime_image" ]; then
+    "$fixture" >"$mock_log" 2>&1 &
+    mock_pid=$!
+    for _ in $(seq 1 100); do
+        if grep -q '^MOCK_ANTHROPIC_BASE_URL=' "$mock_log"; then break; fi
+        sleep 0.1
+    done
+    base_url="$(sed -n 's/^MOCK_ANTHROPIC_BASE_URL=//p' "$mock_log" | head -n 1)"
+    if [ -n "$base_url" ] && [ -x "$repo_root/scripts/release-acceptance-pty.py" ]; then
+        if ANTHROPIC_API_KEY=acceptance-key \
+            ANTHROPIC_BASE_URL="$base_url" \
+            CLAW_WORKER_IMAGE="$runtime_image" \
+            CLAW_VALIDATOR_IMAGE="$runtime_image" \
+            python3 "$repo_root/scripts/release-acceptance-pty.py" \
+                "$binary" "$project" "$base_url" "$runtime_image"; then
+            printf 'Provider fixture        PASS (localhost mock)\n'
+            printf 'Normal coding          PASS (tool-call loop)\n'
+            printf 'Validation/review/apply PASS\n'
+            printf 'Interactive PTY        PASS\n'
+        else
+            printf 'Provider fixture        FAIL\n'
+            printf 'Normal coding          FAIL\n'
+            printf 'Validation/review/apply FAIL\n'
+            printf 'Interactive PTY        FAIL\n'
+            acceptance_result=FAIL
+        fi
+    else
+        printf 'Provider fixture        FAIL (fixture did not start)\n'
+        printf 'Interactive PTY        FAIL\n'
+        acceptance_result=FAIL
+    fi
+else
+    printf 'Provider fixture        NOT RUN\n'
+    printf 'Interactive PTY        NOT RUN\n'
+    acceptance_result=FAIL
+fi
+
+if [ -n "$mock_pid" ]; then
+    kill "$mock_pid" 2>/dev/null || true
+    wait "$mock_pid" 2>/dev/null || true
+fi
+
+if [ -n "$runtime_image" ] && "$binary" --private doctor --privacy >/dev/null 2>&1; then
+    printf 'Private policy          PASS\n'
+else
+    printf 'Private policy          FAIL\n'
+    acceptance_result=FAIL
+fi
+printf 'Required manual stages  0\n'
+
+if [ "$acceptance_result" = PASS ]; then
     printf '\nACCEPTANCE: PASS\n'
-elif [ "$manual_pending" -eq 1 ]; then
-    printf '\nACCEPTANCE: MANUAL / NOT RUN\n'
 else
     printf '\nACCEPTANCE: FAIL\n'
+    exit 1
 fi

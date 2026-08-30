@@ -1,4 +1,5 @@
 use std::env;
+use std::io::{self, Write};
 
 use mock_anthropic_service::MockAnthropicService;
 
@@ -28,6 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let server = MockAnthropicService::spawn_on(&bind_addr).await?;
     println!("MOCK_ANTHROPIC_BASE_URL={}", server.base_url());
+    io::stdout().flush()?;
     tokio::signal::ctrl_c().await?;
     drop(server);
     Ok(())
