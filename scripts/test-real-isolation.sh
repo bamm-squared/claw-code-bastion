@@ -9,7 +9,7 @@ artifact="$artifact_dir/security-verification.json"
 log_dir="$(mktemp -d "${TMPDIR:-/tmp}/claw-real-isolation.XXXXXX")"
 trap 'rm -rf "$log_dir"' EXIT
 
-capabilities=(worker_runtime worker_filesystem_isolation worker_outside_write_isolation worker_canonical_isolation worker_credential_isolation worker_network_isolation worker_socket_isolation worker_symlink_isolation worker_git_metadata_isolation worker_process_isolation worker_resource_limits worker_output_bounds worker_crash_recovery validator_runtime validator_filesystem_isolation validator_canonical_isolation validator_credential_isolation validator_network_isolation validator_socket_isolation validator_candidate_independence validator_timeout_cleanup validator_descendant_cleanup validator_output_bounds candidate_canonical_boundary validation_identity_binding whole_change_set_apply full_authoritative_lifecycle mcp_real_execution mcp_canonical_isolation mcp_outside_host_isolation mcp_credential_isolation mcp_socket_isolation mcp_network_isolation mcp_cleanup mcp_no_host_fallback hook_real_execution hook_canonical_isolation hook_credential_isolation hook_network_isolation hook_descendant_cleanup hook_no_host_fallback plugin_real_execution plugin_canonical_isolation plugin_credential_isolation plugin_network_isolation plugin_cleanup plugin_no_host_fallback private_isolation_mandatory private_no_session_persistence private_no_resume private_webfetch_denied private_websearch_denied private_provider_fallback_denied private_provider_policy private_review_apply webfetch_http_https_validation webfetch_loopback_denial webfetch_private_address_denial webfetch_link_local_denial webfetch_metadata_denial webfetch_ipv6_denial webfetch_ipv4_mapped_ipv6_denial webfetch_redirect_revalidation webfetch_timeout_bound webfetch_body_bound webfetch_header_credential_isolation webfetch_dns_rebinding_toctou custom_runtime_trusted_selection custom_runtime_project_override_denied custom_runtime_network_none custom_runtime_mount_restrictions custom_runtime_credentials_sockets_unavailable custom_runtime_no_host_fallback combined_canonical_unchanged_pre_apply combined_outside_canaries_unchanged combined_credentials_not_leaked combined_network_not_reached combined_stale_validation_rejected combined_only_reviewed_changes_apply combined_cleanup_complete provider_worker_credential_isolation provider_validator_credential_isolation provider_mcp_credential_isolation provider_host_secret_redaction)
+capabilities=(worker_runtime worker_filesystem_isolation worker_outside_write_isolation worker_canonical_isolation worker_credential_isolation worker_network_isolation worker_socket_isolation worker_symlink_isolation worker_git_metadata_isolation worker_process_isolation worker_resource_limits worker_output_bounds worker_crash_recovery validator_runtime validator_filesystem_isolation validator_canonical_isolation validator_credential_isolation validator_network_isolation validator_socket_isolation validator_candidate_independence validator_timeout_cleanup validator_descendant_cleanup validator_output_bounds candidate_canonical_boundary validation_identity_binding whole_change_set_apply full_authoritative_lifecycle mcp_real_execution mcp_canonical_isolation mcp_outside_host_isolation mcp_credential_isolation mcp_socket_isolation mcp_network_isolation mcp_cleanup mcp_no_host_fallback hook_real_execution hook_canonical_isolation hook_credential_isolation hook_network_isolation hook_descendant_cleanup hook_no_host_fallback plugin_real_execution plugin_canonical_isolation plugin_credential_isolation plugin_network_isolation plugin_cleanup plugin_no_host_fallback private_isolation_mandatory private_no_session_persistence private_no_resume private_webfetch_denied private_websearch_denied private_provider_fallback_denied private_provider_policy private_review_apply webfetch_http_https_validation webfetch_loopback_denial webfetch_private_address_denial webfetch_link_local_denial webfetch_metadata_denial webfetch_ipv6_denial webfetch_ipv4_mapped_ipv6_denial webfetch_redirect_revalidation webfetch_timeout_bound webfetch_body_bound webfetch_header_credential_isolation webfetch_dns_rebinding_toctou custom_runtime_trusted_selection custom_runtime_project_override_denied custom_runtime_network_none custom_runtime_mount_restrictions custom_runtime_credentials_sockets_unavailable custom_runtime_no_host_fallback combined_canonical_unchanged_pre_apply combined_outside_canaries_unchanged combined_credentials_not_leaked combined_network_not_reached combined_stale_validation_rejected combined_only_reviewed_changes_apply combined_cleanup_complete provider_worker_credential_isolation provider_validator_credential_isolation provider_mcp_credential_isolation provider_host_secret_redaction trusted_git_boundary retrieval_boundary trusted_context_boundary terminal_rendering_boundary trusted_attachment_boundary multimodal_image_boundary)
 declare -A status TEST_CAPABILITIES TEST_PACKAGES TEST_TARGETS TEST_BIN TEST_LIB TEST_IGNORED TEST_EVIDENCE capability_test capability_evidence
 for capability in "${capabilities[@]}"; do status["$capability"]="not_tested"; done
 
@@ -65,6 +65,7 @@ map_deterministic web_broker_security_assertions "webfetch_http_https_validation
 TEST_PACKAGES[web_broker_security_assertions]="tools"
 TEST_TARGETS[web_broker_security_assertions]="tools"
 TEST_LIB[web_broker_security_assertions]=1
+map_deterministic post_rc_security_boundaries "trusted_git_boundary retrieval_boundary trusted_context_boundary terminal_rendering_boundary trusted_attachment_boundary multimodal_image_boundary"
 TEST_EVIDENCE[real_worker_boundary_blocks_host_state_and_allows_candidate_edits]="candidate marker is present while outside, canonical, credential, socket, and network probes fail"
 TEST_EVIDENCE[real_worker_network_and_mount_policy_denies_host_state]="network, socket, credential, and protected mount probes return denial"
 TEST_EVIDENCE[real_worker_edit_positive_control]="candidate edit succeeds in the isolated worker"
@@ -105,11 +106,12 @@ write_artifact() {
     done
     if [ "$any_failed" -eq 1 ]; then overall=fail; elif [ "$any_tested" -eq 0 ]; then overall=not_run; elif [ "$all_pass" -eq 1 ]; then overall=pass; fi
     local digest="$(podman image inspect --format '{{.Id}}' "$image" 2>/dev/null || true)"
+    local source_revision="$(podman image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image" 2>/dev/null || true)"
     local version="$(podman --version 2>/dev/null || true)"
     local commit="${GITHUB_SHA:-$(git -C "$root" rev-parse HEAD 2>/dev/null || printf unknown)}"
     local os_kernel="$(uname -srm 2>/dev/null || printf unknown)"
     {
-      printf '{\n  "schema": "combined-security-verification-v1",\n  "commit": "%s",\n  "os_kernel": "%s",\n  "worker_image": "%s",\n  "worker_image_digest": "%s",\n  "podman_version": "%s",\n  "rootless": true,\n  "overall": "%s",\n  "required_capabilities": %s,\n  "pass": %s,\n  "fail": %s,\n  "not_tested": %s,\n  "capabilities": {\n' "$commit" "$os_kernel" "$image" "$digest" "$version" "$overall" "${#capabilities[@]}" "$pass_count" "$fail_count" "$not_tested_count"
+      printf '{\n  "schema": "combined-security-verification-v1",\n  "commit": "%s",\n  "os_kernel": "%s",\n  "worker_image": "%s",\n  "worker_image_digest": "%s",\n  "worker_image_source_revision": "%s",\n  "podman_version": "%s",\n  "rootless": true,\n  "overall": "%s",\n  "required_capabilities": %s,\n  "pass": %s,\n  "fail": %s,\n  "not_tested": %s,\n  "capabilities": {\n' "$commit" "$os_kernel" "$image" "$digest" "$source_revision" "$version" "$overall" "${#capabilities[@]}" "$pass_count" "$fail_count" "$not_tested_count"
       for capability in "${capabilities[@]}"; do
         [ "$first" -eq 1 ] || printf ',\n'; first=0
         printf '    "%s": {"result": "%s", "test": "%s", "evidence": "%s"}' "$capability" "${status[$capability]}" "${capability_test[$capability]:-unassigned}" "${capability_evidence[$capability]:-unassigned}"
@@ -157,7 +159,27 @@ if [ "${1:-}" = "--accounting-self-test" ]; then
 fi
 
 printf '%s\n' 'Claw Real Isolation Verification'
-if ! CLAW_PREFLIGHT_CONFIG_ONLY=1 "$root/scripts/security-runner-preflight.sh" || ! command -v podman >/dev/null 2>&1 || ! podman build -f "$root/Containerfile.worker" -t "$image" "$root" || ! CLAW_REAL_PODMAN_IMAGE="$image" "$root/scripts/security-runner-preflight.sh"; then
+if ! CLAW_PREFLIGHT_CONFIG_ONLY=1 "$root/scripts/security-runner-preflight.sh" || ! command -v podman >/dev/null 2>&1; then
+    write_artifact || true
+    exit 2
+fi
+if [ "${CLAW_REUSE_RUNTIME_IMAGE:-0}" = 1 ]; then
+    expected_id="${CLAW_EXPECTED_RUNTIME_IMAGE_ID:-}"
+    expected_revision="${CLAW_EXPECTED_SOURCE_REVISION:-$(git -C "$root" rev-parse HEAD)}"
+    actual_id="$(podman image inspect --format '{{.Id}}' "$image" 2>/dev/null || true)"
+    actual_revision="$(podman image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image" 2>/dev/null || true)"
+    if [ -z "$actual_id" ] || { [ -n "$expected_id" ] && [ "$actual_id" != "$expected_id" ]; } || [ "$actual_revision" != "$expected_revision" ]; then
+        printf 'FAIL runtime identity: image=%s id=%s revision=%s expected_id=%s expected_revision=%s\n' "$image" "$actual_id" "$actual_revision" "$expected_id" "$expected_revision"
+        write_artifact || true
+        exit 2
+    fi
+else
+    if ! podman build --build-arg "CLAW_SOURCE_REVISION=$(git -C "$root" rev-parse HEAD)" -f "$root/Containerfile.worker" -t "$image" "$root"; then
+        write_artifact || true
+        exit 2
+    fi
+fi
+if ! CLAW_REAL_PODMAN_IMAGE="$image" "$root/scripts/security-runner-preflight.sh"; then
     write_artifact || true
     exit 2
 fi
@@ -167,7 +189,9 @@ for test_name in "${!TEST_CAPABILITIES[@]}"; do
     test_args=("$test_name" "--" "--nocapture")
     if [ "${TEST_IGNORED[$test_name]}" = 1 ]; then test_args=("$test_name" "--" "--ignored" "--nocapture"); fi
     if [ "${TEST_LIB[$test_name]:-0}" = 1 ]; then cargo_args=("--lib"); elif [ -n "${TEST_BIN[$test_name]:-}" ]; then cargo_args=("--bin" "${TEST_BIN[$test_name]}"); else cargo_args=("--test" "${TEST_TARGETS[$test_name]}"); fi
-    if (cd "$root/rust" && CLAW_REAL_PODMAN_IMAGE="$image" cargo test -p "${TEST_PACKAGES[$test_name]}" "${cargo_args[@]}" "${test_args[@]}") 2>&1 | tee "$log_dir/$test_name.log"; then result=pass; else result=fail; fi
+    if [ "$test_name" = post_rc_security_boundaries ]; then
+        if (cd "$root" && ./scripts/test-post-rc-security.sh) 2>&1 | tee "$log_dir/$test_name.log"; then result=pass; else result=fail; fi
+    elif (cd "$root/rust" && CLAW_REAL_PODMAN_IMAGE="$image" CLAW_WORKER_IMAGE="$image" CLAW_VALIDATOR_IMAGE="$image" cargo test -p "${TEST_PACKAGES[$test_name]}" "${cargo_args[@]}" "${test_args[@]}") 2>&1 | tee "$log_dir/$test_name.log"; then result=pass; else result=fail; fi
     record_test_results "$test_name" "$result" "$log_dir/$test_name.log"
 done
 for capability in "${capabilities[@]}"; do printf '%-42s %s\n' "$capability" "${status[$capability]}"; done

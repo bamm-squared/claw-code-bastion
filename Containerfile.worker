@@ -1,4 +1,5 @@
 ARG CLAW_VERSION=dev
+ARG CLAW_SOURCE_REVISION=unknown
 FROM docker.io/library/rust:bookworm AS build
 
 RUN apt-get update \
@@ -14,6 +15,7 @@ FROM docker.io/library/debian:bookworm-slim
 ARG CLAW_VERSION=dev
 LABEL org.opencontainers.image.title="Claw Code Bastion isolated runtime" \
       org.opencontainers.image.version="$CLAW_VERSION" \
+      org.opencontainers.image.revision="$CLAW_SOURCE_REVISION" \
       org.opencontainers.image.source="https://github.com/bamm-squared/claw-code-bastion"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git \

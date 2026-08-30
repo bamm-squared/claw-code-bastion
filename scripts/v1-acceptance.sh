@@ -72,7 +72,7 @@ case "$actual_version" in
 esac
 
 runtime_result=NOT_RUN
-if "$binary" doctor --runtime >/dev/null 2>&1; then
+if CLAW_WORKER_IMAGE="${CLAW_WORKER_IMAGE:-}" CLAW_VALIDATOR_IMAGE="${CLAW_VALIDATOR_IMAGE:-}" "$binary" doctor --runtime >/dev/null 2>&1; then
     runtime_result=PASS
 else
     runtime_result=FAIL

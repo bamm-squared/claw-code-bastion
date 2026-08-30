@@ -10622,7 +10622,7 @@ mod tests {
         );
     }
 
-    fn env_lock() -> MutexGuard<'static, ()> {
+    pub(super) fn env_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
@@ -13960,7 +13960,7 @@ mod multimodal_command_integration_tests {
     use commands::SlashCommand;
     use runtime::{ConversationMessage, MessageRole};
     use std::fs;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
     struct HarnessDir {
         root: std::path::PathBuf,
@@ -13988,11 +13988,6 @@ mod multimodal_command_integration_tests {
         }
     }
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
     fn valid_png() -> Vec<u8> {
         let mut bytes = vec![
             0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0,
@@ -14005,8 +14000,8 @@ mod multimodal_command_integration_tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn full_user_attach_command_reaches_both_provider_serializers() {
-        let _cwd_guard = super::tests::cwd_lock().lock().unwrap();
-        let _env_guard = env_lock()
+        let _env_guard = super::tests::env_lock();
+        let _cwd_guard = super::tests::cwd_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _dir = HarnessDir::new();
@@ -14176,8 +14171,8 @@ mod multimodal_command_integration_tests {
 
     #[test]
     fn private_image_snapshot_and_typed_request_leave_no_persistent_canary() {
-        let _cwd_guard = super::tests::cwd_lock().lock().unwrap();
-        let _env_guard = env_lock()
+        let _env_guard = super::tests::env_lock();
+        let _cwd_guard = super::tests::cwd_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _dir = HarnessDir::new();
@@ -14229,8 +14224,8 @@ mod multimodal_command_integration_tests {
 
     #[test]
     fn normal_resume_does_not_restore_image_attachment_or_reread_host_path() {
-        let _cwd_guard = super::tests::cwd_lock().lock().unwrap();
-        let _env_guard = env_lock()
+        let _env_guard = super::tests::env_lock();
+        let _cwd_guard = super::tests::cwd_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _dir = HarnessDir::new();
@@ -14301,8 +14296,8 @@ mod multimodal_command_integration_tests {
 
     #[test]
     fn image_capability_blocks_unsupported_and_unknown_before_provider_runtime() {
-        let _cwd_guard = super::tests::cwd_lock().lock().unwrap();
-        let _env_guard = env_lock()
+        let _env_guard = super::tests::env_lock();
+        let _cwd_guard = super::tests::cwd_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _dir = HarnessDir::new();
@@ -14331,8 +14326,8 @@ mod multimodal_command_integration_tests {
 
     #[test]
     fn active_image_history_uses_snapshot_after_host_file_is_deleted() {
-        let _cwd_guard = super::tests::cwd_lock().lock().unwrap();
-        let _env_guard = env_lock()
+        let _env_guard = super::tests::env_lock();
+        let _cwd_guard = super::tests::cwd_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _dir = HarnessDir::new();

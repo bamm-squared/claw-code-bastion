@@ -88,6 +88,14 @@ availability, and reports product stages requiring manual confirmation. It is
 not a substitute for the dedicated hostile isolation gate. Promotion to
 `v0.1.0` requires Rust CI, release artifact/checksum acceptance, clean-machine
 acceptance, a fresh complete real-container security gate for the release
-commit, and consistent release documentation. The RC1 artifact records 84/84
-for its own tested commit; it does not automatically cover later changes on
-`main`.
+commit, and consistent release documentation. The historical RC1 artifact
+records 84/84 for its own tested commit; it does not automatically cover later
+changes on `main`.
+
+The current release verifier includes six additional composite assertions for
+post-RC boundaries: trusted Git, retrieval, trusted `@` context, terminal
+rendering, trusted external attachments, and typed multimodal image input.
+The resulting current release inventory is 90 assertions. The gate builds one
+revision-labeled runtime image, passes its exact reference to the real
+security campaign, and fails before testing if the resolved image ID or source
+revision differs from the recorded gate identity.
