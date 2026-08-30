@@ -191,6 +191,8 @@ for test_name in "${!TEST_CAPABILITIES[@]}"; do
     if [ "${TEST_LIB[$test_name]:-0}" = 1 ]; then cargo_args=("--lib"); elif [ -n "${TEST_BIN[$test_name]:-}" ]; then cargo_args=("--bin" "${TEST_BIN[$test_name]}"); else cargo_args=("--test" "${TEST_TARGETS[$test_name]}"); fi
     if [ "$test_name" = post_rc_security_boundaries ]; then
         if (cd "$root" && ./scripts/test-post-rc-security.sh) 2>&1 | tee "$log_dir/$test_name.log"; then result=pass; else result=fail; fi
+    elif [ -n "${TEST_BIN[$test_name]:-}" ]; then
+        if (cd "$root/rust" && cargo build -p "${TEST_PACKAGES[$test_name]}" --bin "${TEST_BIN[$test_name]}" >/dev/null && CLAW_REAL_PODMAN_IMAGE="$image" CLAW_WORKER_IMAGE="$image" CLAW_VALIDATOR_IMAGE="$image" cargo test -p "${TEST_PACKAGES[$test_name]}" "${cargo_args[@]}" "${test_args[@]}") 2>&1 | tee "$log_dir/$test_name.log"; then result=pass; else result=fail; fi
     elif (cd "$root/rust" && CLAW_REAL_PODMAN_IMAGE="$image" CLAW_WORKER_IMAGE="$image" CLAW_VALIDATOR_IMAGE="$image" cargo test -p "${TEST_PACKAGES[$test_name]}" "${cargo_args[@]}" "${test_args[@]}") 2>&1 | tee "$log_dir/$test_name.log"; then result=pass; else result=fail; fi
     record_test_results "$test_name" "$result" "$log_dir/$test_name.log"
 done
