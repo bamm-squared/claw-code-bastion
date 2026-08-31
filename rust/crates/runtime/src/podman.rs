@@ -185,6 +185,9 @@ impl PodmanWorkerSpec {
             "run".into(),
             "--rm".into(),
             "--interactive".into(),
+            // The runtime image is selected by trusted host configuration.
+            // Never replace it with a registry pull during an execution.
+            "--pull=never".into(),
             "--network=none".into(),
             "--read-only".into(),
             "--userns=keep-id".into(),
@@ -251,6 +254,7 @@ mod tests {
         .command();
         let rendered = command.join(" ");
         for required in [
+            "--pull=never",
             "--network=none",
             "--read-only",
             "--cap-drop=ALL",
