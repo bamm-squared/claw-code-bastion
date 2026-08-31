@@ -1,11 +1,13 @@
 use std::env;
 use std::path::PathBuf;
 
-use agent_bench::{compare_files, load_tasks, run_mock, write_jsonl, BenchmarkConfig};
+use agent_bench::{
+    compare_files, load_tasks, run_mock, run_production, write_jsonl, BenchmarkConfig,
+};
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  agent-bench run --tasks PATH --output PATH [--models PATH] [--model ALIAS] [--repetitions N]\n  agent-bench compare BASELINE.jsonl CURRENT.jsonl"
+        "usage:\n  agent-bench run --tasks PATH --output PATH [--models PATH] [--model ALIAS] [--repetitions N] [--execution mock|production] [--binary PATH] [--runtime-image REF]\n  agent-bench compare BASELINE.jsonl CURRENT.jsonl"
     );
     std::process::exit(2);
 }
@@ -27,6 +29,9 @@ fn main() {
             let repetitions = value(&args, "--repetitions")
                 .and_then(|value| value.parse::<u32>().ok())
                 .unwrap_or(1);
+            let execution = value(&args, "--execution").unwrap_or_else(|| "mock".to_string());
+            let binary = value(&args, "--binary").map(PathBuf::from);
+            let runtime_image = value(&args, "--runtime-image");
             if repetitions == 0 {
                 eprintln!("--repetitions must be positive");
                 std::process::exit(2);
@@ -40,11 +45,25 @@ fn main() {
                     eprintln!("failed to load model profiles: {error}");
                     std::process::exit(1);
                 });
-            let records =
-                run_mock(&tasks, &config, &model_alias, repetitions).unwrap_or_else(|error| {
-                    eprintln!("benchmark failed: {error}");
-                    std::process::exit(1);
-                });
+            let records = match execution.as_str() {
+                "mock" => run_mock(&tasks, &config, &model_alias, repetitions),
+                "production" => run_production(
+                    &tasks,
+                    &config,
+                    (!model_alias.is_empty()).then_some(model_alias.as_str()),
+                    repetitions,
+                    binary.as_deref(),
+                    runtime_image.as_deref(),
+                ),
+                other => {
+                    eprintln!("--execution must be mock or production, got {other:?}");
+                    std::process::exit(2);
+                }
+            }
+            .unwrap_or_else(|error| {
+                eprintln!("benchmark failed: {error}");
+                std::process::exit(1);
+            });
             write_jsonl(&output_path, &records).unwrap_or_else(|error| {
                 eprintln!("failed to write benchmark output: {error}");
                 std::process::exit(1);

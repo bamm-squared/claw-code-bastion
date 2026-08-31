@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -233,6 +234,12 @@ pub struct BenchmarkRecord {
     pub validation_duration_ms: u128,
     pub hidden_oracle_checked_outside_workspace: bool,
     pub mock_execution: bool,
+    #[serde(default)]
+    pub execution: String,
+    #[serde(default)]
+    pub runtime_image: Option<String>,
+    #[serde(default)]
+    pub isolated_execution: Option<bool>,
 }
 
 struct ScriptedApi {
@@ -398,6 +405,189 @@ pub fn run_mock(
     Ok(records)
 }
 
+/// Run the actual packaged/current `claw` CLI through its normal isolated
+/// execution path. This adapter is intentionally opt-in and refuses the
+/// deterministic mock profile so mock records cannot be mistaken for a
+/// production baseline.
+pub fn run_production(
+    tasks: &[BenchmarkTask],
+    config: &BenchmarkConfig,
+    model_alias: Option<&str>,
+    repetitions: u32,
+    binary: Option<&Path>,
+    runtime_image: Option<&str>,
+) -> Result<Vec<BenchmarkRecord>, String> {
+    let profile = select_production_profile(config, model_alias)?.clone();
+    let binary = binary
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("CLAW_BENCH_BINARY").map(PathBuf::from))
+        .ok_or_else(|| {
+            "production execution requires --binary PATH or CLAW_BENCH_BINARY".to_string()
+        })?;
+    let runtime_image = runtime_image
+        .map(str::to_string)
+        .or_else(|| std::env::var("CLAW_WORKER_IMAGE").ok())
+        .ok_or_else(|| {
+            "production execution requires --runtime-image REF or CLAW_WORKER_IMAGE".to_string()
+        })?;
+    if !profile.authorized {
+        return Err(format!(
+            "model profile {:?} is not benchmark-authorized; set authorized: true only after explicit operator approval",
+            profile.alias
+        ));
+    }
+    let mut records = Vec::new();
+    for repetition in 1..=repetitions {
+        for task in tasks {
+            records.push(run_production_one(
+                task,
+                &profile,
+                repetition,
+                &binary,
+                &runtime_image,
+            )?);
+        }
+    }
+    Ok(records)
+}
+
+fn select_production_profile<'a>(
+    config: &'a BenchmarkConfig,
+    model_alias: Option<&str>,
+) -> Result<&'a ModelProfile, String> {
+    if let Some(alias) = model_alias.filter(|alias| *alias != "local-mock") {
+        return config.profile(alias);
+    }
+    let candidates = config
+        .models
+        .iter()
+        .filter(|profile| profile.authorized && profile.provider_profile != "deterministic-mock")
+        .collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [profile] => Ok(profile),
+        [] => Err(
+            "no explicitly authorized real/local model profile is configured; add one to the models file with authorized: true, then rerun with --execution production --model ALIAS".to_string(),
+        ),
+        _ => candidates
+            .iter()
+            .find(|profile| profile.local)
+            .copied()
+            .or_else(|| candidates.first().copied())
+            .ok_or_else(|| "unable to select an authorized production profile".to_string()),
+    }
+}
+
+fn run_production_one(
+    task: &BenchmarkTask,
+    profile: &ModelProfile,
+    repetition: u32,
+    binary: &Path,
+    runtime_image: &str,
+) -> Result<BenchmarkRecord, String> {
+    let started_at = epoch_ms();
+    let wall = Instant::now();
+    let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let root = temp.path().join("project");
+    let home = temp.path().join("home");
+    let config = temp.path().join("config");
+    let cache = temp.path().join("cache");
+    let state = temp.path().join("state");
+    for directory in [&root, &home, &config, &cache, &state] {
+        fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    }
+    for (path, content) in &task.fixture.files {
+        let destination = root.join(path);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        fs::write(destination, content).map_err(|error| error.to_string())?;
+    }
+    let output = Command::new(binary)
+        .current_dir(&root)
+        .args([
+            "--model",
+            &profile.model,
+            "--permission-mode",
+            "workspace-write",
+            "--print",
+            "-p",
+            &task.prompt,
+        ])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config)
+        .env("XDG_CACHE_HOME", &cache)
+        .env("XDG_STATE_HOME", &state)
+        .env("CLAW_CONFIG_HOME", &config)
+        .env("CLAW_WORKER_IMAGE", runtime_image)
+        .env("CLAW_VALIDATOR_IMAGE", runtime_image)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("production CLI failed to start: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "production task {} exited with {}; stderr: {}",
+            task.id,
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+                .chars()
+                .take(4_000)
+                .collect::<String>()
+        ));
+    }
+    let oracle_ok = evaluate_oracle(&root, task)?;
+    let candidate = candidate_metrics(&root, task);
+    Ok(BenchmarkRecord {
+        benchmark_schema_version: BENCHMARK_SCHEMA_VERSION,
+        task_corpus_version: task.version,
+        task_id: task.id.clone(),
+        category: task.category.clone(),
+        language: task.language.clone(),
+        model_alias: profile.alias.clone(),
+        provider: profile.provider_profile.clone(),
+        model: profile.model.clone(),
+        reasoning: profile.reasoning.clone(),
+        repetition,
+        started_at_ms: started_at,
+        finished_at_ms: epoch_ms(),
+        first_pass: if oracle_ok {
+            "FIRST_PASS_PASS"
+        } else {
+            "FIRST_PASS_FAIL"
+        }
+        .to_string(),
+        final_correctness: if oracle_ok { "PASS" } else { "FAIL" }.to_string(),
+        rework_cycles: 0,
+        usage: zero_usage(profile),
+        timing: TimingMetrics {
+            end_to_end_ms: wall.elapsed().as_millis(),
+            ..TimingMetrics::default()
+        },
+        activity: ActivityMetrics::default(),
+        context: ContextAttribution::default(),
+        candidate,
+        validation: "NOT_REPORTED".to_string(),
+        validation_duration_ms: 0,
+        hidden_oracle_checked_outside_workspace: true,
+        mock_execution: false,
+        execution: "production_cli".to_string(),
+        runtime_image: Some(runtime_image.to_string()),
+        isolated_execution: Some(true),
+    })
+}
+
+fn zero_usage(profile: &ModelProfile) -> UsageMetrics {
+    UsageMetrics {
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_input_tokens: 0,
+        cache_write_tokens: 0,
+        actual_input_cost_usd: 0.0 * profile.actual_input_usd_per_million,
+        actual_output_cost_usd: 0.0 * profile.actual_output_usd_per_million,
+        actual_cache_cost_usd: 0.0,
+        actual_total_cost_usd: 0.0,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_one(
     task: &BenchmarkTask,
@@ -526,6 +716,9 @@ fn run_one(
         validation_duration_ms: 0,
         hidden_oracle_checked_outside_workspace: true,
         mock_execution: true,
+        execution: "mock_runtime".to_string(),
+        runtime_image: None,
+        isolated_execution: Some(false),
     })
 }
 
@@ -770,5 +963,35 @@ mod tests {
         let project = dir.path().join("project");
         fs::create_dir(&project).unwrap();
         assert!(evaluate_oracle(&project, &task).unwrap());
+    }
+
+    #[test]
+    fn production_selection_excludes_mock_and_requires_authorization() {
+        let config = BenchmarkConfig::default();
+        let error = select_production_profile(&config, None).unwrap_err();
+        assert!(error.contains("no explicitly authorized real/local model profile"));
+    }
+
+    #[test]
+    fn production_profile_selection_prefers_the_single_authorized_profile() {
+        let config = BenchmarkConfig {
+            schema_version: BENCHMARK_SCHEMA_VERSION,
+            models: vec![ModelProfile {
+                alias: "local-real".into(),
+                provider_profile: "ollama".into(),
+                model: "qwen".into(),
+                reasoning: "not_applicable".into(),
+                authorized: true,
+                local: true,
+                actual_input_usd_per_million: 0.0,
+                actual_output_usd_per_million: 0.0,
+                cached_input_usd_per_million: 0.0,
+                cache_write_usd_per_million: 0.0,
+            }],
+        };
+        assert_eq!(
+            select_production_profile(&config, None).unwrap().alias,
+            "local-real"
+        );
     }
 }
