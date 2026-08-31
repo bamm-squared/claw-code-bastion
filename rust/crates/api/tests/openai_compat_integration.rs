@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::{Mutex as StdMutex, OnceLock};
 
@@ -159,6 +160,86 @@ async fn stream_message_preserves_generic_reasoning_before_text() {
             content_block: OutputContentBlock::Text { .. },
         })
     ));
+}
+
+#[tokio::test]
+async fn stream_message_accepts_reasoning_then_tool_call_without_text() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = [
+        json!({
+            "id": "chatcmpl_tool_reasoning",
+            "model": "qwen3.5:4b",
+            "choices": [{"delta": {"reasoning": "Think"}}]
+        }),
+        json!({
+            "id": "chatcmpl_tool_reasoning",
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "id": "call_1",
+                "function": {"name": "write_file", "arguments": "{\"path\":\"result.txt\""}
+            }]}}]
+        }),
+        json!({
+            "id": "chatcmpl_tool_reasoning",
+            "choices": [{
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "function": {"arguments": ":\"OK\"}"}
+                }]},
+                "finish_reason": "tool_calls"
+            }]
+        }),
+    ]
+    .into_iter()
+    .fold(String::new(), |mut sse, chunk| {
+        let _ = writeln!(sse, "data: {chunk}");
+        sse.push('\n');
+        sse
+    }) + "data: [DONE]\n\n";
+    let Some(server) = spawn_server(
+        state,
+        vec![http_response("200 OK", "text/event-stream", &sse)],
+    )
+    .await
+    else {
+        return;
+    };
+
+    let client = OpenAiCompatClient::new("ollama-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let mut stream = client
+        .stream_message(&sample_request(true))
+        .await
+        .expect("stream should start");
+    let mut events = Vec::new();
+    while let Some(event) = stream.next_event().await.expect("event should parse") {
+        events.push(event);
+    }
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            delta: ContentBlockDelta::ThinkingDelta { .. },
+            ..
+        })
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            delta: ContentBlockDelta::InputJsonDelta { partial_json },
+            ..
+        }) if partial_json.contains("OK")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        StreamEvent::MessageDelta(MessageDeltaEvent {
+            delta: api::MessageDelta {
+                stop_reason: Some(reason),
+                ..
+            },
+            ..
+        }) if reason == "tool_use"
+    )));
 }
 
 #[tokio::test]

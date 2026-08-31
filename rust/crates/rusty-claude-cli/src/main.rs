@@ -8679,6 +8679,18 @@ impl AnthropicRuntimeClient {
                             .and_then(|()| out.flush())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
                     }
+                    // Some OpenAI-compatible providers, including Ollama
+                    // thinking models, may terminate a tool turn without a
+                    // separate content-block stop event. The accumulated
+                    // tool call is still valid protocol state and must reach
+                    // the runtime instead of being mistaken for an empty
+                    // assistant response.
+                    if let Some((id, name, input)) = pending_tool.take() {
+                        if let Some(progress_reporter) = &self.progress_reporter {
+                            progress_reporter.mark_tool_phase(&name, &input);
+                        }
+                        events.push(AssistantEvent::ToolUse { id, name, input });
+                    }
                     events.push(AssistantEvent::MessageStop);
                 }
             }

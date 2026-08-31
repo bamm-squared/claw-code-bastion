@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -486,6 +487,7 @@ fn select_production_profile<'a>(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_production_one(
     task: &BenchmarkTask,
     profile: &ModelProfile,
@@ -501,6 +503,13 @@ fn run_production_one(
     let config = temp.path().join("config");
     let cache = temp.path().join("cache");
     let state = temp.path().join("state");
+    let podman_data_home = std::env::var_os("XDG_DATA_HOME").unwrap_or_else(|| {
+        std::env::var_os("HOME")
+            .map_or_else(|| PathBuf::from("/home"), PathBuf::from)
+            .join(".local")
+            .join("share")
+            .into_os_string()
+    });
     for directory in [&root, &home, &config, &cache, &state] {
         fs::create_dir_all(directory).map_err(|error| error.to_string())?;
     }
@@ -511,8 +520,16 @@ fn run_production_one(
         }
         fs::write(destination, content).map_err(|error| error.to_string())?;
     }
+    let git_status = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&root)
+        .status()
+        .map_err(|error| format!("benchmark git fixture failed to start: {error}"))?;
+    if !git_status.success() {
+        return Err("benchmark git fixture initialization failed".to_string());
+    }
     fs::write(
-        root.join(".claw.json"),
+        config.join("settings.json"),
         serde_json::to_vec(&json!({"model": profile.model})).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
@@ -532,6 +549,10 @@ fn run_production_one(
         .env("XDG_CACHE_HOME", &cache)
         .env("XDG_STATE_HOME", &state)
         .env("CLAW_CONFIG_HOME", &config)
+        // Rootless Podman stores images independently of Bastion's HOME.
+        // Preserve that storage location so the explicitly supplied runtime
+        // image resolves locally instead of triggering a registry pull.
+        .env("XDG_DATA_HOME", podman_data_home)
         .env("CLAW_WORKER_IMAGE", runtime_image)
         .env("CLAW_VALIDATOR_IMAGE", runtime_image)
         .stdin(Stdio::null())
@@ -554,7 +575,6 @@ fn run_production_one(
                 .take()
                 .ok_or_else(|| "production CLI stderr unavailable".to_string())?;
             let mut output = Vec::new();
-            use std::io::Read;
             stdout
                 .take(8 * 1024 * 1024)
                 .read_to_end(&mut output)
@@ -862,6 +882,9 @@ fn collect_files(
     for entry in fs::read_dir(current).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
         let path = entry.path();
+        if entry.file_name() == ".git" {
+            continue;
+        }
         if path.is_dir() {
             collect_files(root, &path, files)?;
         } else {
