@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "models": [
+    {
+      "alias": "local-mock",
+      "provider_profile": "deterministic-mock",
+      "model": "mock-agent-v1",
+      "reasoning": "not_applicable",
+      "authorized": true,
+      "local": true,
+      "actual_input_usd_per_million": 0.0,
+      "actual_output_usd_per_million": 0.0,
+      "cached_input_usd_per_million": 0.0,
+      "cache_write_usd_per_million": 0.0
+    }
+  ]
+}

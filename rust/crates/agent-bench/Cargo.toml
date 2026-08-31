@@ -1,0 +1,17 @@
+[package]
+name = "agent-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Deterministic benchmark harness for measuring the Bastion agent loop."
+
+[dependencies]
+runtime = { path = "../runtime" }
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+telemetry = { path = "../telemetry" }
+tempfile = "3"
+
+[lints]
+workspace = true
