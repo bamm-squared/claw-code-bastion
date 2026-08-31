@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use runtime::{
     ApiClient, ApiRequest, AssistantEvent, ConversationRuntime, PermissionMode, PermissionPolicy,
@@ -240,6 +240,10 @@ pub struct BenchmarkRecord {
     pub runtime_image: Option<String>,
     #[serde(default)]
     pub isolated_execution: Option<bool>,
+    #[serde(default)]
+    pub error_class: Option<String>,
+    #[serde(default)]
+    pub error_message: Option<String>,
 }
 
 struct ScriptedApi {
@@ -423,7 +427,9 @@ pub fn run_production(
         .or_else(|| std::env::var_os("CLAW_BENCH_BINARY").map(PathBuf::from))
         .ok_or_else(|| {
             "production execution requires --binary PATH or CLAW_BENCH_BINARY".to_string()
-        })?;
+        })?
+        .canonicalize()
+        .map_err(|error| format!("production benchmark binary is unavailable: {error}"))?;
     let runtime_image = runtime_image
         .map(str::to_string)
         .or_else(|| std::env::var("CLAW_WORKER_IMAGE").ok())
@@ -439,13 +445,16 @@ pub fn run_production(
     let mut records = Vec::new();
     for repetition in 1..=repetitions {
         for task in tasks {
-            records.push(run_production_one(
-                task,
-                &profile,
-                repetition,
-                &binary,
-                &runtime_image,
-            )?);
+            match run_production_one(task, &profile, repetition, &binary, &runtime_image) {
+                Ok(record) => records.push(record),
+                Err(error) => records.push(production_failure_record(
+                    task,
+                    &profile,
+                    repetition,
+                    &runtime_image,
+                    &error,
+                )),
+            }
         }
     }
     Ok(records)
@@ -502,7 +511,12 @@ fn run_production_one(
         }
         fs::write(destination, content).map_err(|error| error.to_string())?;
     }
-    let output = Command::new(binary)
+    fs::write(
+        root.join(".claw.json"),
+        serde_json::to_vec(&json!({"model": profile.model})).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let mut child = Command::new(binary)
         .current_dir(&root)
         .args([
             "--model",
@@ -521,8 +535,51 @@ fn run_production_one(
         .env("CLAW_WORKER_IMAGE", runtime_image)
         .env("CLAW_VALIDATOR_IMAGE", runtime_image)
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|error| format!("production CLI failed to start: {error}"))?;
+    let deadline = Instant::now() + Duration::from_secs(task.timeout_seconds);
+    let output = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("production CLI wait failed: {error}"))?
+        {
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| "production CLI stdout unavailable".to_string())?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| "production CLI stderr unavailable".to_string())?;
+            let mut output = Vec::new();
+            use std::io::Read;
+            stdout
+                .take(8 * 1024 * 1024)
+                .read_to_end(&mut output)
+                .map_err(|error| error.to_string())?;
+            let mut error_output = Vec::new();
+            stderr
+                .take(256 * 1024)
+                .read_to_end(&mut error_output)
+                .map_err(|error| error.to_string())?;
+            break std::process::Output {
+                status,
+                stdout: output,
+                stderr: error_output,
+            };
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "production task {} timed out after {} seconds",
+                task.id, task.timeout_seconds
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
     if !output.status.success() {
         return Err(format!(
             "production task {} exited with {}; stderr: {}",
@@ -572,7 +629,54 @@ fn run_production_one(
         execution: "production_cli".to_string(),
         runtime_image: Some(runtime_image.to_string()),
         isolated_execution: Some(true),
+        error_class: None,
+        error_message: None,
     })
+}
+
+fn production_failure_record(
+    task: &BenchmarkTask,
+    profile: &ModelProfile,
+    repetition: u32,
+    runtime_image: &str,
+    error: &str,
+) -> BenchmarkRecord {
+    let class = if error.contains("timed out") {
+        "timeout"
+    } else {
+        "agent_or_provider_failure"
+    };
+    BenchmarkRecord {
+        benchmark_schema_version: BENCHMARK_SCHEMA_VERSION,
+        task_corpus_version: task.version,
+        task_id: task.id.clone(),
+        category: task.category.clone(),
+        language: task.language.clone(),
+        model_alias: profile.alias.clone(),
+        provider: profile.provider_profile.clone(),
+        model: profile.model.clone(),
+        reasoning: profile.reasoning.clone(),
+        repetition,
+        started_at_ms: epoch_ms(),
+        finished_at_ms: epoch_ms(),
+        first_pass: "FIRST_PASS_FAIL".to_string(),
+        final_correctness: "FAIL".to_string(),
+        rework_cycles: 0,
+        usage: zero_usage(profile),
+        timing: TimingMetrics::default(),
+        activity: ActivityMetrics::default(),
+        context: ContextAttribution::default(),
+        candidate: CandidateMetrics::default(),
+        validation: "NOT_RUN".to_string(),
+        validation_duration_ms: 0,
+        hidden_oracle_checked_outside_workspace: true,
+        mock_execution: false,
+        execution: "production_cli".to_string(),
+        runtime_image: Some(runtime_image.to_string()),
+        isolated_execution: Some(true),
+        error_class: Some(class.to_string()),
+        error_message: Some(error.to_string()),
+    }
 }
 
 fn zero_usage(profile: &ModelProfile) -> UsageMetrics {
@@ -719,6 +823,8 @@ fn run_one(
         execution: "mock_runtime".to_string(),
         runtime_image: None,
         isolated_execution: Some(false),
+        error_class: None,
+        error_message: None,
     })
 }
 
