@@ -1622,7 +1622,138 @@ fn seed_ids(graph: &RepositoryGraph, task: &str) -> BTreeSet<String> {
             seeds.insert(node.id.clone());
         }
     }
+    if seeds.is_empty() {
+        seeds.extend(inferred_seed_ids(graph, task));
+    }
     seeds
+}
+
+const RELEVANCE_STOP_WORDS: &[&str] = &[
+    "a",
+    "an",
+    "and",
+    "are",
+    "assert",
+    "assertion",
+    "be",
+    "by",
+    "change",
+    "create",
+    "expected",
+    "exact",
+    "fixture",
+    "fix",
+    "for",
+    "from",
+    "in",
+    "is",
+    "it",
+    "make",
+    "must",
+    "of",
+    "on",
+    "or",
+    "output",
+    "preserve",
+    "required",
+    "result",
+    "safe",
+    "set",
+    "setting",
+    "should",
+    "task",
+    "test",
+    "the",
+    "this",
+    "through",
+    "to",
+    "update",
+    "value",
+    "with",
+    "without",
+    "add",
+];
+
+fn relevance_terms(task: &str) -> BTreeSet<String> {
+    task_tokens(task)
+        .flat_map(|token| token.split(|character: char| !character.is_ascii_alphanumeric()))
+        .map(str::to_ascii_lowercase)
+        .filter(|term| term.len() >= 3 && !RELEVANCE_STOP_WORDS.contains(&term.as_str()))
+        .collect()
+}
+
+fn label_terms(label: &str) -> impl Iterator<Item = String> + '_ {
+    label
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+fn lexical_match_score(task_term: &str, label_term: &str) -> usize {
+    if task_term == label_term {
+        return 4;
+    }
+    let common_prefix = task_term
+        .chars()
+        .zip(label_term.chars())
+        .take_while(|(left, right)| left == right)
+        .count();
+    if common_prefix >= 4
+        && (task_term.starts_with(label_term) || label_term.starts_with(task_term))
+    {
+        3
+    } else {
+        0
+    }
+}
+
+fn inferred_seed_ids(graph: &RepositoryGraph, task: &str) -> BTreeSet<String> {
+    let terms = relevance_terms(task);
+    if terms.is_empty() {
+        return BTreeSet::new();
+    }
+
+    let mut candidates: BTreeMap<String, usize> = BTreeMap::new();
+    for path in graph.facts.keys() {
+        let score = terms
+            .iter()
+            .map(|term| {
+                label_terms(path)
+                    .map(|label| lexical_match_score(term, &label))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .sum();
+        if score >= 3 {
+            candidates.insert(format!("file:{path}"), score);
+        }
+    }
+    for node in graph
+        .nodes
+        .values()
+        .filter(|node| node.kind == NodeKind::Symbol)
+    {
+        let score = terms
+            .iter()
+            .map(|term| {
+                label_terms(&node.label)
+                    .map(|label| lexical_match_score(term, &label))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .sum();
+        if score >= 4 {
+            candidates.insert(node.id.clone(), score);
+        }
+    }
+
+    let best_score = candidates.values().copied().max().unwrap_or(0);
+    candidates
+        .into_iter()
+        .filter(|(_, score)| *score == best_score)
+        .take(8)
+        .map(|(id, _)| id)
+        .collect()
 }
 
 #[must_use]
@@ -2010,6 +2141,7 @@ mod tests {
             "use crate::util::target; fn main() { target(); }",
         )
         .unwrap();
+        fs::write(dir.join("src/parser.rs"), "pub fn parse() {}\n").unwrap();
         fs::write(dir.join("src/util.rs"), "pub fn target() {}").unwrap();
         fs::write(dir.join("src/other.rs"), "pub fn target() {}").unwrap();
         let built = RepositoryIndex::build(&dir, None, AnalysisConfig::default(), true).unwrap();
@@ -2111,6 +2243,27 @@ mod tests {
         let fallback = context_for_task(&output.graph, "change the behavior", 16, 4096);
         assert!(fallback.seeds.is_empty());
         assert!(fallback.text.contains("use source/retrieval tools"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn broker_infers_specific_path_terms_without_broad_common_word_matches() {
+        let dir = std::env::temp_dir().join(format!("ri-relevance-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/config.rs"), "pub fn load_config() {}\n").unwrap();
+        fs::write(dir.join("src/parser.rs"), "pub fn parse() {}\n").unwrap();
+        let output = RepositoryIndex::build(&dir, None, AnalysisConfig::default(), true).unwrap();
+
+        let inferred = context_for_task(&output.graph, "fix parser behavior", 8, 4096);
+        assert_eq!(inferred.seeds, vec!["file:src/parser.rs"]);
+        assert!(inferred.text.contains("file: src/parser.rs"));
+        let configuration = context_for_task(&output.graph, "thread configuration", 8, 4096);
+        assert!(configuration
+            .seeds
+            .contains(&"file:src/config.rs".to_string()));
+        let generic = context_for_task(&output.graph, "update the behavior", 8, 4096);
+        assert!(generic.seeds.is_empty());
         let _ = fs::remove_dir_all(dir);
     }
 
