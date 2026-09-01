@@ -14,6 +14,11 @@ pub struct Snapshot {
     pub tool_bearing_turns: u64,
     pub tool_calls: BTreeMap<String, u64>,
     pub model_request_bytes: u64,
+    pub repository_intelligence_context_used: bool,
+    pub repository_intelligence_context_bytes: u64,
+    pub repository_intelligence_nodes_used: u64,
+    pub repository_intelligence_edges_used: u64,
+    pub impact_query_count: u64,
     pub total_file_reads: u64,
     pub unique_files_read: u64,
     pub repeated_file_reads: u64,
@@ -115,6 +120,25 @@ pub fn usage(input: u64, output: u64, cache_read: u64, cache_write: u64) {
 pub fn model_request_bytes(bytes: u64) {
     with_state(|s| {
         s.snapshot.model_request_bytes = s.snapshot.model_request_bytes.saturating_add(bytes);
+    });
+}
+
+pub fn repository_intelligence_context(bytes: u64, nodes: usize, edges: usize) {
+    with_state(|s| {
+        s.snapshot.repository_intelligence_context_used = true;
+        s.snapshot.repository_intelligence_context_bytes = s
+            .snapshot
+            .repository_intelligence_context_bytes
+            .saturating_add(bytes);
+        s.snapshot.repository_intelligence_nodes_used = s
+            .snapshot
+            .repository_intelligence_nodes_used
+            .saturating_add(nodes as u64);
+        s.snapshot.repository_intelligence_edges_used = s
+            .snapshot
+            .repository_intelligence_edges_used
+            .saturating_add(edges as u64);
+        s.snapshot.impact_query_count = s.snapshot.impact_query_count.saturating_add(1);
     });
 }
 

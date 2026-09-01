@@ -554,6 +554,9 @@ fn run_production_one(
         .env("XDG_STATE_HOME", &state)
         .env("CLAW_CONFIG_HOME", &config)
         .env("CLAW_BENCH_TELEMETRY", &telemetry)
+        // Headless Claw treats a local OpenAI-compatible provider as
+        // configured only when its explicit Ollama endpoint is present.
+        .env("OLLAMA_HOST", "http://127.0.0.1:11434")
         // Rootless Podman stores images independently of Bastion's HOME.
         // Preserve that storage location so the explicitly supplied runtime
         // image resolves locally instead of triggering a registry pull.

@@ -47,7 +47,9 @@ use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{sanitize_terminal_text, MarkdownStreamState, Spinner, TerminalRenderer};
-use repository_intelligence::{context_for_task, AnalysisConfig, RepositoryIndex};
+use repository_intelligence::{
+    context_for_task, AnalysisConfig, ContextSelection, RepositoryIndex,
+};
 use runtime::{
     check_base_commit, create_disposable_snapshot, format_stale_base_warning, format_usd,
     load_oauth_credentials, load_system_prompt, pricing_for_model, render_change_summary,
@@ -4772,8 +4774,13 @@ impl LiveCli {
             None,
             retained_backend,
         )?;
-        let runtime = if let Some(context) = repository_context {
-            runtime.with_repository_context(context)
+        let runtime = if let Some(selection) = repository_context {
+            benchmark_telemetry::repository_intelligence_context(
+                selection.text.len() as u64,
+                selection.selected_nodes,
+                selection.considered_edges,
+            );
+            runtime.with_repository_context(selection.text)
         } else {
             runtime
         }
@@ -6070,7 +6077,7 @@ impl LiveCli {
 fn build_repository_context(
     task: &str,
     retained_backend: Option<&Arc<Mutex<dyn ExecutionBackend>>>,
-) -> Option<String> {
+) -> Option<ContextSelection> {
     let root = env::current_dir().ok()?;
     let private = is_private_mode();
     let built = RepositoryIndex::build(&root, None, AnalysisConfig::default(), private).ok()?;
@@ -6087,7 +6094,7 @@ fn build_repository_context(
         let _ = index.refresh_candidate(&candidate_root);
     }
     let selection = context_for_task(index.active_graph()?, task, 48, 16 * 1024);
-    (!selection.seeds.is_empty()).then_some(selection.text)
+    (!selection.seeds.is_empty()).then_some(selection)
 }
 
 fn attachment_image_block(attachment: &attachments::TaskAttachment) -> Option<ContentBlock> {
