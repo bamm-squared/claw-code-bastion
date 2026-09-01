@@ -161,6 +161,7 @@ pub struct ConversationRuntime<C, T> {
     tool_executor: T,
     permission_policy: PermissionPolicy,
     system_prompt: Vec<String>,
+    repository_context: Option<String>,
     max_iterations: usize,
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
@@ -210,6 +211,7 @@ where
             tool_executor,
             permission_policy,
             system_prompt,
+            repository_context: None,
             max_iterations: usize::MAX,
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
@@ -259,6 +261,12 @@ where
     #[must_use]
     pub fn with_session_tracer(mut self, session_tracer: SessionTracer) -> Self {
         self.session_tracer = Some(session_tracer);
+        self
+    }
+
+    #[must_use]
+    pub fn with_repository_context(mut self, context: impl Into<String>) -> Self {
+        self.repository_context = Some(context.into());
         self
     }
 
@@ -406,8 +414,12 @@ where
                 return Err(error);
             }
 
+            let mut system_prompt = self.system_prompt.clone();
+            if let Some(context) = &self.repository_context {
+                system_prompt.push(context.clone());
+            }
             let request = ApiRequest {
-                system_prompt: self.system_prompt.clone(),
+                system_prompt,
                 messages: self.session.messages.clone(),
             };
             let events = match self.api_client.stream(request) {

@@ -1573,6 +1573,209 @@ fn pack_provenance(pack: &FileFactPack) -> Provenance {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ImpactItem {
+    pub subject: String,
+    pub relationship: String,
+    pub evidence: Evidence,
+    pub provenance: Provenance,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ImpactResult {
+    pub items: Vec<ImpactItem>,
+    pub considered_nodes: usize,
+    pub elapsed_ms: u128,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContextSelection {
+    pub text: String,
+    pub seeds: Vec<String>,
+    pub selected_files: Vec<String>,
+    pub selected_nodes: usize,
+    pub considered_edges: usize,
+    pub elapsed_ms: u128,
+}
+
+fn task_tokens(task: &str) -> impl Iterator<Item = &str> {
+    task.split(|character: char| {
+        !(character.is_ascii_alphanumeric() || matches!(character, '_' | '/' | '.' | '-'))
+    })
+    .filter(|token| !token.is_empty())
+}
+
+fn file_from_node(graph: &RepositoryGraph, node_id: &str) -> Option<String> {
+    if let Some(path) = node_id.strip_prefix("file:") {
+        return graph.facts.contains_key(path).then(|| path.to_string());
+    }
+    graph.file_defining_node(node_id).map(str::to_string)
+}
+
+fn seed_ids(graph: &RepositoryGraph, task: &str) -> BTreeSet<String> {
+    let mut seeds = BTreeSet::new();
+    for token in task_tokens(task) {
+        if graph.facts.contains_key(token) {
+            seeds.insert(format!("file:{token}"));
+        }
+        for node in graph.find_symbols_exact(token) {
+            seeds.insert(node.id.clone());
+        }
+    }
+    seeds
+}
+
+#[must_use]
+pub fn impact_analysis(
+    graph: &RepositoryGraph,
+    seeds: &[String],
+    max_nodes: usize,
+) -> ImpactResult {
+    let started = Instant::now();
+    let mut frontier = seeds.to_vec();
+    let mut seen = BTreeSet::new();
+    let mut items = Vec::new();
+    while let Some(current) = frontier.pop() {
+        if !seen.insert(current.clone()) || seen.len() > max_nodes {
+            continue;
+        }
+        for edge in graph
+            .outgoing(&current)
+            .into_iter()
+            .chain(graph.incoming(&current))
+        {
+            if !matches!(
+                edge.kind.as_str(),
+                "REFERENCES" | "DEPENDS_ON" | "BELONGS_TO"
+            ) {
+                continue;
+            }
+            let related = if edge.source == current {
+                &edge.target
+            } else {
+                &edge.source
+            };
+            let Some(node) = graph.node(related) else {
+                continue;
+            };
+            items.push(ImpactItem {
+                subject: node.label.clone(),
+                relationship: edge.kind.clone(),
+                evidence: edge.provenance.evidence,
+                provenance: edge.provenance.clone(),
+            });
+            if seen.len() < max_nodes {
+                frontier.push(related.clone());
+            }
+        }
+    }
+    items.sort_by(|a, b| (&a.relationship, &a.subject).cmp(&(&b.relationship, &b.subject)));
+    items.dedup();
+    ImpactResult {
+        items,
+        considered_nodes: seen.len(),
+        elapsed_ms: started.elapsed().as_millis(),
+    }
+}
+
+#[must_use]
+pub fn context_for_task(
+    graph: &RepositoryGraph,
+    task: &str,
+    max_nodes: usize,
+    max_bytes: usize,
+) -> ContextSelection {
+    let started = Instant::now();
+    let seed_set = seed_ids(graph, task);
+    let seeds = seed_set.iter().cloned().collect::<Vec<_>>();
+    let impact = impact_analysis(graph, &seeds, max_nodes);
+    let mut files = BTreeSet::new();
+    for seed in &seeds {
+        if let Some(file) = file_from_node(graph, seed) {
+            files.insert(file);
+        }
+    }
+    for item in &impact.items {
+        for node in graph
+            .nodes
+            .values()
+            .filter(|node| node.label == item.subject)
+        {
+            if let Some(file) = file_from_node(graph, &node.id) {
+                files.insert(file);
+            }
+        }
+    }
+    let mut text = String::from("[Deterministic repository intelligence]\n");
+    if seeds.is_empty() {
+        text.push_str("No exact graph seed matched; use source/retrieval tools for discovery.\n");
+    }
+    for file in &files {
+        let Some(pack) = graph.file_facts(file) else {
+            continue;
+        };
+        let _ = std::fmt::Write::write_fmt(&mut text, format_args!("\nfile: {file}\n"));
+        let packages = graph
+            .incoming(&format!("file:{file}"))
+            .into_iter()
+            .filter(|edge| edge.kind == "BELONGS_TO")
+            .filter_map(|edge| graph.node(&edge.target).map(|node| node.label.clone()))
+            .collect::<Vec<_>>();
+        if !packages.is_empty() {
+            let _ = std::fmt::Write::write_fmt(
+                &mut text,
+                format_args!("package: {}\n", packages.join(", ")),
+            );
+        }
+        let definitions = pack
+            .symbols
+            .iter()
+            .map(|symbol| symbol.qualified_name.as_str())
+            .collect::<Vec<_>>();
+        if !definitions.is_empty() {
+            let _ = std::fmt::Write::write_fmt(
+                &mut text,
+                format_args!("defines: {}\n", definitions.join(", ")),
+            );
+        }
+        let imports = pack
+            .imports
+            .iter()
+            .map(|import| import.target.as_str())
+            .collect::<Vec<_>>();
+        if !imports.is_empty() {
+            let _ = std::fmt::Write::write_fmt(
+                &mut text,
+                format_args!("imports: {}\n", imports.join(", ")),
+            );
+        }
+        let references = graph
+            .outgoing(&format!("file:{file}"))
+            .into_iter()
+            .filter(|edge| edge.kind == "REFERENCES")
+            .filter_map(|edge| graph.file_defining_node(&edge.target))
+            .collect::<Vec<_>>();
+        if !references.is_empty() {
+            let _ = std::fmt::Write::write_fmt(
+                &mut text,
+                format_args!("references: {}\n", references.join(", ")),
+            );
+        }
+    }
+    if text.len() > max_bytes {
+        text.truncate(max_bytes);
+        text.push_str("\n[repository intelligence truncated; inspect exact source]\n");
+    }
+    ContextSelection {
+        text,
+        seeds,
+        selected_files: files.into_iter().collect(),
+        selected_nodes: impact.considered_nodes,
+        considered_edges: impact.items.len(),
+        elapsed_ms: started.elapsed().as_millis(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1880,6 +2083,48 @@ mod tests {
             .iter()
             .any(|edge| edge.kind == "DEPENDS_ON"
                 && edge.target == "package:crates/core/Cargo.toml:core"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn broker_formats_seeded_context_and_impact_without_graph_dump() {
+        let dir = std::env::temp_dir().join(format!("ri-broker-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("src/main.rs"),
+            "use crate::util::target; fn main() { target(); }",
+        )
+        .unwrap();
+        fs::write(dir.join("src/util.rs"), "pub fn target() {}").unwrap();
+        let output = RepositoryIndex::build(&dir, None, AnalysisConfig::default(), true).unwrap();
+        let selection = context_for_task(&output.graph, "update src/main.rs", 16, 4096);
+        assert_eq!(selection.seeds, vec!["file:src/main.rs"]);
+        assert!(selection.text.contains("file: src/main.rs"));
+        assert!(selection.text.contains("references: src/util.rs"));
+        assert!(selection.text.len() <= 4096);
+        let impact = impact_analysis(&output.graph, &selection.seeds, 16);
+        assert!(impact
+            .items
+            .iter()
+            .any(|item| { item.relationship == "REFERENCES" && item.subject == "target" }));
+        let fallback = context_for_task(&output.graph, "change the behavior", 16, 4096);
+        assert!(fallback.seeds.is_empty());
+        assert!(fallback.text.contains("use source/retrieval tools"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn broker_keeps_ambiguous_exact_symbol_seeds_bounded() {
+        let dir = std::env::temp_dir().join(format!("ri-ambiguous-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/one.rs"), "pub fn same() {}").unwrap();
+        fs::write(dir.join("src/two.rs"), "pub fn same() {}").unwrap();
+        let output = RepositoryIndex::build(&dir, None, AnalysisConfig::default(), true).unwrap();
+        let selection = context_for_task(&output.graph, "inspect same", 8, 4096);
+        assert_eq!(selection.seeds.len(), 2);
+        assert_eq!(selection.selected_files.len(), 2);
         let _ = fs::remove_dir_all(dir);
     }
 }

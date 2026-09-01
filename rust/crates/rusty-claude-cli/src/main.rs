@@ -47,6 +47,7 @@ use compat_harness::{extract_manifest, UpstreamPaths};
 use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{sanitize_terminal_text, MarkdownStreamState, Spinner, TerminalRenderer};
+use repository_intelligence::{context_for_task, AnalysisConfig, RepositoryIndex};
 use runtime::{
     check_base_commit, create_disposable_snapshot, format_stale_base_warning, format_usd,
     load_oauth_credentials, load_system_prompt, pricing_for_model, render_change_summary,
@@ -3776,6 +3777,15 @@ impl BuiltRuntime {
         self
     }
 
+    fn with_repository_context(mut self, context: String) -> Self {
+        let runtime = self
+            .runtime
+            .take()
+            .expect("runtime should exist before repository context");
+        self.runtime = Some(runtime.with_repository_context(context));
+        self
+    }
+
     fn shutdown_plugins(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.plugins_active {
             self.plugin_registry.shutdown()?;
@@ -4734,6 +4744,7 @@ impl LiveCli {
     fn prepare_turn_runtime(
         &self,
         emit_output: bool,
+        task_input: &str,
     ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
         let retained_backend = if self.candidate_state.reuses_candidate() {
             self.runtime.execution_backend()
@@ -4748,6 +4759,7 @@ impl LiveCli {
                 .map_err(std::io::Error::other)?;
         }
         let hook_abort_signal = runtime::HookAbortSignal::new();
+        let repository_context = build_repository_context(task_input, retained_backend.as_ref());
         let runtime = build_runtime_with_backend(
             self.runtime.session().clone(),
             &self.session.id,
@@ -4759,7 +4771,12 @@ impl LiveCli {
             self.permission_mode,
             None,
             retained_backend,
-        )?
+        )?;
+        let runtime = if let Some(context) = repository_context {
+            runtime.with_repository_context(context)
+        } else {
+            runtime
+        }
         .with_hook_abort_signal(hook_abort_signal.clone());
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
 
@@ -4785,7 +4802,7 @@ impl LiveCli {
                 }
             }
         }
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true, input)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         let hud = trusted_hud_line(
@@ -4886,7 +4903,7 @@ impl LiveCli {
     }
 
     fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false, input)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
@@ -4907,7 +4924,7 @@ impl LiveCli {
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false, input)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
@@ -6048,6 +6065,29 @@ impl LiveCli {
         println!("{}", format_issue_report(context));
         Ok(())
     }
+}
+
+fn build_repository_context(
+    task: &str,
+    retained_backend: Option<&Arc<Mutex<dyn ExecutionBackend>>>,
+) -> Option<String> {
+    let root = env::current_dir().ok()?;
+    let private = is_private_mode();
+    let built = RepositoryIndex::build(&root, None, AnalysisConfig::default(), private).ok()?;
+    let mut index = RepositoryIndex {
+        root: root.clone(),
+        canonical: built.graph,
+        candidate: None,
+        config: AnalysisConfig::default(),
+        private,
+    };
+    if let Some((_, candidate_root)) =
+        retained_backend.and_then(|backend| backend.lock().ok()?.candidate_review_roots())
+    {
+        let _ = index.refresh_candidate(&candidate_root);
+    }
+    let selection = context_for_task(index.active_graph()?, task, 48, 16 * 1024);
+    (!selection.seeds.is_empty()).then_some(selection.text)
 }
 
 fn attachment_image_block(attachment: &attachments::TaskAttachment) -> Option<ContentBlock> {
