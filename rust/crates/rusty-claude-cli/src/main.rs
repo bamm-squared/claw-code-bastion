@@ -6078,6 +6078,7 @@ fn build_repository_context(
     task: &str,
     retained_backend: Option<&Arc<Mutex<dyn ExecutionBackend>>>,
 ) -> Option<ContextSelection> {
+    benchmark_telemetry::repository_intelligence_attempted();
     let root = env::current_dir().ok()?;
     let private = is_private_mode();
     let built = RepositoryIndex::build(&root, None, AnalysisConfig::default(), private).ok()?;
@@ -6094,6 +6095,10 @@ fn build_repository_context(
         let _ = index.refresh_candidate(&candidate_root);
     }
     let selection = context_for_task(index.active_graph()?, task, 48, 16 * 1024);
+    benchmark_telemetry::repository_intelligence_selection(
+        selection.seeds.len(),
+        !selection.seeds.is_empty(),
+    );
     (!selection.seeds.is_empty()).then_some(selection)
 }
 

@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 use telemetry::{MemoryTelemetrySink, SessionTracer, TelemetryEvent};
 
 pub const BENCHMARK_SCHEMA_VERSION: u32 = 1;
+const PARTIAL_TELEMETRY_MARKER: &str = "\n__CLAW_BENCH_PARTIAL_TELEMETRY__";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkTask {
@@ -601,22 +602,28 @@ fn run_production_one(
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(format!(
-                "production task {} timed out after {} seconds",
-                task.id, task.timeout_seconds
+            return Err(with_partial_telemetry(
+                &format!(
+                    "production task {} timed out after {} seconds",
+                    task.id, task.timeout_seconds
+                ),
+                &telemetry,
             ));
         }
         std::thread::sleep(Duration::from_millis(25));
     };
     if !output.status.success() {
-        return Err(format!(
-            "production task {} exited with {}; stderr: {}",
-            task.id,
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-                .chars()
-                .take(4_000)
-                .collect::<String>()
+        return Err(with_partial_telemetry(
+            &format!(
+                "production task {} exited with {}; stderr: {}",
+                task.id,
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+                    .chars()
+                    .take(4_000)
+                    .collect::<String>()
+            ),
+            &telemetry,
         ));
     }
     let oracle_ok = evaluate_oracle(&root, task)?;
@@ -673,6 +680,7 @@ fn production_failure_record(
     runtime_image: &str,
     error: &str,
 ) -> BenchmarkRecord {
+    let (error_message, production_telemetry) = split_partial_telemetry(error);
     let class = if error.contains("timed out") {
         "timeout"
     } else {
@@ -707,9 +715,29 @@ fn production_failure_record(
         runtime_image: Some(runtime_image.to_string()),
         isolated_execution: Some(true),
         error_class: Some(class.to_string()),
-        error_message: Some(error.to_string()),
-        production_telemetry: None,
+        error_message: Some(error_message),
+        production_telemetry,
     }
+}
+
+fn with_partial_telemetry(message: &str, path: &Path) -> String {
+    let Some(text) = fs::read_to_string(path).ok() else {
+        return message.to_string();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return message.to_string();
+    };
+    format!("{message}{PARTIAL_TELEMETRY_MARKER}{value}")
+}
+
+fn split_partial_telemetry(error: &str) -> (String, Option<Value>) {
+    let Some((message, telemetry)) = error.split_once(PARTIAL_TELEMETRY_MARKER) else {
+        return (error.to_string(), None);
+    };
+    (
+        message.to_string(),
+        serde_json::from_str::<Value>(telemetry).ok(),
+    )
 }
 
 fn zero_usage(profile: &ModelProfile) -> UsageMetrics {
@@ -1265,5 +1293,24 @@ mod tests {
             select_production_profile(&config, None).unwrap().alias,
             "local-real"
         );
+    }
+
+    #[test]
+    fn partial_telemetry_is_recovered_without_leaking_marker_into_error() {
+        let error = with_partial_telemetry(
+            "production task timed out",
+            Path::new("/definitely/missing/telemetry.json"),
+        );
+        assert_eq!(split_partial_telemetry(&error), (error, None));
+
+        let value = json!({
+            "repository_intelligence_attempted": true,
+            "repository_intelligence_seed_count": 2,
+            "repository_intelligence_context_used": true
+        });
+        let encoded = format!("failure{PARTIAL_TELEMETRY_MARKER}{value}");
+        let (message, telemetry) = split_partial_telemetry(&encoded);
+        assert_eq!(message, "failure");
+        assert_eq!(telemetry, Some(value));
     }
 }

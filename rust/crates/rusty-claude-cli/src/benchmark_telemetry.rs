@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Serialize, Default)]
+#[derive(Clone, Debug, Serialize, Default)]
 pub struct Snapshot {
     pub schema_version: u32,
     pub run_id: String,
@@ -14,8 +14,10 @@ pub struct Snapshot {
     pub tool_bearing_turns: u64,
     pub tool_calls: BTreeMap<String, u64>,
     pub model_request_bytes: u64,
-    pub repository_intelligence_context_used: bool,
-    pub repository_intelligence_context_bytes: u64,
+    pub repository_intelligence_attempted: Option<bool>,
+    pub repository_intelligence_seed_count: Option<u64>,
+    pub repository_intelligence_context_used: Option<bool>,
+    pub repository_intelligence_context_bytes: Option<u64>,
     pub repository_intelligence_nodes_used: u64,
     pub repository_intelligence_edges_used: u64,
     pub impact_query_count: u64,
@@ -123,13 +125,33 @@ pub fn model_request_bytes(bytes: u64) {
     });
 }
 
+pub fn repository_intelligence_attempted() {
+    with_state(|s| s.snapshot.repository_intelligence_attempted = Some(true));
+    persist_snapshot();
+}
+
+pub fn repository_intelligence_selection(seed_count: usize, injected: bool) {
+    with_state(|s| {
+        s.snapshot.repository_intelligence_attempted = Some(true);
+        s.snapshot.repository_intelligence_seed_count = Some(seed_count as u64);
+        s.snapshot.repository_intelligence_context_used = Some(injected);
+        if !injected {
+            s.snapshot.repository_intelligence_context_bytes = Some(0);
+        }
+    });
+    persist_snapshot();
+}
+
 pub fn repository_intelligence_context(bytes: u64, nodes: usize, edges: usize) {
     with_state(|s| {
-        s.snapshot.repository_intelligence_context_used = true;
-        s.snapshot.repository_intelligence_context_bytes = s
-            .snapshot
-            .repository_intelligence_context_bytes
-            .saturating_add(bytes);
+        s.snapshot.repository_intelligence_attempted = Some(true);
+        s.snapshot.repository_intelligence_context_used = Some(true);
+        s.snapshot.repository_intelligence_context_bytes = Some(
+            s.snapshot
+                .repository_intelligence_context_bytes
+                .unwrap_or(0)
+                .saturating_add(bytes),
+        );
         s.snapshot.repository_intelligence_nodes_used = s
             .snapshot
             .repository_intelligence_nodes_used
@@ -140,6 +162,7 @@ pub fn repository_intelligence_context(bytes: u64, nodes: usize, edges: usize) {
             .saturating_add(edges as u64);
         s.snapshot.impact_query_count = s.snapshot.impact_query_count.saturating_add(1);
     });
+    persist_snapshot();
 }
 
 fn add_usage(slot: &mut Option<u64>, value: u64) {
@@ -230,12 +253,24 @@ pub fn flush(status: &str) {
     };
     state.snapshot.elapsed_ms = state.started.elapsed().as_millis();
     state.snapshot.terminal_status = status.into();
-    let Ok(bytes) = serde_json::to_vec_pretty(&state.snapshot) else {
+    write_snapshot(&state.path, &state.snapshot);
+}
+
+fn persist_snapshot() {
+    with_state(|state| write_snapshot(&state.path, &state.snapshot));
+}
+
+fn write_snapshot(path: &PathBuf, snapshot: &Snapshot) {
+    let mut persisted = snapshot.clone();
+    if persisted.terminal_status.is_empty() {
+        persisted.terminal_status = "in_progress".into();
+    }
+    let Ok(bytes) = serde_json::to_vec_pretty(&persisted) else {
         return;
     };
-    let temporary = state.path.with_extension("tmp");
+    let temporary = path.with_extension("tmp");
     if fs::write(&temporary, bytes).is_ok() {
-        let _ = fs::rename(temporary, state.path);
+        let _ = fs::rename(temporary, path);
     }
 }
 
@@ -290,6 +325,25 @@ mod tests {
         assert_eq!(state.snapshot.repeated_file_reads, 1);
         assert_eq!(state.snapshot.grep_calls, 1);
         assert_eq!(state.snapshot.context_search_calls, 1);
+    }
+
+    #[test]
+    fn treatment_fields_distinguish_unreached_from_definitive_non_match() {
+        let mut state = state();
+        assert_eq!(state.snapshot.repository_intelligence_attempted, None);
+        assert_eq!(state.snapshot.repository_intelligence_context_used, None);
+        state.snapshot.repository_intelligence_attempted = Some(true);
+        state.snapshot.repository_intelligence_seed_count = Some(0);
+        state.snapshot.repository_intelligence_context_used = Some(false);
+        state.snapshot.repository_intelligence_context_bytes = Some(0);
+        assert_eq!(
+            state.snapshot.repository_intelligence_context_used,
+            Some(false)
+        );
+        assert_eq!(
+            state.snapshot.repository_intelligence_context_bytes,
+            Some(0)
+        );
     }
 
     #[test]
