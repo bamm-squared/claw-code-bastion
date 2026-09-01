@@ -6,6 +6,7 @@
 //! scripted provider. It is not presented as a model-quality baseline.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -997,6 +998,7 @@ pub fn write_jsonl(path: &Path, records: &[BenchmarkRecord]) -> Result<(), Strin
     fs::write(path, output).map_err(|error| error.to_string())
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn compare_files(old: &Path, new: &Path) -> Result<String, String> {
     let old_records = read_jsonl(old)?;
     let new_records = read_jsonl(new)?;
@@ -1006,15 +1008,151 @@ pub fn compare_files(old: &Path, new: &Path) -> Result<String, String> {
     let new_pass = rate(&new_records, |record| {
         record.first_pass == "FIRST_PASS_PASS"
     });
-    let old_tokens = mean(&old_records, |record| {
-        record.usage.input_tokens + record.usage.output_tokens
-    });
-    let new_tokens = mean(&new_records, |record| {
-        record.usage.input_tokens + record.usage.output_tokens
-    });
+    let old_tokens = mean_telemetry(&old_records, "input_tokens")
+        .zip(mean_telemetry(&old_records, "output_tokens"))
+        .map(|(input, output)| input + output);
+    let new_tokens = mean_telemetry(&new_records, "input_tokens")
+        .zip(mean_telemetry(&new_records, "output_tokens"))
+        .map(|(input, output)| input + output);
     let old_time = mean_u128(&old_records, |record| record.timing.end_to_end_ms);
     let new_time = mean_u128(&new_records, |record| record.timing.end_to_end_ms);
-    Ok(format!("# Agent benchmark comparison\n\n| Metric | Baseline | Current | Delta |\n|---|---:|---:|---:|\n| First-pass success | {old_pass:.3} | {new_pass:.3} | {:+.3} |\n| Mean tokens | {old_tokens:.1} | {new_tokens:.1} | {:+.1} |\n| Mean wall time ms | {old_time:.1} | {new_time:.1} | {:+.1} |\n", new_pass - old_pass, new_tokens - old_tokens, new_time - old_time))
+    let mut output = String::from("# Agent benchmark comparison\n\n| Metric | Baseline | Current | Delta |\n|---|---:|---:|---:|\n");
+    push_comparison_row(
+        &mut output,
+        "First-pass success",
+        Some(old_pass),
+        Some(new_pass),
+    );
+    push_comparison_row(
+        &mut output,
+        "Mean input tokens",
+        mean_telemetry(&old_records, "input_tokens"),
+        mean_telemetry(&new_records, "input_tokens"),
+    );
+    push_comparison_row(
+        &mut output,
+        "Mean output tokens",
+        mean_telemetry(&old_records, "output_tokens"),
+        mean_telemetry(&new_records, "output_tokens"),
+    );
+    push_comparison_row(
+        &mut output,
+        "Mean total model request bytes",
+        mean_telemetry(&old_records, "model_request_bytes"),
+        mean_telemetry(&new_records, "model_request_bytes"),
+    );
+    push_comparison_row(
+        &mut output,
+        "Mean provider calls",
+        mean_telemetry(&old_records, "provider_calls"),
+        mean_telemetry(&new_records, "provider_calls"),
+    );
+    push_comparison_row(
+        &mut output,
+        "Mean model turns",
+        mean_telemetry(&old_records, "model_turns"),
+        mean_telemetry(&new_records, "model_turns"),
+    );
+    push_comparison_row(
+        &mut output,
+        "Mean total file reads",
+        mean_telemetry(&old_records, "total_file_reads"),
+        mean_telemetry(&new_records, "total_file_reads"),
+    );
+    push_comparison_row(
+        &mut output,
+        "Mean unique file reads",
+        mean_telemetry(&old_records, "unique_files_read"),
+        mean_telemetry(&new_records, "unique_files_read"),
+    );
+    push_comparison_row(
+        &mut output,
+        "Mean repeated file reads",
+        mean_telemetry(&old_records, "repeated_file_reads"),
+        mean_telemetry(&new_records, "repeated_file_reads"),
+    );
+    push_comparison_row(
+        &mut output,
+        "Mean Grep calls",
+        mean_telemetry(&old_records, "grep_calls"),
+        mean_telemetry(&new_records, "grep_calls"),
+    );
+    push_comparison_row(
+        &mut output,
+        "Mean ContextSearch calls",
+        mean_telemetry(&old_records, "context_search_calls"),
+        mean_telemetry(&new_records, "context_search_calls"),
+    );
+    push_comparison_row(
+        &mut output,
+        "Mean tool calls before first mutation",
+        mean_telemetry(&old_records, "tool_calls_before_first_candidate_mutation"),
+        mean_telemetry(&new_records, "tool_calls_before_first_candidate_mutation"),
+    );
+    push_comparison_row(
+        &mut output,
+        "Mean model turns before first mutation",
+        mean_telemetry(&old_records, "model_turns_before_first_candidate_mutation"),
+        mean_telemetry(&new_records, "model_turns_before_first_candidate_mutation"),
+    );
+    push_comparison_row(
+        &mut output,
+        "Mean reads before first mutation",
+        mean_telemetry(&old_records, "file_reads_before_first_candidate_mutation"),
+        mean_telemetry(&new_records, "file_reads_before_first_candidate_mutation"),
+    );
+    push_comparison_row(
+        &mut output,
+        "Mean time to first mutation ms",
+        mean_telemetry(&old_records, "time_to_first_candidate_mutation_ms"),
+        mean_telemetry(&new_records, "time_to_first_candidate_mutation_ms"),
+    );
+    push_comparison_row(
+        &mut output,
+        "Mean wall time ms",
+        Some(old_time),
+        Some(new_time),
+    );
+    let _ = writeln!(
+        output,
+        "\nMean total tokens | Baseline: {} | Current: {}",
+        format_optional(old_tokens),
+        format_optional(new_tokens)
+    );
+    Ok(output)
+}
+
+fn telemetry_number(record: &BenchmarkRecord, key: &str) -> Option<f64> {
+    record
+        .production_telemetry
+        .as_ref()
+        .and_then(|telemetry| telemetry.get(key))
+        .and_then(Value::as_f64)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn mean_telemetry(records: &[BenchmarkRecord], key: &str) -> Option<f64> {
+    let values: Vec<f64> = records
+        .iter()
+        .filter_map(|record| telemetry_number(record, key))
+        .collect();
+    (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+}
+
+fn format_optional(value: Option<f64>) -> String {
+    value.map_or_else(|| "N/A".into(), |value| format!("{value:.1}"))
+}
+
+fn push_comparison_row(output: &mut String, name: &str, old: Option<f64>, new: Option<f64>) {
+    let delta = old
+        .zip(new)
+        .map_or_else(|| "N/A".into(), |(old, new)| format!("{:+.1}", new - old));
+    let _ = writeln!(
+        output,
+        "| {name} | {} | {} | {delta} |",
+        format_optional(old),
+        format_optional(new)
+    );
 }
 
 fn read_jsonl(path: &Path) -> Result<Vec<BenchmarkRecord>, String> {
@@ -1030,14 +1168,6 @@ fn rate(records: &[BenchmarkRecord], predicate: impl Fn(&BenchmarkRecord) -> boo
         0.0
     } else {
         records.iter().filter(|record| predicate(record)).count() as f64 / records.len() as f64
-    }
-}
-#[allow(clippy::cast_precision_loss)]
-fn mean(records: &[BenchmarkRecord], value: impl Fn(&BenchmarkRecord) -> u64) -> f64 {
-    if records.is_empty() {
-        0.0
-    } else {
-        records.iter().map(value).sum::<u64>() as f64 / records.len() as f64
     }
 }
 #[allow(clippy::cast_precision_loss)]

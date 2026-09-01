@@ -8528,6 +8528,9 @@ impl ApiClient for AnthropicRuntimeClient {
             reasoning_effort: self.reasoning_effort.clone(),
             ..Default::default()
         };
+        if let Ok(bytes) = serde_json::to_vec(&message_request) {
+            benchmark_telemetry::model_request_bytes(bytes.len() as u64);
+        }
 
         self.runtime.block_on(async {
             // When resuming after tool execution, apply a stall timeout on the
@@ -8717,8 +8720,8 @@ impl AnthropicRuntimeClient {
         }
 
         for event in &events {
-            if let AssistantEvent::ToolUse { name, .. } = event {
-                benchmark_telemetry::tool(name);
+            if let AssistantEvent::ToolUse { name, input, .. } = event {
+                benchmark_telemetry::tool_event(name, Some(input));
                 benchmark_telemetry::tool_turn();
                 if matches!(name.as_str(), "write_file" | "edit_file" | "apply_patch") {
                     benchmark_telemetry::candidate_mutation();

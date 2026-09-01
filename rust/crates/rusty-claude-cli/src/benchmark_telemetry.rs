@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -13,6 +13,23 @@ pub struct Snapshot {
     pub model_turns: u64,
     pub tool_bearing_turns: u64,
     pub tool_calls: BTreeMap<String, u64>,
+    pub model_request_bytes: u64,
+    pub total_file_reads: u64,
+    pub unique_files_read: u64,
+    pub repeated_file_reads: u64,
+    pub grep_calls: u64,
+    pub context_search_calls: u64,
+    pub time_to_first_tool_call_ms: Option<u128>,
+    pub time_to_first_candidate_mutation_ms: Option<u128>,
+    pub model_turns_before_first_candidate_mutation: Option<u64>,
+    pub tool_calls_before_first_candidate_mutation: Option<u64>,
+    pub file_reads_before_first_candidate_mutation: Option<u64>,
+    pub unique_files_read_before_first_candidate_mutation: Option<u64>,
+    pub repeated_file_reads_before_first_candidate_mutation: Option<u64>,
+    pub grep_calls_before_first_candidate_mutation: Option<u64>,
+    pub context_search_calls_before_first_candidate_mutation: Option<u64>,
+    pub input_tokens_before_first_candidate_mutation: Option<u64>,
+    pub output_tokens_before_first_candidate_mutation: Option<u64>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cache_read_tokens: Option<u64>,
@@ -31,6 +48,9 @@ struct State {
     path: PathBuf,
     started: Instant,
     snapshot: Snapshot,
+    read_identities: HashSet<u64>,
+    first_tool_at: Option<Instant>,
+    first_mutation_recorded: bool,
 }
 
 static STATE: OnceLock<Mutex<Option<State>>> = OnceLock::new();
@@ -48,6 +68,9 @@ pub fn init() {
             started_at_ms: now_ms(),
             ..Snapshot::default()
         },
+        read_identities: HashSet::new(),
+        first_tool_at: None,
+        first_mutation_recorded: false,
     })));
 }
 
@@ -66,7 +89,10 @@ pub fn model_turn() {
     with_state(|s| s.snapshot.model_turns += 1);
 }
 pub fn tool(name: &str) {
-    with_state(|s| *s.snapshot.tool_calls.entry(name.into()).or_default() += 1);
+    tool_event(name, None);
+}
+pub fn tool_event(name: &str, input: Option<&str>) {
+    with_state(|s| record_tool_event(s, name, input));
 }
 pub fn tool_turn() {
     with_state(|s| s.snapshot.tool_bearing_turns += 1);
@@ -86,13 +112,84 @@ pub fn usage(input: u64, output: u64, cache_read: u64, cache_write: u64) {
     });
 }
 
+pub fn model_request_bytes(bytes: u64) {
+    with_state(|s| {
+        s.snapshot.model_request_bytes = s.snapshot.model_request_bytes.saturating_add(bytes);
+    });
+}
+
 fn add_usage(slot: &mut Option<u64>, value: u64) {
     if value > 0 {
         *slot = Some(slot.unwrap_or(0).saturating_add(value));
     }
 }
 pub fn candidate_mutation() {
-    with_state(|s| s.snapshot.candidate_mutations += 1);
+    with_state(record_candidate_mutation);
+}
+
+fn record_tool_event(state: &mut State, name: &str, input: Option<&str>) {
+    *state.snapshot.tool_calls.entry(name.into()).or_default() += 1;
+    if state.first_tool_at.is_none() {
+        state.first_tool_at = Some(Instant::now());
+        state.snapshot.time_to_first_tool_call_ms = Some(state.started.elapsed().as_millis());
+    }
+    let normalized = name.to_ascii_lowercase();
+    if matches!(normalized.as_str(), "read" | "read_file" | "readfile") {
+        state.snapshot.total_file_reads += 1;
+        let identity = input
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+            .and_then(|value| {
+                value
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .map(|path| {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                std::hash::Hash::hash(&path.replace('\\', "/"), &mut hasher);
+                std::hash::Hasher::finish(&hasher)
+            });
+        if let Some(identity) = identity {
+            state.read_identities.insert(identity);
+            state.snapshot.unique_files_read = state.read_identities.len() as u64;
+            state.snapshot.repeated_file_reads = state
+                .snapshot
+                .total_file_reads
+                .saturating_sub(state.snapshot.unique_files_read);
+        }
+    } else if normalized == "grep" {
+        state.snapshot.grep_calls += 1;
+    } else if normalized == "contextsearch" || normalized == "context_search" {
+        state.snapshot.context_search_calls += 1;
+    }
+}
+
+fn record_candidate_mutation(state: &mut State) {
+    state.snapshot.candidate_mutations += 1;
+    if state.first_mutation_recorded {
+        return;
+    }
+    state.first_mutation_recorded = true;
+    state.snapshot.time_to_first_candidate_mutation_ms = Some(state.started.elapsed().as_millis());
+    state.snapshot.model_turns_before_first_candidate_mutation = Some(state.snapshot.model_turns);
+    state.snapshot.tool_calls_before_first_candidate_mutation =
+        Some(state.snapshot.tool_calls.values().copied().sum());
+    state.snapshot.file_reads_before_first_candidate_mutation =
+        Some(state.snapshot.total_file_reads);
+    state
+        .snapshot
+        .unique_files_read_before_first_candidate_mutation = Some(state.snapshot.unique_files_read);
+    state
+        .snapshot
+        .repeated_file_reads_before_first_candidate_mutation =
+        Some(state.snapshot.repeated_file_reads);
+    state.snapshot.grep_calls_before_first_candidate_mutation = Some(state.snapshot.grep_calls);
+    state
+        .snapshot
+        .context_search_calls_before_first_candidate_mutation =
+        Some(state.snapshot.context_search_calls);
+    state.snapshot.input_tokens_before_first_candidate_mutation = state.snapshot.input_tokens;
+    state.snapshot.output_tokens_before_first_candidate_mutation = state.snapshot.output_tokens;
 }
 pub fn validation(result: &str) {
     with_state(|s| {
@@ -122,4 +219,85 @@ fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> State {
+        State {
+            path: PathBuf::from("/tmp/telemetry-test.json"),
+            started: Instant::now(),
+            snapshot: Snapshot {
+                schema_version: 1,
+                ..Snapshot::default()
+            },
+            read_identities: HashSet::new(),
+            first_tool_at: None,
+            first_mutation_recorded: false,
+        }
+    }
+
+    #[test]
+    fn usage_and_request_bytes_accumulate_without_fabricating_zeroes() {
+        let mut state = state();
+        add_usage(&mut state.snapshot.input_tokens, 10);
+        add_usage(&mut state.snapshot.input_tokens, 20);
+        add_usage(&mut state.snapshot.output_tokens, 7);
+        state.snapshot.model_request_bytes += 100;
+        state.snapshot.model_request_bytes += 50;
+        assert_eq!(state.snapshot.input_tokens, Some(30));
+        assert_eq!(state.snapshot.output_tokens, Some(7));
+        assert_eq!(state.snapshot.cache_read_tokens, None);
+        assert_eq!(state.snapshot.model_request_bytes, 150);
+    }
+
+    #[test]
+    fn read_and_exploration_counts_track_unique_and_repeated_events() {
+        let mut state = state();
+        record_tool_event(&mut state, "read_file", Some(r#"{"path":"a.rs"}"#));
+        record_tool_event(&mut state, "read_file", Some(r#"{"path":"b.rs"}"#));
+        record_tool_event(&mut state, "read_file", Some(r#"{"path":"a.rs"}"#));
+        record_tool_event(&mut state, "grep", None);
+        record_tool_event(&mut state, "ContextSearch", None);
+        assert_eq!(state.snapshot.total_file_reads, 3);
+        assert_eq!(state.snapshot.unique_files_read, 2);
+        assert_eq!(state.snapshot.repeated_file_reads, 1);
+        assert_eq!(state.snapshot.grep_calls, 1);
+        assert_eq!(state.snapshot.context_search_calls, 1);
+    }
+
+    #[test]
+    fn first_mutation_snapshots_only_prior_activity() {
+        let mut state = state();
+        state.snapshot.model_turns = 2;
+        record_tool_event(&mut state, "read_file", Some(r#"{"path":"a.rs"}"#));
+        record_candidate_mutation(&mut state);
+        state.snapshot.model_turns = 3;
+        record_tool_event(&mut state, "read_file", Some(r#"{"path":"b.rs"}"#));
+        assert_eq!(
+            state.snapshot.model_turns_before_first_candidate_mutation,
+            Some(2)
+        );
+        assert_eq!(
+            state.snapshot.file_reads_before_first_candidate_mutation,
+            Some(1)
+        );
+        assert_eq!(
+            state
+                .snapshot
+                .unique_files_read_before_first_candidate_mutation,
+            Some(1)
+        );
+        assert_eq!(
+            state.snapshot.tool_calls_before_first_candidate_mutation,
+            Some(1)
+        );
+        assert_eq!(
+            state.snapshot.file_reads_before_first_candidate_mutation,
+            Some(1)
+        );
+        assert!(state.snapshot.time_to_first_candidate_mutation_ms.is_some());
+    }
 }
