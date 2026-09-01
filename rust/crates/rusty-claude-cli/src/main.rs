@@ -7,6 +7,7 @@
     clippy::unused_self
 )]
 mod attachments;
+mod benchmark_telemetry;
 mod context_reference;
 mod init;
 mod input;
@@ -335,7 +336,9 @@ type RuntimePluginStateBuildOutput = (
 );
 
 fn main() {
+    benchmark_telemetry::init();
     if let Err(error) = run() {
+        benchmark_telemetry::flush("internal_error");
         let message = error.to_string();
         // When --output-format json is active, emit errors as JSON so downstream
         // tools can parse failures the same way they parse successes (ROADMAP #42).
@@ -366,6 +369,7 @@ Run `claw --help` for usage."
         }
         std::process::exit(1);
     }
+    benchmark_telemetry::flush("completed");
 }
 
 /// Classify CLI failures into stable machine-readable categories.
@@ -4957,6 +4961,10 @@ impl LiveCli {
             return Ok(());
         };
 
+        if !changes.changes.is_empty() {
+            benchmark_telemetry::candidate_mutation();
+        }
+
         if changes.changes.is_empty() {
             self.candidate_state = CandidateLifecycleState::Editing;
             return Ok(());
@@ -4969,6 +4977,7 @@ impl LiveCli {
         }
 
         let validation = runtime.validate_candidate(&changes)?;
+        benchmark_telemetry::validation("completed");
         self.candidate_state = CandidateLifecycleState::ReviewReady;
         let policy = runtime::ValidationPolicy::default();
         let normal_apply_allowed = validation.allows_apply(changes.id, policy, false);
@@ -8500,6 +8509,8 @@ fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
 impl ApiClient for AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+        benchmark_telemetry::provider_call();
+        benchmark_telemetry::model_turn();
         if let Some(progress_reporter) = &self.progress_reporter {
             progress_reporter.mark_model_phase();
         }
@@ -8627,6 +8638,7 @@ impl AnthropicRuntimeClient {
                 ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                     ContentBlockDelta::TextDelta { text } => {
                         if !text.is_empty() {
+                            benchmark_telemetry::content();
                             if let Some(progress_reporter) = &self.progress_reporter {
                                 progress_reporter.mark_text_phase(&text);
                             }
@@ -8644,6 +8656,7 @@ impl AnthropicRuntimeClient {
                         }
                     }
                     ContentBlockDelta::ThinkingDelta { .. } => {
+                        benchmark_telemetry::thinking();
                         if !block_has_thinking_summary {
                             render_thinking_block_summary(out, None, false)?;
                             block_has_thinking_summary = true;
@@ -8670,7 +8683,14 @@ impl AnthropicRuntimeClient {
                     }
                 }
                 ApiStreamEvent::MessageDelta(delta) => {
-                    events.push(AssistantEvent::Usage(delta.usage.token_usage()));
+                    let usage = delta.usage.token_usage();
+                    benchmark_telemetry::usage(
+                        u64::from(usage.input_tokens),
+                        u64::from(usage.output_tokens),
+                        u64::from(usage.cache_read_input_tokens),
+                        u64::from(usage.cache_creation_input_tokens),
+                    );
+                    events.push(AssistantEvent::Usage(usage));
                 }
                 ApiStreamEvent::MessageStop(_) => {
                     saw_stop = true;
@@ -8692,6 +8712,16 @@ impl AnthropicRuntimeClient {
                         events.push(AssistantEvent::ToolUse { id, name, input });
                     }
                     events.push(AssistantEvent::MessageStop);
+                }
+            }
+        }
+
+        for event in &events {
+            if let AssistantEvent::ToolUse { name, .. } = event {
+                benchmark_telemetry::tool(name);
+                benchmark_telemetry::tool_turn();
+                if matches!(name.as_str(), "write_file" | "edit_file" | "apply_patch") {
+                    benchmark_telemetry::candidate_mutation();
                 }
             }
         }

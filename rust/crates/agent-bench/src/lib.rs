@@ -245,6 +245,8 @@ pub struct BenchmarkRecord {
     pub error_class: Option<String>,
     #[serde(default)]
     pub error_message: Option<String>,
+    #[serde(default)]
+    pub production_telemetry: Option<Value>,
 }
 
 struct ScriptedApi {
@@ -503,6 +505,7 @@ fn run_production_one(
     let config = temp.path().join("config");
     let cache = temp.path().join("cache");
     let state = temp.path().join("state");
+    let telemetry = temp.path().join("production-telemetry.json");
     let podman_data_home = std::env::var_os("XDG_DATA_HOME").unwrap_or_else(|| {
         std::env::var_os("HOME")
             .map_or_else(|| PathBuf::from("/home"), PathBuf::from)
@@ -549,6 +552,7 @@ fn run_production_one(
         .env("XDG_CACHE_HOME", &cache)
         .env("XDG_STATE_HOME", &state)
         .env("CLAW_CONFIG_HOME", &config)
+        .env("CLAW_BENCH_TELEMETRY", &telemetry)
         // Rootless Podman stores images independently of Bastion's HOME.
         // Preserve that storage location so the explicitly supplied runtime
         // image resolves locally instead of triggering a registry pull.
@@ -612,6 +616,9 @@ fn run_production_one(
         ));
     }
     let oracle_ok = evaluate_oracle(&root, task)?;
+    let production_telemetry = fs::read_to_string(&telemetry)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
     let candidate = candidate_metrics(&root, task);
     Ok(BenchmarkRecord {
         benchmark_schema_version: BENCHMARK_SCHEMA_VERSION,
@@ -651,6 +658,7 @@ fn run_production_one(
         isolated_execution: Some(true),
         error_class: None,
         error_message: None,
+        production_telemetry,
     })
 }
 
@@ -696,6 +704,7 @@ fn production_failure_record(
         isolated_execution: Some(true),
         error_class: Some(class.to_string()),
         error_message: Some(error.to_string()),
+        production_telemetry: None,
     }
 }
 
@@ -845,6 +854,7 @@ fn run_one(
         isolated_execution: Some(false),
         error_class: None,
         error_message: None,
+        production_telemetry: None,
     })
 }
 
