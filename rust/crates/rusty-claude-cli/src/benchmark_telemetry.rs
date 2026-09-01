@@ -13,10 +13,10 @@ pub struct Snapshot {
     pub model_turns: u64,
     pub tool_bearing_turns: u64,
     pub tool_calls: BTreeMap<String, u64>,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_write_tokens: u64,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
     pub thinking_present: bool,
     pub content_present: bool,
     pub candidate_mutations: u64,
@@ -79,11 +79,17 @@ pub fn content() {
 }
 pub fn usage(input: u64, output: u64, cache_read: u64, cache_write: u64) {
     with_state(|s| {
-        s.snapshot.input_tokens += input;
-        s.snapshot.output_tokens += output;
-        s.snapshot.cache_read_tokens += cache_read;
-        s.snapshot.cache_write_tokens += cache_write;
+        add_usage(&mut s.snapshot.input_tokens, input);
+        add_usage(&mut s.snapshot.output_tokens, output);
+        add_usage(&mut s.snapshot.cache_read_tokens, cache_read);
+        add_usage(&mut s.snapshot.cache_write_tokens, cache_write);
     });
+}
+
+fn add_usage(slot: &mut Option<u64>, value: u64) {
+    if value > 0 {
+        *slot = Some(slot.unwrap_or(0).saturating_add(value));
+    }
 }
 pub fn candidate_mutation() {
     with_state(|s| s.snapshot.candidate_mutations += 1);
