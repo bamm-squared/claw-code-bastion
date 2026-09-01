@@ -26,6 +26,7 @@ pub const EXTRACTOR_VERSION: &str = "tree-sitter-structural-1";
 pub const GRAMMAR_VERSION: &str = "tree-sitter-grammars-0.23";
 pub const DEFAULT_MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_REFERENCES_PER_FILE: usize = 8192;
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_SYMBOLS_PER_FILE: usize = 4096;
 const MAX_IMPORTS_PER_FILE: usize = 2048;
 const MAX_STRUCTURAL_FACTS_PER_FILE: usize = 4096;
@@ -248,6 +249,28 @@ pub struct FileFactPack {
     pub parse_diagnostics: ParseDiagnostics,
     pub extractor_provenance: ExtractorProvenance,
     pub facts_truncated: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectDependency {
+    pub name: String,
+    pub requirement: String,
+    pub kind: String,
+    pub local_manifest: Option<String>,
+    pub resolved_package: Option<String>,
+    pub provenance: Provenance,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectFact {
+    pub manifest_path: String,
+    pub ecosystem: String,
+    pub package_name: String,
+    pub package_root: String,
+    pub workspace_root: Option<String>,
+    pub version: Option<String>,
+    pub dependencies: Vec<ProjectDependency>,
+    pub provenance: Provenance,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -616,6 +639,8 @@ pub enum NodeKind {
     File,
     Symbol,
     ImportTarget,
+    Project,
+    Package,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -639,6 +664,7 @@ pub struct RepositoryGraph {
     pub nodes: BTreeMap<String, GraphNode>,
     pub edges: Vec<GraphEdge>,
     pub facts: BTreeMap<String, FileFactPack>,
+    pub project_facts: BTreeMap<String, ProjectFact>,
 }
 
 impl RepositoryGraph {
@@ -773,6 +799,106 @@ impl RepositoryGraph {
             }
         }
         self.edges.extend(additions);
+    }
+
+    fn add_project_fact(&mut self, fact: ProjectFact) {
+        let project_id = format!("project:{}", fact.manifest_path);
+        let package_id = format!("package:{}:{}", fact.manifest_path, fact.package_name);
+        self.nodes.insert(
+            project_id.clone(),
+            GraphNode {
+                id: project_id.clone(),
+                kind: NodeKind::Project,
+                label: fact.manifest_path.clone(),
+                provenance: Some(fact.provenance.clone()),
+            },
+        );
+        self.nodes.insert(
+            package_id.clone(),
+            GraphNode {
+                id: package_id.clone(),
+                kind: NodeKind::Package,
+                label: fact.package_name.clone(),
+                provenance: Some(fact.provenance.clone()),
+            },
+        );
+        self.edges.push(GraphEdge {
+            source: "repository".into(),
+            target: project_id.clone(),
+            kind: "CONTAINS".into(),
+            provenance: fact.provenance.clone(),
+        });
+        if let Some(workspace_root) = &fact.workspace_root {
+            let workspace_id = format!("project:{workspace_root}");
+            self.nodes.entry(workspace_id.clone()).or_insert(GraphNode {
+                id: workspace_id.clone(),
+                kind: NodeKind::Project,
+                label: workspace_root.clone(),
+                provenance: Some(fact.provenance.clone()),
+            });
+            self.edges.push(GraphEdge {
+                source: workspace_id,
+                target: package_id.clone(),
+                kind: "CONTAINS".into(),
+                provenance: fact.provenance.clone(),
+            });
+        }
+        self.edges.push(GraphEdge {
+            source: project_id,
+            target: package_id.clone(),
+            kind: "CONTAINS".into(),
+            provenance: fact.provenance.clone(),
+        });
+        for dependency in &fact.dependencies {
+            let target = dependency.resolved_package.clone().unwrap_or_else(|| {
+                format!("package:external:{}:{}", fact.ecosystem, dependency.name)
+            });
+            self.nodes.entry(target.clone()).or_insert(GraphNode {
+                id: target.clone(),
+                kind: NodeKind::Package,
+                label: dependency.name.clone(),
+                provenance: Some(dependency.provenance.clone()),
+            });
+            self.edges.push(GraphEdge {
+                source: package_id.clone(),
+                target,
+                kind: "DEPENDS_ON".into(),
+                provenance: dependency.provenance.clone(),
+            });
+        }
+        for path in self.facts.keys() {
+            if path == &fact.manifest_path
+                || Path::new(path)
+                    .parent()
+                    .is_some_and(|parent| parent == Path::new(&fact.package_root))
+                || path.starts_with(&format!("{}/", fact.package_root))
+            {
+                self.edges.push(GraphEdge {
+                    source: format!("file:{path}"),
+                    target: package_id.clone(),
+                    kind: "BELONGS_TO".into(),
+                    provenance: fact.provenance.clone(),
+                });
+            }
+        }
+        self.project_facts.insert(fact.manifest_path.clone(), fact);
+    }
+
+    fn clear_project_metadata(&mut self) {
+        self.project_facts.clear();
+        let project_nodes: BTreeSet<String> = self
+            .nodes
+            .values()
+            .filter(|node| matches!(node.kind, NodeKind::Project | NodeKind::Package))
+            .map(|node| node.id.clone())
+            .collect();
+        self.nodes.retain(|id, _| !project_nodes.contains(id));
+        self.edges.retain(|edge| {
+            !project_nodes.contains(&edge.source)
+                && !project_nodes.contains(&edge.target)
+                && edge.kind != "DEPENDS_ON"
+                && edge.kind != "BELONGS_TO"
+        });
     }
     #[must_use]
     pub fn file_facts(&self, path: &str) -> Option<&FileFactPack> {
@@ -930,6 +1056,265 @@ fn rust_module_path(path: &str, module: &str, paths: &BTreeSet<String>) -> Optio
     None
 }
 
+fn project_provenance(bytes: &[u8], manifest_path: &str) -> Provenance {
+    let content = ContentIdentity::from_bytes(bytes);
+    let analysis = AnalysisIdentity::new(content, Language::Rust, &AnalysisConfig::default());
+    Provenance {
+        source: "ProjectMetadata".into(),
+        analyzer: "repository-intelligence-manifest-reader".into(),
+        analyzer_version: format!("project-metadata-1:{manifest_path}"),
+        analysis_identity: analysis,
+        evidence: Evidence::Exact,
+    }
+}
+
+fn manifest_string_value(line: &str) -> Option<String> {
+    let value = line.split_once('=')?.1.trim();
+    value
+        .strip_prefix('"')
+        .and_then(|value| value.split('"').next())
+        .map(str::to_string)
+}
+
+fn cargo_dependency(line: &str, kind: &str, provenance: &Provenance) -> Option<ProjectDependency> {
+    let (name, raw_value) = line.split_once('=')?;
+    let name = name.trim();
+    if name.is_empty() || name.starts_with('#') {
+        return None;
+    }
+    let raw_value = raw_value.trim();
+    let mut requirement = raw_value.trim_matches('"').to_string();
+    let mut local_manifest = None;
+    let mut package_name = name.to_string();
+    if raw_value.starts_with('{') {
+        let inner = raw_value.trim_matches(|c| c == '{' || c == '}');
+        for part in inner.split(',') {
+            let Some((key, value)) = part.split_once('=') else {
+                continue;
+            };
+            let value = value.trim().trim_matches('"');
+            match key.trim() {
+                "path" => local_manifest = Some(value.to_string()),
+                "package" => package_name = value.to_string(),
+                "version" => requirement = value.to_string(),
+                _ => {}
+            }
+        }
+        if requirement.starts_with('{') {
+            requirement.clear();
+        }
+    }
+    Some(ProjectDependency {
+        name: package_name,
+        requirement,
+        kind: kind.into(),
+        local_manifest,
+        resolved_package: None,
+        provenance: provenance.clone(),
+    })
+}
+
+fn parse_cargo_manifest(
+    root: &Path,
+    path: &Path,
+    bytes: &[u8],
+    workspace_roots: &BTreeSet<String>,
+) -> Option<ProjectFact> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let manifest_path = safe_relative(root, path).ok()?.display().to_string();
+    let package_root = Path::new(&manifest_path)
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .display()
+        .to_string();
+    let provenance = project_provenance(bytes, &manifest_path);
+    let mut section = String::new();
+    let mut package_name = None;
+    let mut version = None;
+    let mut dependencies = Vec::new();
+    for line in text.lines() {
+        let line = line.split_once('#').map_or(line, |(line, _)| line).trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line.trim_matches(['[', ']']).to_string();
+            continue;
+        }
+        if section == "package" {
+            if line.starts_with("name") {
+                package_name = manifest_string_value(line);
+            } else if line.starts_with("version") {
+                version = manifest_string_value(line);
+            }
+        }
+        if section == "dependencies"
+            || section == "dev-dependencies"
+            || section == "build-dependencies"
+            || section.ends_with(".dependencies")
+        {
+            if let Some(dependency) = cargo_dependency(line, &section, &provenance) {
+                dependencies.push(dependency);
+            }
+        }
+    }
+    let package_name = package_name?;
+    let workspace_root = workspace_roots
+        .iter()
+        .find(|workspace| {
+            workspace.is_empty()
+                || package_root == **workspace
+                || package_root.starts_with(&format!("{workspace}/"))
+        })
+        .cloned();
+    Some(ProjectFact {
+        manifest_path,
+        ecosystem: "Cargo".into(),
+        package_name,
+        package_root,
+        workspace_root,
+        version,
+        dependencies,
+        provenance,
+    })
+}
+
+fn parse_package_json(root: &Path, path: &Path, bytes: &[u8]) -> Option<ProjectFact> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let package_name = value.get("name")?.as_str()?.to_string();
+    let manifest_path = safe_relative(root, path).ok()?.display().to_string();
+    let package_root = Path::new(&manifest_path)
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .display()
+        .to_string();
+    let provenance = project_provenance(bytes, &manifest_path);
+    let mut dependencies = Vec::new();
+    for (field, kind) in [
+        ("dependencies", "dependencies"),
+        ("devDependencies", "dev-dependencies"),
+        ("peerDependencies", "peer-dependencies"),
+        ("optionalDependencies", "optional-dependencies"),
+    ] {
+        if let Some(values) = value.get(field).and_then(serde_json::Value::as_object) {
+            for (name, requirement) in values {
+                dependencies.push(ProjectDependency {
+                    name: name.clone(),
+                    requirement: requirement.as_str().unwrap_or("*").into(),
+                    kind: kind.into(),
+                    local_manifest: None,
+                    resolved_package: None,
+                    provenance: provenance.clone(),
+                });
+            }
+        }
+    }
+    Some(ProjectFact {
+        manifest_path,
+        ecosystem: "Node".into(),
+        package_name,
+        package_root,
+        workspace_root: None,
+        version: value
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        dependencies,
+        provenance,
+    })
+}
+
+fn project_facts(root: &Path) -> std::io::Result<Vec<ProjectFact>> {
+    let mut manifests = Vec::new();
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_file()
+            || entry
+                .path()
+                .components()
+                .any(|c| matches!(c, Component::Normal(v) if v == ".git"))
+        {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy();
+        if name == "Cargo.toml" || name == "package.json" {
+            manifests.push(entry.path().to_path_buf());
+        }
+    }
+    manifests.sort();
+    let mut workspace_roots = BTreeSet::new();
+    for path in &manifests {
+        if path.file_name().is_some_and(|name| name == "Cargo.toml") {
+            let bytes = fs::read(path)?;
+            if std::str::from_utf8(&bytes)
+                .is_ok_and(|text| text.lines().any(|line| line.trim() == "[workspace]"))
+            {
+                if let Ok(relative) = safe_relative(root, path) {
+                    workspace_roots.insert(
+                        relative
+                            .parent()
+                            .unwrap_or_else(|| Path::new(""))
+                            .display()
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+    let mut facts = Vec::new();
+    for path in manifests {
+        let bytes = fs::read(&path)?;
+        if bytes.len() as u64 > MAX_MANIFEST_BYTES || bytes.contains(&0) {
+            continue;
+        }
+        let fact = if path.file_name().is_some_and(|name| name == "Cargo.toml") {
+            parse_cargo_manifest(root, &path, &bytes, &workspace_roots)
+        } else {
+            parse_package_json(root, &path, &bytes)
+        };
+        if let Some(fact) = fact {
+            facts.push(fact);
+        }
+    }
+    let package_ids: BTreeMap<String, String> = facts
+        .iter()
+        .map(|fact| {
+            (
+                fact.manifest_path.clone(),
+                format!("package:{}:{}", fact.manifest_path, fact.package_name),
+            )
+        })
+        .collect();
+    for fact in &mut facts {
+        for dependency in &mut fact.dependencies {
+            let Some(local) = dependency.local_manifest.as_ref() else {
+                continue;
+            };
+            let manifest = normalize_project_path(
+                &Path::new(&fact.package_root).join(local).join("Cargo.toml"),
+            );
+            dependency.local_manifest = Some(manifest.clone());
+            dependency.resolved_package = package_ids.get(&manifest).cloned();
+        }
+    }
+    facts.sort_by(|a, b| a.manifest_path.cmp(&b.manifest_path));
+    Ok(facts)
+}
+
+fn normalize_project_path(path: &Path) -> String {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => parts.push(value.to_string_lossy().into_owned()),
+            Component::ParentDir => {
+                let _ = parts.pop();
+            }
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+    parts.join("/")
+}
+
 #[derive(Clone, Debug)]
 pub struct RepositoryIndex {
     pub root: PathBuf,
@@ -1048,6 +1433,9 @@ impl RepositoryIndex {
             };
             graph.add_pack(pack);
         }
+        for fact in project_facts(root)? {
+            graph.add_project_fact(fact);
+        }
         graph.enrich_semantics();
         graph.finish();
         let (nodes, edges) = graph.statistics();
@@ -1100,6 +1488,10 @@ impl RepositoryIndex {
             if !candidate_paths.contains(&path) {
                 merged.remove_file(&path);
             }
+        }
+        merged.clear_project_metadata();
+        for fact in project_facts(candidate_root)? {
+            merged.add_project_fact(fact);
         }
         merged.enrich_semantics();
         merged.finish();
@@ -1436,6 +1828,58 @@ mod tests {
             edge.provenance.source == "SyntaxResolver"
                 && edge.provenance.evidence == Evidence::Derived
         }));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn project_metadata_resolves_local_cargo_dependency_and_tracks_external() {
+        let dir = std::env::temp_dir().join(format!("ri-project-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("crates/app/src")).unwrap();
+        fs::create_dir_all(dir.join("crates/core/src")).unwrap();
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/app\", \"crates/core\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("crates/app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"1.0.0\"\n\n[dependencies]\ncore = { path = \"../core\" }\nserde = \"1\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("crates/core/Cargo.toml"),
+            "[package]\nname = \"core\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        fs::write(dir.join("crates/app/src/main.rs"), "fn main() {}").unwrap();
+        fs::write(dir.join("crates/core/src/lib.rs"), "pub fn core() {}").unwrap();
+        let output = RepositoryIndex::build(&dir, None, AnalysisConfig::default(), true).unwrap();
+        let app = output
+            .graph
+            .project_facts
+            .get("crates/app/Cargo.toml")
+            .unwrap();
+        let dependency = app
+            .dependencies
+            .iter()
+            .find(|dep| dep.name == "core")
+            .unwrap();
+        assert_eq!(
+            dependency.resolved_package.as_deref(),
+            Some("package:crates/core/Cargo.toml:core")
+        );
+        assert!(app
+            .dependencies
+            .iter()
+            .any(|dep| dep.name == "serde" && dep.resolved_package.is_none()));
+        assert!(app.workspace_root.is_some());
+        assert!(output
+            .graph
+            .edges
+            .iter()
+            .any(|edge| edge.kind == "DEPENDS_ON"
+                && edge.target == "package:crates/core/Cargo.toml:core"));
         let _ = fs::remove_dir_all(dir);
     }
 }
