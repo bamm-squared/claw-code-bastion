@@ -22,6 +22,15 @@ LSP/SCIP, build metadata, Git/history, coverage, schema, and configuration
 analyzers enrich this same graph rather than creating separate graphs. Future
 AI notes must be advisory and AnalysisIdentity-bound.
 
+Phase 1B adds a bounded local Rust syntax resolver. It resolves explicit
+`use crate::...` imports to definitions in the corresponding Rust module file
+and records identifier references only when they resolve to a same-file
+definition or an explicit imported definition. These relationships are
+`REFERENCES` edges with `SyntaxResolver` provenance and `Derived` evidence;
+unresolved imports remain unresolved. No language server is invoked because
+the available rust-analyzer may execute project/build configuration, and no
+safe compiler-grade server is installed for the other languages.
+
 The crate performs no network access, compiler/build execution, project hook
 execution, Git filters, or language-server execution. It is not connected to
 prompts, tools, ContextSearch, providers, validation, review, or Apply yet.

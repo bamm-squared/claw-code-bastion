@@ -25,6 +25,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub const EXTRACTOR_VERSION: &str = "tree-sitter-structural-1";
 pub const GRAMMAR_VERSION: &str = "tree-sitter-grammars-0.23";
 pub const DEFAULT_MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_REFERENCES_PER_FILE: usize = 8192;
 const MAX_SYMBOLS_PER_FILE: usize = 4096;
 const MAX_IMPORTS_PER_FILE: usize = 2048;
 const MAX_STRUCTURAL_FACTS_PER_FILE: usize = 4096;
@@ -201,6 +202,14 @@ pub struct ImportFact {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceFact {
+    pub name: String,
+    pub resolved_symbol: Option<String>,
+    pub range: SourceRange,
+    pub provenance: Provenance,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StructuralFact {
     pub kind: String,
     pub value: String,
@@ -234,6 +243,7 @@ pub struct FileFactPack {
     pub source_size: u64,
     pub symbols: Vec<SymbolFact>,
     pub imports: Vec<ImportFact>,
+    pub references: Vec<ReferenceFact>,
     pub structural_facts: Vec<StructuralFact>,
     pub parse_diagnostics: ParseDiagnostics,
     pub extractor_provenance: ExtractorProvenance,
@@ -372,6 +382,47 @@ fn import_kind(language: Language, kind: &str) -> bool {
     )
 }
 
+fn rust_reference_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "as" | "async"
+            | "await"
+            | "const"
+            | "crate"
+            | "dyn"
+            | "else"
+            | "enum"
+            | "extern"
+            | "false"
+            | "fn"
+            | "for"
+            | "if"
+            | "impl"
+            | "in"
+            | "let"
+            | "loop"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "pub"
+            | "ref"
+            | "return"
+            | "self"
+            | "Self"
+            | "static"
+            | "struct"
+            | "super"
+            | "trait"
+            | "true"
+            | "type"
+            | "unsafe"
+            | "use"
+            | "where"
+            | "while"
+    )
+}
+
 #[must_use]
 pub fn extract_file(
     relative_path: &str,
@@ -395,6 +446,7 @@ pub fn extract_file(
     let tree = parser.parse(source, None).expect("parser returns a tree");
     let mut symbols = Vec::new();
     let mut imports = Vec::new();
+    let mut references = Vec::new();
     let mut structural = Vec::new();
     let mut facts_truncated = false;
     let mut stack = vec![(tree.root_node(), None::<String>)];
@@ -436,6 +488,26 @@ pub fn extract_file(
                 facts_truncated = true;
             }
         }
+        if language == Language::Rust && node.kind() == "identifier" {
+            let name = node_text(node, source);
+            let is_declaration = symbols.iter().any(|symbol| {
+                symbol.range.start_byte <= node.start_byte()
+                    && node.end_byte() <= symbol.range.end_byte
+                    && symbol.name == name
+            });
+            if !is_declaration && !rust_reference_keyword(&name) {
+                if references.len() < MAX_REFERENCES_PER_FILE {
+                    references.push(ReferenceFact {
+                        name,
+                        resolved_symbol: None,
+                        range: range(node),
+                        provenance: provenance(Evidence::Derived),
+                    });
+                } else {
+                    facts_truncated = true;
+                }
+            }
+        }
         if matches!(language, Language::Html | Language::Css)
             && matches!(
                 node.kind(),
@@ -473,6 +545,7 @@ pub fn extract_file(
         (a.range.start_byte, &a.qualified_name).cmp(&(b.range.start_byte, &b.qualified_name))
     });
     imports.sort_by_key(|a| a.range.start_byte);
+    references.sort_by_key(|a| a.range.start_byte);
     structural.sort_by(|a, b| {
         a.range
             .as_ref()
@@ -500,6 +573,7 @@ pub fn extract_file(
         source_size: source.len() as u64,
         symbols,
         imports,
+        references,
         structural_facts: structural,
         parse_diagnostics: ParseDiagnostics {
             contains_error_nodes: !diagnostics.is_empty(),
@@ -644,6 +718,62 @@ impl RepositoryGraph {
             .sort_by(|a, b| (&a.source, &a.kind, &a.target).cmp(&(&b.source, &b.kind, &b.target)));
         self.edges.dedup();
     }
+
+    fn enrich_semantics(&mut self) {
+        self.edges.retain(|edge| edge.kind != "REFERENCES");
+        let mut definitions = BTreeMap::new();
+        for (path, pack) in &self.facts {
+            for symbol in &pack.symbols {
+                definitions.insert(
+                    (path.clone(), symbol.name.clone()),
+                    format!("symbol:{path}:{}", symbol.qualified_name),
+                );
+            }
+        }
+        let paths: BTreeSet<String> = self.facts.keys().cloned().collect();
+        let mut additions = Vec::new();
+        for (path, pack) in &mut self.facts {
+            if pack.language != Language::Rust {
+                continue;
+            }
+            for reference in &mut pack.references {
+                reference.resolved_symbol = None;
+            }
+            let mut imported = BTreeMap::new();
+            for import in &mut pack.imports {
+                import.resolution = "UNRESOLVED".into();
+                let Some((name, module)) = rust_import_parts(&import.target) else {
+                    continue;
+                };
+                let Some(target_path) = rust_module_path(path, &module, &paths) else {
+                    continue;
+                };
+                let Some(symbol_id) = definitions.get(&(target_path, name.clone())) else {
+                    continue;
+                };
+                import.resolution.clone_from(symbol_id);
+                imported.insert(name, symbol_id.clone());
+            }
+            for reference in &mut pack.references {
+                let symbol_id = imported.get(&reference.name).cloned().or_else(|| {
+                    definitions
+                        .get(&(path.clone(), reference.name.clone()))
+                        .cloned()
+                });
+                let Some(symbol_id) = symbol_id else {
+                    continue;
+                };
+                reference.resolved_symbol = Some(symbol_id.clone());
+                additions.push(GraphEdge {
+                    source: format!("file:{path}"),
+                    target: symbol_id,
+                    kind: "REFERENCES".into(),
+                    provenance: semantic_provenance(reference.provenance.clone()),
+                });
+            }
+        }
+        self.edges.extend(additions);
+    }
     #[must_use]
     pub fn file_facts(&self, path: &str) -> Option<&FileFactPack> {
         self.facts.get(path)
@@ -745,6 +875,59 @@ impl RepositoryGraph {
         }
         result
     }
+}
+
+fn semantic_provenance(mut provenance: Provenance) -> Provenance {
+    provenance.source = "SyntaxResolver".into();
+    provenance.analyzer = "repository-intelligence-rust-resolver".into();
+    provenance.evidence = Evidence::Derived;
+    provenance
+}
+
+fn rust_import_parts(target: &str) -> Option<(String, String)> {
+    let target = target
+        .trim()
+        .strip_prefix("use ")?
+        .trim_end_matches(';')
+        .trim();
+    if target.contains('{') || target.contains('*') {
+        return None;
+    }
+    let mut parts = target.split("::").map(str::trim).collect::<Vec<_>>();
+    let name = parts.pop()?.to_string();
+    if parts.is_empty() {
+        return None;
+    }
+    Some((name, parts.join("::")))
+}
+
+fn rust_module_path(path: &str, module: &str, paths: &BTreeSet<String>) -> Option<String> {
+    let mut segments = module.split("::").collect::<Vec<_>>();
+    let mut base = Path::new(path).parent().unwrap_or_else(|| Path::new(""));
+    if segments.first().copied() == Some("crate") {
+        segments.remove(0);
+        base = Path::new("src");
+    } else if segments.first().copied() == Some("self") {
+        segments.remove(0);
+    } else {
+        while segments.first().copied() == Some("super") {
+            segments.remove(0);
+            base = base.parent().unwrap_or_else(|| Path::new(""));
+        }
+    }
+    let relative = segments
+        .iter()
+        .fold(base.to_path_buf(), |mut path, segment| {
+            path.push(segment);
+            path
+        });
+    for candidate in [relative.with_extension("rs"), relative.join("mod.rs")] {
+        let candidate = candidate.to_string_lossy().replace('\\', "/");
+        if paths.contains(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 #[derive(Clone, Debug)]
@@ -865,6 +1048,7 @@ impl RepositoryIndex {
             };
             graph.add_pack(pack);
         }
+        graph.enrich_semantics();
         graph.finish();
         let (nodes, edges) = graph.statistics();
         stats.nodes = nodes;
@@ -917,6 +1101,7 @@ impl RepositoryIndex {
                 merged.remove_file(&path);
             }
         }
+        merged.enrich_semantics();
         merged.finish();
         let (nodes, edges) = merged.statistics();
         stats.nodes = nodes;
@@ -1218,5 +1403,39 @@ mod tests {
         assert!(safe_relative(root, Path::new("/tmp/repository/ok.rs")).is_ok());
         assert!(safe_relative(root, Path::new("/tmp/repository/../outside.rs")).is_err());
         assert!(safe_relative(root, Path::new("/other/ok.rs")).is_err());
+    }
+
+    #[test]
+    fn rust_semantics_resolve_explicit_imports_not_unrelated_names() {
+        let dir = std::env::temp_dir().join(format!("ri-semantic-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("src/main.rs"),
+            "use crate::util::target; fn main() { target(); }",
+        )
+        .unwrap();
+        fs::write(dir.join("src/util.rs"), "pub fn target() {}").unwrap();
+        fs::write(dir.join("src/other.rs"), "pub fn target() {}").unwrap();
+        let built = RepositoryIndex::build(&dir, None, AnalysisConfig::default(), true).unwrap();
+        let main = built.graph.file_facts("src/main.rs").unwrap();
+        let util_id = "symbol:src/util.rs:target";
+        assert!(main
+            .imports
+            .iter()
+            .any(|import| import.resolution == util_id));
+        let references = built
+            .graph
+            .outgoing("file:src/main.rs")
+            .into_iter()
+            .filter(|edge| edge.kind == "REFERENCES")
+            .collect::<Vec<_>>();
+        assert!(!references.is_empty());
+        assert!(references.iter().all(|edge| edge.target == util_id));
+        assert!(references.iter().all(|edge| {
+            edge.provenance.source == "SyntaxResolver"
+                && edge.provenance.evidence == Evidence::Derived
+        }));
+        let _ = fs::remove_dir_all(dir);
     }
 }
