@@ -22,23 +22,51 @@ impl ProviderClient {
         model: &str,
         anthropic_auth: Option<AuthSource>,
     ) -> Result<Self, ApiError> {
+        Self::from_model_with_profile(model, None, anthropic_auth, None)
+    }
+
+    pub fn from_model_with_profile(
+        model: &str,
+        provider_hint: Option<&str>,
+        anthropic_auth: Option<AuthSource>,
+        endpoint: Option<&str>,
+    ) -> Result<Self, ApiError> {
         let resolved_model = providers::resolve_model_alias(model);
-        match providers::detect_provider_kind(&resolved_model) {
-            ProviderKind::Anthropic => Ok(Self::Anthropic(match anthropic_auth {
-                Some(auth) => AnthropicClient::from_auth(auth),
-                None => AnthropicClient::from_env()?,
-            })),
-            ProviderKind::Xai => Ok(Self::Xai(OpenAiCompatClient::from_env(
-                OpenAiCompatConfig::xai(),
-            )?)),
+        let provider = provider_hint.map(str::to_ascii_lowercase);
+        let provider_kind = match provider.as_deref() {
+            Some("anthropic") => ProviderKind::Anthropic,
+            Some("xai") => ProviderKind::Xai,
+            Some("openai" | "ollama" | "vllm" | "dashscope") => ProviderKind::OpenAi,
+            _ => providers::detect_provider_kind(&resolved_model),
+        };
+        match provider_kind {
+            ProviderKind::Anthropic => {
+                let client = match anthropic_auth {
+                    Some(auth) => AnthropicClient::from_auth(auth),
+                    None => AnthropicClient::from_env()?,
+                };
+                Ok(Self::Anthropic(
+                    endpoint.map_or(client.clone(), |url| client.with_base_url(url)),
+                ))
+            }
+            ProviderKind::Xai => {
+                let client = OpenAiCompatClient::from_env(OpenAiCompatConfig::xai())?;
+                Ok(Self::Xai(
+                    endpoint.map_or(client.clone(), |url| client.with_base_url(url)),
+                ))
+            }
             ProviderKind::OpenAi => {
                 // DashScope models (qwen-*) also return ProviderKind::OpenAi because they
                 // speak the OpenAI wire format, but they need the DashScope config which
                 // reads DASHSCOPE_API_KEY and points at dashscope.aliyuncs.com.
-                if std::env::var_os("OLLAMA_HOST").is_some()
-                    && providers::metadata_for_model(&resolved_model).is_none()
+                if provider.as_deref() == Some("ollama")
+                    || (std::env::var_os("OLLAMA_HOST").is_some()
+                        && providers::metadata_for_model(&resolved_model).is_none())
                 {
-                    return Ok(Self::OpenAi(OpenAiCompatClient::from_ollama_env()));
+                    let client = OpenAiCompatClient::from_ollama_env();
+                    return Ok(Self::OpenAi(
+                        endpoint.map_or(client.clone(), |url| client.with_base_url(url)),
+                    ));
                 }
                 let config = match providers::metadata_for_model(&resolved_model) {
                     Some(meta) if meta.auth_env == "DASHSCOPE_API_KEY" => {
@@ -46,7 +74,10 @@ impl ProviderClient {
                     }
                     _ => OpenAiCompatConfig::openai(),
                 };
-                Ok(Self::OpenAi(OpenAiCompatClient::from_env(config)?))
+                let client = OpenAiCompatClient::from_env(config)?;
+                Ok(Self::OpenAi(
+                    endpoint.map_or(client.clone(), |url| client.with_base_url(url)),
+                ))
             }
         }
     }

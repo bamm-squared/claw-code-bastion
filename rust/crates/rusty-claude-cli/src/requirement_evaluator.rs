@@ -5,6 +5,7 @@
 //! [`EvaluationRequest`] without receiving the writer's conversation history.
 
 use crate::task_plan::{ExpectedContract, PlanItemStatus, TaskPlan};
+use serde::Deserialize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequirementState {
@@ -30,6 +31,7 @@ pub struct EvaluationReport {
     pub deterministic: bool,
     pub requirements: Vec<EvaluationFinding>,
     pub validation_passed: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,6 +106,7 @@ impl RequirementEvaluator {
             deterministic: false,
             requirements,
             validation_passed,
+            error: None,
         }
     }
 
@@ -155,6 +158,80 @@ impl RequirementEvaluator {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ModelEvaluationEnvelope {
+    requirements: Vec<ModelEvaluationFinding>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelEvaluationFinding {
+    requirement_id: String,
+    state: String,
+    finding: String,
+    evidence: String,
+    confidence: String,
+    rework_recommended: bool,
+}
+
+impl RequirementEvaluator {
+    pub fn from_model_response(
+        response: &str,
+        validation_passed: bool,
+    ) -> Result<EvaluationReport, String> {
+        let envelope: ModelEvaluationEnvelope = serde_json::from_str(response.trim())
+            .map_err(|error| format!("malformed evaluator response: {error}"))?;
+        if envelope.requirements.is_empty() {
+            return Err("evaluator returned no requirement findings".to_string());
+        }
+        let requirements = envelope
+            .requirements
+            .into_iter()
+            .map(|finding| {
+                let state = match finding.state.to_ascii_lowercase().as_str() {
+                    "satisfied" => RequirementState::Satisfied,
+                    "partially_satisfied" | "partially satisfied" => {
+                        RequirementState::PartiallySatisfied
+                    }
+                    "missing_evidence" | "missing evidence" => RequirementState::MissingEvidence,
+                    "gap_found" | "gap found" => RequirementState::GapFound,
+                    "uncertain" => RequirementState::Uncertain,
+                    other => return Err(format!("unknown evaluator state: {other}")),
+                };
+                Ok(EvaluationFinding {
+                    requirement_id: finding.requirement_id,
+                    state,
+                    finding: finding.finding,
+                    evidence: finding.evidence,
+                    confidence: Box::leak(finding.confidence.into_boxed_str()),
+                    rework_recommended: finding.rework_recommended,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(EvaluationReport {
+            deterministic: false,
+            requirements,
+            validation_passed,
+            error: None,
+        })
+    }
+
+    pub fn unavailable(validation_passed: bool, reason: impl Into<String>) -> EvaluationReport {
+        EvaluationReport {
+            deterministic: false,
+            requirements: vec![EvaluationFinding {
+                requirement_id: "evaluation".to_string(),
+                state: RequirementState::Uncertain,
+                finding: "Independent semantic evaluation was unavailable.".to_string(),
+                evidence: reason.into(),
+                confidence: "unknown",
+                rework_recommended: true,
+            }],
+            validation_passed,
+            error: Some("independent semantic evaluation unavailable".to_string()),
+        }
+    }
+}
+
 impl EvaluationReport {
     #[must_use]
     pub fn has_rework_finding(&self) -> bool {
@@ -165,7 +242,8 @@ impl EvaluationReport {
 
     #[must_use]
     pub fn summary(&self) -> String {
-        self.requirements
+        let summary = self
+            .requirements
             .iter()
             .map(|finding| {
                 format!(
@@ -176,7 +254,10 @@ impl EvaluationReport {
                 )
             })
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        self.error.as_ref().map_or(summary.clone(), |error| {
+            format!("{summary}\nevaluator error: {error}")
+        })
     }
 }
 
@@ -249,5 +330,21 @@ mod tests {
             RequirementState::Satisfied as u8,
             PlanItemStatus::Implemented as u8
         );
+    }
+
+    #[test]
+    fn malformed_model_response_is_not_success() {
+        assert!(RequirementEvaluator::from_model_response("not json", true).is_err());
+    }
+
+    #[test]
+    fn structured_model_response_preserves_requirement_state() {
+        let report = RequirementEvaluator::from_model_response(
+            r#"{"requirements":[{"requirement_id":"r1","state":"gap_found","finding":"missing path","evidence":"no change","confidence":"high","rework_recommended":true}]}"#,
+            true,
+        )
+        .expect("valid evaluator response");
+        assert_eq!(report.requirements[0].state, RequirementState::GapFound);
+        assert!(report.has_rework_finding());
     }
 }

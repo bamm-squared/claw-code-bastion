@@ -3713,6 +3713,7 @@ struct LiveCli {
     model_pool: model_router::ModelPool,
     routing_policy: model_router::RoutingPolicy,
     last_routing_explanation: Option<String>,
+    selected_writer_profile: Option<model_router::ModelProfile>,
 }
 
 #[derive(Debug, Clone)]
@@ -4557,6 +4558,7 @@ impl LiveCli {
             model_pool,
             routing_policy,
             last_routing_explanation: None,
+            selected_writer_profile: None,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -4583,7 +4585,8 @@ impl LiveCli {
         );
         self.last_routing_explanation = Some(decision.reason.clone());
         if let Some(profile) = decision.selected {
-            self.model = profile.model;
+            self.model.clone_from(&profile.model);
+            self.selected_writer_profile = Some(profile);
         }
     }
 
@@ -4808,7 +4811,7 @@ impl LiveCli {
             .map(|selection| selection.text.as_str());
         self.task_plan.update(task_input, repository_text);
         let plan_text = self.task_plan.render();
-        let runtime = build_runtime_with_backend(
+        let runtime = build_runtime_with_backend_profile(
             self.runtime.session().clone(),
             &self.session.id,
             self.model.clone(),
@@ -4819,7 +4822,18 @@ impl LiveCli {
             self.permission_mode,
             None,
             retained_backend,
+            self.selected_writer_profile.as_ref(),
         )?;
+        let mut runtime = runtime;
+        if let Some(profile) = &self.selected_writer_profile {
+            if let Some(inner) = runtime.runtime.as_mut() {
+                inner
+                    .api_client_mut()
+                    .set_reasoning_effort(normalize_profile_reasoning(
+                        profile.reasoning_profile.as_deref(),
+                    )?);
+            }
+        }
         let runtime = if let Some(selection) = repository_context {
             benchmark_telemetry::repository_intelligence_context(
                 selection.text.len() as u64,
@@ -5079,11 +5093,36 @@ impl LiveCli {
                 routing_signals(&self.task_plan),
                 &self.routing_policy,
             );
+            let evidence = requirement_evaluator::RequirementEvaluator::render_request(&request);
             println!(
                 "Evaluator routing: {}\nEvidence package: {} bytes; writer conversation excluded",
                 evaluator_route.reason,
-                requirement_evaluator::RequirementEvaluator::render_request(&request).len()
+                evidence.len()
             );
+            self.evaluation = Some(match evaluator_route.selected {
+                Some(profile) => match execute_evaluator_profile(&profile, &request) {
+                    Ok(response) => {
+                        requirement_evaluator::RequirementEvaluator::from_model_response(
+                            &response,
+                            normal_apply_allowed,
+                        )
+                        .unwrap_or_else(|error| {
+                            requirement_evaluator::RequirementEvaluator::unavailable(
+                                normal_apply_allowed,
+                                error,
+                            )
+                        })
+                    }
+                    Err(error) => requirement_evaluator::RequirementEvaluator::unavailable(
+                        normal_apply_allowed,
+                        error,
+                    ),
+                },
+                None => requirement_evaluator::RequirementEvaluator::unavailable(
+                    normal_apply_allowed,
+                    evaluator_route.reason,
+                ),
+            });
         }
         if !normal_apply_allowed {
             self.task_plan
@@ -8399,8 +8438,38 @@ fn build_runtime_with_backend(
     progress_reporter: Option<InternalPromptProgressReporter>,
     execution_backend: Option<Arc<Mutex<dyn ExecutionBackend>>>,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
+    build_runtime_with_backend_profile(
+        session,
+        session_id,
+        model,
+        system_prompt,
+        enable_tools,
+        emit_output,
+        allowed_tools,
+        permission_mode,
+        progress_reporter,
+        execution_backend,
+        None,
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_arguments)]
+fn build_runtime_with_backend_profile(
+    session: Session,
+    session_id: &str,
+    model: String,
+    system_prompt: Vec<String>,
+    enable_tools: bool,
+    emit_output: bool,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    progress_reporter: Option<InternalPromptProgressReporter>,
+    execution_backend: Option<Arc<Mutex<dyn ExecutionBackend>>>,
+    profile: Option<&model_router::ModelProfile>,
+) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     let runtime_plugin_state = build_runtime_plugin_state_with_backend(execution_backend)?;
-    build_runtime_with_plugin_state(
+    build_runtime_with_plugin_state_profile(
         session,
         session_id,
         model,
@@ -8411,12 +8480,42 @@ fn build_runtime_with_backend(
         permission_mode,
         progress_reporter,
         runtime_plugin_state,
+        profile,
     )
 }
 
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_arguments)]
 fn build_runtime_with_plugin_state(
+    session: Session,
+    session_id: &str,
+    model: String,
+    system_prompt: Vec<String>,
+    enable_tools: bool,
+    emit_output: bool,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    progress_reporter: Option<InternalPromptProgressReporter>,
+    runtime_plugin_state: RuntimePluginState,
+) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
+    build_runtime_with_plugin_state_profile(
+        session,
+        session_id,
+        model,
+        system_prompt,
+        enable_tools,
+        emit_output,
+        allowed_tools,
+        permission_mode,
+        progress_reporter,
+        runtime_plugin_state,
+        None,
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_arguments)]
+fn build_runtime_with_plugin_state_profile(
     mut session: Session,
     session_id: &str,
     model: String,
@@ -8427,6 +8526,7 @@ fn build_runtime_with_plugin_state(
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
     runtime_plugin_state: RuntimePluginState,
+    profile: Option<&model_router::ModelProfile>,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     // Persist the model in session metadata so resumed sessions can report it.
     if session.model.is_none() {
@@ -8456,6 +8556,8 @@ fn build_runtime_with_plugin_state(
             allowed_tools.clone(),
             tool_registry.clone(),
             progress_reporter,
+            profile.map(|value| value.provider.as_str()),
+            profile.and_then(|value| value.endpoint.as_deref()),
         )?,
         CliToolExecutor::new(
             allowed_tools.clone(),
@@ -8596,6 +8698,7 @@ struct AnthropicRuntimeClient {
 }
 
 impl AnthropicRuntimeClient {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         session_id: &str,
         model: String,
@@ -8604,6 +8707,8 @@ impl AnthropicRuntimeClient {
         allowed_tools: Option<AllowedToolSet>,
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
+        provider: Option<&str>,
+        endpoint: Option<&str>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Dispatch to the correct provider at construction time.
         // `ApiProviderClient` (exposed by the api crate as
@@ -8626,11 +8731,21 @@ impl AnthropicRuntimeClient {
         // skip it.
         let resolved_model = api::resolve_model_alias(&model);
         enforce_private_provider(&resolved_model)?;
-        let client = match detect_provider_kind(&resolved_model) {
+        let client = match provider
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+            .and_then(|value| match value {
+                "anthropic" => Some(ProviderKind::Anthropic),
+                "xai" => Some(ProviderKind::Xai),
+                "openai" | "ollama" | "vllm" | "dashscope" => Some(ProviderKind::OpenAi),
+                _ => None,
+            })
+            .unwrap_or_else(|| detect_provider_kind(&resolved_model))
+        {
             ProviderKind::Anthropic => {
                 let auth = resolve_cli_auth_source()?;
-                let mut inner =
-                    AnthropicClient::from_auth(auth).with_base_url(api::read_base_url());
+                let mut inner = AnthropicClient::from_auth(auth)
+                    .with_base_url(endpoint.map_or_else(api::read_base_url, str::to_string));
                 if !is_private_mode() {
                     inner = inner.with_prompt_cache(PromptCache::new(session_id));
                 }
@@ -8647,7 +8762,12 @@ impl AnthropicRuntimeClient {
                 // OpenRouter, xAI, DashScope, Ollama, and any other
                 // OpenAI-compat endpoint users configure via
                 // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
-                ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
+                ApiProviderClient::from_model_with_profile(
+                    &resolved_model,
+                    provider,
+                    None,
+                    endpoint,
+                )?
             }
         };
         Ok(Self {
@@ -8675,6 +8795,71 @@ fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
 
 fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
     resolve_startup_auth_source(|| Ok(None))
+}
+
+fn execute_evaluator_profile(
+    profile: &model_router::ModelProfile,
+    request: &requirement_evaluator::EvaluationRequest,
+) -> Result<String, String> {
+    let resolved_model = api::resolve_model_alias(&profile.model);
+    enforce_private_provider(&resolved_model).map_err(|error| error.to_string())?;
+    let client = ApiProviderClient::from_model_with_profile(
+        &resolved_model,
+        Some(&profile.provider),
+        (profile.provider.eq_ignore_ascii_case("anthropic"))
+            .then(resolve_cli_auth_source)
+            .transpose()
+            .map_err(|error| error.to_string())?,
+        profile.endpoint.as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
+    let request_text = requirement_evaluator::RequirementEvaluator::render_request(request);
+    let message_request = MessageRequest {
+        model: resolved_model,
+        max_tokens: 2_048,
+        messages: vec![InputMessage::user_text(request_text)],
+        system: Some(
+            "You are an independent requirement evaluator. Return only JSON with a requirements array."
+                .to_string(),
+        ),
+        stream: false,
+        reasoning_effort: normalize_profile_reasoning(profile.reasoning_profile.as_deref())?,
+        ..Default::default()
+    };
+    if let Ok(bytes) = serde_json::to_vec(&message_request) {
+        benchmark_telemetry::provider_call();
+        benchmark_telemetry::model_turn();
+        benchmark_telemetry::model_request_bytes(bytes.len() as u64);
+    }
+    let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+    let response = runtime
+        .block_on(client.send_message(&message_request))
+        .map_err(|error| error.to_string())?;
+    let text = response
+        .content
+        .into_iter()
+        .filter_map(|block| match block {
+            OutputContentBlock::Text { text } => Some(text),
+            OutputContentBlock::ToolUse { .. }
+            | OutputContentBlock::Thinking { .. }
+            | OutputContentBlock::RedactedThinking { .. } => None,
+        })
+        .collect::<String>();
+    if text.trim().is_empty() {
+        Err("evaluator returned an empty text response".to_string())
+    } else {
+        Ok(text)
+    }
+}
+
+fn normalize_profile_reasoning(value: Option<&str>) -> Result<Option<String>, String> {
+    match value.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("default" | "none" | "off") => Ok(None),
+        Some("low" | "medium" | "high") => Ok(value.map(str::to_string)),
+        Some(other) => Err(format!(
+            "unsupported routed reasoning profile '{other}'; supported values are default, off, none, low, medium, and high"
+        )),
+    }
 }
 
 impl ApiClient for AnthropicRuntimeClient {
