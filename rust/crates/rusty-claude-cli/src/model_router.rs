@@ -489,6 +489,36 @@ impl CalibrationStore {
         self.external_priors.clear();
     }
 
+    pub fn clear_local(&mut self, profile_id: Option<&str>) {
+        self.observations.retain(|observation| {
+            observation.evidence_kind != CalibrationEvidenceKind::LocalCalibration
+                || profile_id.is_some_and(|id| observation.profile_id != id)
+        });
+    }
+
+    #[must_use]
+    pub fn summary(&self) -> Vec<String> {
+        let mut rows = self
+            .observations
+            .iter()
+            .map(|observation| {
+                format!(
+                    "{} {:?} bucket={} first_pass={} validation={} rework={} escalation={} evidence={:?}",
+                    observation.profile_id,
+                    observation.role,
+                    observation.difficulty_bucket,
+                    observation.first_pass_success,
+                    observation.validation_passed,
+                    observation.rework_required,
+                    observation.escalation_required,
+                    observation.evidence_kind,
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    }
+
     #[must_use]
     pub fn effective_profile(&self, profile: &ModelProfile) -> ModelProfile {
         let identity = CalibrationIdentity::from_profile(profile);
@@ -672,6 +702,24 @@ pub struct DifficultyRationale {
     pub scope: u8,
     pub risk: u8,
     pub unresolved: u8,
+}
+
+#[must_use]
+pub fn difficulty_bucket(estimate: DifficultyEstimate) -> u8 {
+    let requirement = estimate.requirement;
+    let score = (u16::from(requirement.coding)
+        + u16::from(requirement.reasoning)
+        + u16::from(requirement.agent_tool_use)
+        + u16::from(requirement.planning)
+        + u16::from(requirement.evaluation))
+        / 5;
+    match score {
+        0..=39 => 1,
+        40..=59 => 2,
+        60..=79 => 3,
+        80..=94 => 4,
+        _ => 5,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -29,7 +29,7 @@ use std::process::Command;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use api::{
     detect_provider_kind, resolve_startup_auth_source, AnthropicClient, AuthSource,
@@ -536,6 +536,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             action,
             output_format,
         } => provider::run(action, matches!(output_format, CliOutputFormat::Json))?,
+        CliAction::Calibration {
+            action,
+            profile,
+            path,
+            output_format,
+        } => run_calibration_command(&action, profile.as_deref(), path.as_deref(), output_format)?,
         CliAction::DumpManifests {
             output_format,
             manifests_dir,
@@ -639,6 +645,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 enum CliAction {
     Provider {
         action: provider::ProviderAction,
+        output_format: CliOutputFormat,
+    },
+    Calibration {
+        action: String,
+        profile: Option<String>,
+        path: Option<PathBuf>,
         output_format: CliOutputFormat,
     },
     DumpManifests {
@@ -1032,6 +1044,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
 
     match rest[0].as_str() {
         "provider" => parse_provider_args(&rest[1..], output_format),
+        "calibration" => parse_calibration_args(&rest[1..], output_format),
         "dump-manifests" => parse_dump_manifests_args(&rest[1..], output_format),
         "bootstrap-plan" => Ok(CliAction::BootstrapPlan { output_format }),
         "agents" => Ok(CliAction::Agents {
@@ -1134,6 +1147,122 @@ fn parse_provider_args(
         action,
         output_format,
     })
+}
+
+fn parse_calibration_args(
+    args: &[String],
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
+    let action = args.first().map_or("show", String::as_str);
+    if !matches!(action, "show" | "clear" | "import" | "cases") {
+        return Err("usage: claw calibration [show|clear [PROFILE]|import PATH|cases]".to_string());
+    }
+    let (profile, path) = match action {
+        "clear" => {
+            if args.len() > 2 {
+                return Err("usage: claw calibration clear [PROFILE]".to_string());
+            }
+            (args.get(1).cloned(), None)
+        }
+        "import" => {
+            if args.len() != 2 {
+                return Err("usage: claw calibration import PATH".to_string());
+            }
+            (None, Some(PathBuf::from(&args[1])))
+        }
+        _ if args.len() != 1 => {
+            return Err("usage: claw calibration [show|cases]".to_string());
+        }
+        _ => (None, None),
+    };
+    Ok(CliAction::Calibration {
+        action: action.to_string(),
+        profile,
+        path,
+        output_format,
+    })
+}
+
+fn calibration_store_path() -> PathBuf {
+    env::var_os("CLAW_CALIBRATION_PATH").map_or_else(
+        || {
+            env::var_os("HOME").map_or_else(
+                || PathBuf::from(".claw/calibration.json"),
+                |home| PathBuf::from(home).join(".config/claw/calibration.json"),
+            )
+        },
+        PathBuf::from,
+    )
+}
+
+fn run_calibration_command(
+    action: &str,
+    profile: Option<&str>,
+    import_path: Option<&Path>,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if is_private_mode() && matches!(action, "clear" | "import") {
+        return Err("calibration persistence is disabled in private mode".into());
+    }
+    if action == "cases" {
+        let cases = model_router::default_calibration_cases();
+        if output_format == CliOutputFormat::Json {
+            println!("{}", serde_json::to_string_pretty(&cases.iter().map(|case| serde_json::json!({
+                "id": case.id, "role": case.role, "difficulty_bucket": case.difficulty_bucket, "description": case.description
+            })).collect::<Vec<_>>())?);
+        } else {
+            for case in cases {
+                println!(
+                    "{}: {:?}, difficulty {}, {}",
+                    case.id, case.role, case.difficulty_bucket, case.description
+                );
+            }
+        }
+        return Ok(());
+    }
+    let store_path = calibration_store_path();
+    let mut store = model_router::CalibrationStore::load(&store_path)
+        .unwrap_or_else(|_| model_router::CalibrationStore::new());
+    match action {
+        "show" => {
+            let rows = store.summary();
+            if output_format == CliOutputFormat::Json {
+                println!("{}", serde_json::to_string_pretty(&store)?);
+            } else if rows.is_empty() {
+                println!("No calibration evidence at {}.", store_path.display());
+            } else {
+                println!("Calibration evidence at {}:", store_path.display());
+                for row in rows {
+                    println!("  {row}");
+                }
+                println!("External priors: {}", store.external_priors.len());
+            }
+        }
+        "clear" => {
+            store.clear_local(profile);
+            if let Some(parent) = store_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            store.save(&store_path).map_err(std::io::Error::other)?;
+            println!(
+                "Cleared local calibration evidence{}.",
+                profile.map_or_else(String::new, |id| format!(" for {id}"))
+            );
+        }
+        "import" => {
+            let source = std::fs::read_to_string(import_path.expect("import path"))?;
+            let count = store
+                .import_external_json(&source)
+                .map_err(std::io::Error::other)?;
+            if let Some(parent) = store_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            store.save(&store_path).map_err(std::io::Error::other)?;
+            println!("Imported {count} external benchmark prior(s).");
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
 }
 
 fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>> {
@@ -3716,6 +3845,8 @@ struct LiveCli {
     routing_policy: model_router::RoutingPolicy,
     last_routing_explanation: Option<String>,
     selected_writer_profile: Option<model_router::ModelProfile>,
+    selected_evaluator_profile: Option<model_router::ModelProfile>,
+    calibration_path: Option<PathBuf>,
     pending_rework: Option<model_router::EscalationPackage>,
     rework_cycles: u8,
     escalation_requested: bool,
@@ -4523,10 +4654,14 @@ impl LiveCli {
         let cwd = env::current_dir()?;
         let config = ConfigLoader::default_for(&cwd).load()?;
         let model_pool = model_router::ModelPool::from_runtime_config(&config, &model);
+        let calibration_path = (!is_private_mode()).then(calibration_store_path);
         let calibration = if is_private_mode() {
             model_router::CalibrationStore::new()
         } else {
-            model_router::CalibrationStore::from_runtime_config(&config)
+            calibration_path
+                .as_deref()
+                .and_then(|path| model_router::CalibrationStore::load(path).ok())
+                .unwrap_or_else(|| model_router::CalibrationStore::from_runtime_config(&config))
         };
         let mut routing_policy = model_router::RoutingPolicy::from_runtime_config(&config);
         if is_private_mode() && env::var("CLAW_PRIVATE_ALLOW_REMOTE_PROVIDER").as_deref() != Ok("1")
@@ -4571,6 +4706,8 @@ impl LiveCli {
             routing_policy,
             last_routing_explanation: None,
             selected_writer_profile: None,
+            selected_evaluator_profile: None,
+            calibration_path,
             pending_rework: None,
             rework_cycles: 0,
             escalation_requested: false,
@@ -5174,6 +5311,8 @@ impl LiveCli {
                 routing_signals(&self.task_plan),
                 &self.routing_policy,
             );
+            self.selected_evaluator_profile
+                .clone_from(&evaluator_route.selected);
             let evidence = requirement_evaluator::RequirementEvaluator::render_request(&request);
             println!(
                 "Evaluator routing: {}\nEvidence package: {} bytes; writer conversation excluded",
@@ -5214,6 +5353,10 @@ impl LiveCli {
             .clone()
             .unwrap_or_else(|| evaluation.clone());
         println!("\nRequirement evaluation\n{}", active_evaluation.summary());
+        self.record_runtime_calibration(
+            validation.allows_apply(changes.id, policy, false),
+            !active_evaluation.has_rework_finding(),
+        );
 
         if active_evaluation.has_rework_finding() {
             self.record_evaluation_rework(&active_evaluation, &changed_paths, normal_apply_allowed);
@@ -5312,6 +5455,65 @@ impl LiveCli {
         }
 
         Ok(false)
+    }
+
+    fn record_runtime_calibration(&mut self, validation_passed: bool, evaluation_passed: bool) {
+        if is_private_mode() {
+            return;
+        }
+        let estimate = model_router::ModelRouter::estimate(
+            model_router::ModelRole::Writer,
+            routing_signals(&self.task_plan),
+            &self.routing_policy,
+        );
+        let bucket = model_router::difficulty_bucket(estimate);
+        let recorded_at = SystemTime::now().duration_since(UNIX_EPOCH).map_or_else(
+            |_| "unknown".to_string(),
+            |duration| duration.as_secs().to_string(),
+        );
+        let mut store = self.calibration.clone();
+        let mut record = |profile: &model_router::ModelProfile,
+                          role: model_router::ModelRole,
+                          passed: bool,
+                          rework: bool| {
+            let outcome = model_router::OutcomeMetadata {
+                profile_id: profile.id.clone(),
+                identity: model_router::CalibrationIdentity::from_profile(profile),
+                role,
+                runtime_identity: env!("CARGO_PKG_VERSION").to_string(),
+                difficulty_bucket: bucket,
+                first_pass_success: passed && validation_passed,
+                validation_passed,
+                evaluation_passed: Some(passed),
+                rework_required: rework,
+                escalation_required: self.escalation_requested,
+                elapsed_ms: None,
+                recorded_at: recorded_at.clone(),
+            };
+            let _ = store.record_outcome(outcome, false);
+        };
+        if let Some(profile) = self.selected_writer_profile.clone() {
+            record(
+                &profile,
+                model_router::ModelRole::Writer,
+                evaluation_passed,
+                !evaluation_passed,
+            );
+        }
+        if let Some(profile) = self.selected_evaluator_profile.clone() {
+            record(
+                &profile,
+                model_router::ModelRole::Evaluator,
+                evaluation_passed,
+                false,
+            );
+        }
+        self.calibration = store;
+        if let Some(path) = self.calibration_path.as_deref() {
+            if let Err(error) = self.calibration.save(path) {
+                eprintln!("warning: calibration outcome was not persisted: {error}");
+            }
+        }
     }
 
     fn run_automatic_rework(
