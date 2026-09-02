@@ -11,6 +11,7 @@ mod benchmark_telemetry;
 mod context_reference;
 mod init;
 mod input;
+mod model_router;
 mod provider;
 mod render;
 mod requirement_evaluator;
