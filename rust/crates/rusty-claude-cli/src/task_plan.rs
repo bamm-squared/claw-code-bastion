@@ -50,6 +50,30 @@ pub struct TaskPlan {
 }
 
 impl TaskPlan {
+    pub fn invalidate_after_candidate_restore(&mut self) {
+        let mut changed = false;
+        for item in &mut self.items {
+            if matches!(
+                item.status,
+                PlanItemStatus::Implemented
+                    | PlanItemStatus::EvaluationFailed
+                    | PlanItemStatus::Verified
+            ) {
+                item.status = PlanItemStatus::NeedsResearch;
+                item.provenance =
+                    "candidate checkpoint restored; candidate-dependent state must be reconfirmed"
+                        .to_string();
+                changed = true;
+            }
+        }
+        if changed {
+            self.open_questions
+                .push("Reconfirm the plan against the restored candidate state.".to_string());
+            self.open_questions.truncate(MAX_CONTRACTS);
+            self.revision = self.revision.saturating_add(1);
+        }
+    }
+
     #[must_use]
     pub fn from_request(request: &str, repository_context: Option<&str>) -> Self {
         let mut plan = Self {
@@ -313,5 +337,21 @@ mod tests {
             .open_questions
             .iter()
             .any(|question| question.contains("Evaluation follow-up")));
+    }
+
+    #[test]
+    fn checkpoint_restore_reopens_candidate_dependent_plan_state() {
+        let mut plan = TaskPlan::from_request("Update the provider path", None);
+        plan.mark_implemented("item-1", "candidate writer");
+        let revision = plan.revision;
+
+        plan.invalidate_after_candidate_restore();
+
+        assert_eq!(plan.items[0].status, PlanItemStatus::NeedsResearch);
+        assert!(plan.revision > revision);
+        assert!(plan
+            .open_questions
+            .iter()
+            .any(|question| question.contains("restored candidate")));
     }
 }

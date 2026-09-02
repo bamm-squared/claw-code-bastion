@@ -58,7 +58,7 @@ impl CandidateCheckpointStore {
         let staged = self.root.join(format!("{id}.staged"));
         let path = self.root.join(&id);
         fs::create_dir_all(&staged)?;
-        if let Err(error) = copy_tree(candidate_root, &staged) {
+        if let Err(error) = copy_tree(candidate_root, &staged, candidate_root) {
             let _ = fs::remove_dir_all(&staged);
             return Err(error);
         }
@@ -104,7 +104,7 @@ impl CandidateCheckpointStore {
         let backup = self.root.join(format!("{id}.restore-backup"));
         fs::create_dir_all(&backup)?;
         move_contents(candidate_root, &backup)?;
-        if let Err(error) = copy_tree(&checkpoint.path, candidate_root) {
+        if let Err(error) = copy_tree(&checkpoint.path, candidate_root, &checkpoint.path) {
             let _ = clear_contents(candidate_root);
             let _ = move_contents(&backup, candidate_root);
             let _ = fs::remove_dir_all(&backup);
@@ -127,25 +127,25 @@ impl Drop for CandidateCheckpointStore {
     }
 }
 
-fn copy_tree(source: &Path, destination: &Path) -> io::Result<()> {
+fn copy_tree(source: &Path, destination: &Path, root: &Path) -> io::Result<()> {
     fs::create_dir_all(destination)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         if entry.file_name() == ".git" {
             continue;
         }
-        copy_entry(&entry.path(), &destination.join(entry.file_name()))?;
+        copy_entry(&entry.path(), &destination.join(entry.file_name()), root)?;
     }
     Ok(())
 }
 
-fn copy_entry(source: &Path, destination: &Path) -> io::Result<()> {
+fn copy_entry(source: &Path, destination: &Path, root: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(source)?;
     if metadata.is_dir() {
-        copy_tree(source, destination)
+        copy_tree(source, destination, root)
     } else if metadata.file_type().is_symlink() {
         let target = fs::read_link(source)?;
-        validate_link_target(source.parent().unwrap_or(Path::new("")), &target)?;
+        validate_link_target(source.parent().unwrap_or(Path::new("")), &target, root)?;
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -198,25 +198,42 @@ fn remove_entry(path: &Path) -> io::Result<()> {
     }
 }
 
-fn validate_link_target(parent: &Path, target: &Path) -> io::Result<()> {
+fn validate_link_target(parent: &Path, target: &Path, root: &Path) -> io::Result<()> {
     if target.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "absolute checkpoint symlink",
         ));
     }
-    let mut depth = 0_i32;
-    for component in parent.join(target).components() {
+    let relative_parent = parent.strip_prefix(root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "checkpoint symlink parent is outside root",
+        )
+    })?;
+    let mut depth = relative_parent
+        .components()
+        .filter(|component| matches!(component, Component::Normal(_)))
+        .count();
+    for component in target.components() {
         match component {
-            Component::ParentDir => depth -= 1,
+            Component::ParentDir => {
+                if depth == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "checkpoint symlink escapes root",
+                    ));
+                }
+                depth -= 1;
+            }
             Component::Normal(_) => depth += 1,
-            _ => {}
-        }
-        if depth < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "checkpoint symlink escapes root",
-            ));
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "absolute checkpoint symlink",
+                ));
+            }
         }
     }
     Ok(())

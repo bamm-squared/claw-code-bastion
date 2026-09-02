@@ -5171,6 +5171,10 @@ impl LiveCli {
         if self.exploration_input.as_deref() == Some(input) || self.pending_rework.is_some() {
             return;
         }
+        // Findings are scoped to the request that produced them. Clear them
+        // before any later early return so a new task cannot inherit stale
+        // explorer interpretations.
+        self.exploration_context = None;
         let Some(repository_context) = build_repository_context(input, None) else {
             self.exploration_input = Some(input.to_string());
             return;
@@ -5849,8 +5853,14 @@ impl LiveCli {
         self.pending_rework = None;
         self.escalation_requested = false;
         self.rework_blocked = None;
+        self.task_plan.invalidate_after_candidate_restore();
+        self.exploration_input = None;
+        self.exploration_context = None;
+        self.selected_writer_profile = None;
+        self.selected_evaluator_profile = None;
+        self.last_routing_explanation = None;
         self.candidate_state = CandidateLifecycleState::Editing;
-        println!("Restored trusted candidate checkpoint {checkpoint_id}; validation and evaluation are stale.");
+        println!("Restored trusted candidate checkpoint {checkpoint_id}; candidate-dependent planning, validation, evaluation, exploration, and routing state are stale.");
         Ok(())
     }
 
