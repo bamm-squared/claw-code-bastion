@@ -13,6 +13,7 @@ mod init;
 mod input;
 mod provider;
 mod render;
+mod requirement_evaluator;
 mod task_plan;
 
 use std::collections::BTreeSet;
@@ -3707,6 +3708,7 @@ struct LiveCli {
     context_tray: Vec<ContextTrayItem>,
     attachments: Vec<attachments::TaskAttachment>,
     task_plan: task_plan::TaskPlan,
+    evaluation: Option<requirement_evaluator::EvaluationReport>,
 }
 
 #[derive(Debug, Clone)]
@@ -4538,6 +4540,7 @@ impl LiveCli {
             context_tray: Vec::new(),
             attachments: Vec::new(),
             task_plan: task_plan::TaskPlan::default(),
+            evaluation: None,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -5014,10 +5017,22 @@ impl LiveCli {
         let policy = runtime::ValidationPolicy::default();
         let normal_apply_allowed = validation.allows_apply(changes.id, policy, false);
         let blocked_apply_allowed = validation.allows_apply(changes.id, policy, true);
+        let changed_paths = changes
+            .changes
+            .iter()
+            .map(|change| change.path().display().to_string())
+            .collect::<Vec<_>>();
+        let evaluation = requirement_evaluator::RequirementEvaluator::deterministic(
+            &self.task_plan,
+            &changed_paths,
+            normal_apply_allowed,
+        );
+        self.evaluation = Some(evaluation.clone());
         if !normal_apply_allowed {
             self.task_plan
                 .mark_validation_failure("trusted validation did not permit normal Apply");
         }
+        println!("\nRequirement evaluation\n{}", evaluation.summary());
 
         let action = loop {
             println!("\n{}", render_review_overview(&changes, &validation));
