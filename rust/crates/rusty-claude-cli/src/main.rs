@@ -6078,6 +6078,9 @@ fn build_repository_context(
     task: &str,
     retained_backend: Option<&Arc<Mutex<dyn ExecutionBackend>>>,
 ) -> Option<ContextSelection> {
+    if !benchmark_telemetry::graph_context_enabled() {
+        return None;
+    }
     benchmark_telemetry::repository_intelligence_attempted();
     let root = env::current_dir().ok()?;
     let private = is_private_mode();

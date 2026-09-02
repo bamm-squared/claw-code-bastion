@@ -26,6 +26,7 @@ pub struct Snapshot {
     pub repeated_file_reads: u64,
     pub grep_calls: u64,
     pub context_search_calls: u64,
+    pub repository_intelligence_enabled: Option<bool>,
     pub time_to_first_tool_call_ms: Option<u128>,
     pub time_to_first_candidate_mutation_ms: Option<u128>,
     pub model_turns_before_first_candidate_mutation: Option<u64>,
@@ -73,12 +74,21 @@ pub fn init() {
             schema_version: 1,
             run_id: format!("claw-{}", std::process::id()),
             started_at_ms: now_ms(),
+            repository_intelligence_enabled: Some(graph_context_enabled()),
             ..Snapshot::default()
         },
         read_identities: HashSet::new(),
         first_tool_at: None,
         first_mutation_recorded: false,
     })));
+}
+
+fn graph_context_enabled_value(value: Option<&str>) -> bool {
+    value != Some("off")
+}
+
+pub fn graph_context_enabled() -> bool {
+    graph_context_enabled_value(std::env::var("CLAW_BENCH_GRAPH_CONTEXT").ok().as_deref())
 }
 
 fn with_state(f: impl FnOnce(&mut State)) {
@@ -344,6 +354,13 @@ mod tests {
             state.snapshot.repository_intelligence_context_bytes,
             Some(0)
         );
+    }
+
+    #[test]
+    fn graph_context_switch_is_off_only_when_explicitly_disabled() {
+        assert!(graph_context_enabled_value(None));
+        assert!(graph_context_enabled_value(Some("on")));
+        assert!(!graph_context_enabled_value(Some("off")));
     }
 
     #[test]
