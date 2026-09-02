@@ -259,9 +259,11 @@ pub struct CalibrationRunSummary {
     pub observations: Vec<CalibrationObservation>,
     pub first_pass_successes: usize,
     pub cases_run: usize,
+    pub infrastructure_failures: usize,
 }
 
-pub type CalibrationCaseExecutor = dyn Fn(&CalibrationCase) -> CalibrationCaseResult;
+pub type CalibrationCaseExecutor =
+    dyn Fn(&CalibrationCase) -> Result<CalibrationCaseResult, String>;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[allow(clippy::struct_excessive_bools)]
@@ -397,19 +399,33 @@ impl CalibrationStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn run_local_calibration(
+    pub fn run_local_calibration<F>(
         &mut self,
         profile: &ModelProfile,
         corpus_version: &str,
         bastion_version: &str,
         runtime_identity: &str,
         cases: &[CalibrationCase],
-        execute: &CalibrationCaseExecutor,
+        execute: &F,
         recorded_at: &str,
-    ) -> Result<CalibrationRunSummary, String> {
+    ) -> Result<CalibrationRunSummary, String>
+    where
+        F: Fn(&CalibrationCase) -> Result<CalibrationCaseResult, String>,
+    {
+        let identity = CalibrationIdentity::from_profile(profile);
+        self.observations.retain(|observation| {
+            !(observation.evidence_kind == CalibrationEvidenceKind::LocalCalibration
+                && observation.profile_id == profile.id
+                && observation.identity == identity
+                && observation.corpus_version == corpus_version)
+        });
         let mut summary = CalibrationRunSummary::default();
         for case in cases {
-            let result = execute(case);
+            summary.cases_run += 1;
+            let Ok(result) = execute(case) else {
+                summary.infrastructure_failures += 1;
+                continue;
+            };
             let observation = CalibrationObservation {
                 profile_id: profile.id.clone(),
                 identity: CalibrationIdentity::from_profile(profile),
@@ -430,7 +446,6 @@ impl CalibrationStore {
             if result.first_pass_success {
                 summary.first_pass_successes += 1;
             }
-            summary.cases_run += 1;
             self.record(observation.clone())?;
             summary.observations.push(observation);
         }
@@ -1388,12 +1403,14 @@ mod tests {
                 "bastion-test",
                 "mock-runtime-v1",
                 &cases,
-                &|case| CalibrationCaseResult {
-                    first_pass_success: case.difficulty_bucket < 4,
-                    validation_passed: case.difficulty_bucket < 4,
-                    evaluation_passed: Some(case.difficulty_bucket < 4),
-                    rework_required: case.difficulty_bucket >= 4,
-                    ..CalibrationCaseResult::default()
+                &|case| {
+                    Ok(CalibrationCaseResult {
+                        first_pass_success: case.difficulty_bucket < 4,
+                        validation_passed: case.difficulty_bucket < 4,
+                        evaluation_passed: Some(case.difficulty_bucket < 4),
+                        rework_required: case.difficulty_bucket >= 4,
+                        ..CalibrationCaseResult::default()
+                    })
                 },
                 "2026-09-01T00:00:00Z",
             )

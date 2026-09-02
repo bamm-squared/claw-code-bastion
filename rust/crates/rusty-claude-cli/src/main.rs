@@ -1154,8 +1154,11 @@ fn parse_calibration_args(
     output_format: CliOutputFormat,
 ) -> Result<CliAction, String> {
     let action = args.first().map_or("show", String::as_str);
-    if !matches!(action, "show" | "clear" | "import" | "cases") {
-        return Err("usage: claw calibration [show|clear [PROFILE]|import PATH|cases]".to_string());
+    if !matches!(action, "show" | "clear" | "import" | "cases" | "run") {
+        return Err(
+            "usage: claw calibration [run [PROFILE]|show|clear [PROFILE]|import PATH|cases]"
+                .to_string(),
+        );
     }
     let (profile, path) = match action {
         "clear" => {
@@ -1169,6 +1172,12 @@ fn parse_calibration_args(
                 return Err("usage: claw calibration import PATH".to_string());
             }
             (None, Some(PathBuf::from(&args[1])))
+        }
+        "run" => {
+            if args.len() > 2 {
+                return Err("usage: claw calibration run [PROFILE]".to_string());
+            }
+            (args.get(1).cloned(), None)
         }
         _ if args.len() != 1 => {
             return Err("usage: claw calibration [show|cases]".to_string());
@@ -1195,6 +1204,7 @@ fn calibration_store_path() -> PathBuf {
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_calibration_command(
     action: &str,
     profile: Option<&str>,
@@ -1204,6 +1214,7 @@ fn run_calibration_command(
     if is_private_mode() && matches!(action, "clear" | "import") {
         return Err("calibration persistence is disabled in private mode".into());
     }
+    let store_path = calibration_store_path();
     if action == "cases" {
         let cases = model_router::default_calibration_cases();
         if output_format == CliOutputFormat::Json {
@@ -1220,7 +1231,85 @@ fn run_calibration_command(
         }
         return Ok(());
     }
-    let store_path = calibration_store_path();
+    if action == "run" {
+        if is_private_mode() {
+            return Err("synthetic calibration persistence is disabled in private mode".into());
+        }
+        let cwd = env::current_dir()?;
+        let config = ConfigLoader::default_for(&cwd).load()?;
+        let legacy_model = resolve_repl_model(DEFAULT_MODEL.to_string());
+        let pool = model_router::ModelPool::from_runtime_config(&config, &legacy_model);
+        let policy = model_router::RoutingPolicy::from_runtime_config(&config);
+        let requested = profile;
+        let profiles = pool
+            .profiles
+            .iter()
+            .filter(|candidate| requested.is_none_or(|id| id == candidate.id))
+            .filter(|candidate| candidate.enabled)
+            .filter(|candidate| calibration_policy_allows(candidate, &policy))
+            .cloned()
+            .collect::<Vec<_>>();
+        if profiles.is_empty() {
+            return Err(requested.map_or_else(
+                || "no enabled policy-eligible profiles are available for calibration".to_string(),
+                |id| format!("profile {id:?} is missing, disabled, or ineligible under current policy"),
+            ).into());
+        }
+        let mut store = model_router::CalibrationStore::load(&store_path)
+            .unwrap_or_else(|_| model_router::CalibrationStore::new());
+        let cases = model_router::default_calibration_cases();
+        let mut results = Vec::new();
+        for candidate in profiles {
+            let profile = candidate.clone();
+            let summary = store
+                .run_local_calibration(
+                    &profile,
+                    "calibration-v1",
+                    env!("CARGO_PKG_VERSION"),
+                    "provider-backed-calibration-v1",
+                    &cases,
+                    &|case| execute_calibration_case(&profile, case),
+                    &SystemTime::now().duration_since(UNIX_EPOCH).map_or_else(
+                        |_| "unknown".to_string(),
+                        |duration| duration.as_secs().to_string(),
+                    ),
+                )
+                .map_err(std::io::Error::other)?;
+            results.push((profile.id, summary));
+        }
+        if let Some(parent) = store_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        store.save(&store_path).map_err(std::io::Error::other)?;
+        if output_format == CliOutputFormat::Json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &results
+                        .iter()
+                        .map(|(id, summary)| json!({
+                            "profile": id,
+                            "cases_attempted": summary.cases_run,
+                        "first_pass_successes": summary.first_pass_successes,
+                        "infrastructure_failures": summary.infrastructure_failures,
+                            "observations_recorded": summary.observations.len(),
+                        }))
+                        .collect::<Vec<_>>()
+                )?
+            );
+        } else {
+            for (id, summary) in results {
+                println!(
+                    "{id}: {}/{} first-pass cases; {} observations recorded.",
+                    summary.first_pass_successes,
+                    summary.cases_run,
+                    summary.observations.len()
+                );
+            }
+            println!("Calibration evidence saved to {}.", store_path.display());
+        }
+        return Ok(());
+    }
     let mut store = model_router::CalibrationStore::load(&store_path)
         .unwrap_or_else(|_| model_router::CalibrationStore::new());
     match action {
@@ -1263,6 +1352,103 @@ fn run_calibration_command(
         _ => unreachable!(),
     }
     Ok(())
+}
+
+fn calibration_policy_allows(
+    profile: &model_router::ModelProfile,
+    policy: &model_router::RoutingPolicy,
+) -> bool {
+    if policy.local_only && profile.privacy != model_router::PrivacyClass::Local {
+        return false;
+    }
+    match profile.privacy {
+        model_router::PrivacyClass::Local => true,
+        model_router::PrivacyClass::Confidential => policy.allow_confidential,
+        model_router::PrivacyClass::Remote => policy.allow_remote,
+    }
+}
+
+fn execute_calibration_case(
+    profile: &model_router::ModelProfile,
+    case: &model_router::CalibrationCase,
+) -> Result<model_router::CalibrationCaseResult, String> {
+    let started = Instant::now();
+    let result = (|| -> Result<bool, String> {
+        let resolved_model = api::resolve_model_alias(&profile.model);
+        enforce_private_provider(&resolved_model).map_err(|error| error.to_string())?;
+        let client = ApiProviderClient::from_model_with_profile(
+            &resolved_model,
+            Some(&profile.provider),
+            (profile.provider.eq_ignore_ascii_case("anthropic"))
+                .then(resolve_cli_auth_source)
+                .transpose()
+                .map_err(|error| error.to_string())?,
+            profile.endpoint.as_deref(),
+        )
+        .map_err(|error| error.to_string())?;
+        let system = match case.role {
+            model_router::ModelRole::Evaluator => {
+                "You are a calibration evaluator. Return only JSON: {\"result\":\"satisfied\"} or {\"result\":\"gap\"}."
+            }
+            _ => "You are a calibration coding agent. Return exactly CALIBRATION_OK when you have completed the bounded exercise.",
+        };
+        let request = MessageRequest {
+            model: resolved_model,
+            max_tokens: 512,
+            messages: vec![InputMessage::user_text(format!(
+                "Calibration case {} (difficulty {}). {}",
+                case.id, case.difficulty_bucket, case.description
+            ))],
+            system: Some(system.to_string()),
+            stream: false,
+            reasoning_effort: normalize_profile_reasoning(profile.reasoning_profile.as_deref())?,
+            ..Default::default()
+        };
+        let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+        let response = runtime
+            .block_on(client.send_message(&request))
+            .map_err(|error| error.to_string())?;
+        let text = response
+            .content
+            .into_iter()
+            .filter_map(|block| match block {
+                OutputContentBlock::Text { text } => Some(text),
+                OutputContentBlock::ToolUse { .. }
+                | OutputContentBlock::Thinking { .. }
+                | OutputContentBlock::RedactedThinking { .. } => None,
+            })
+            .collect::<String>();
+        let passed = match case.role {
+            model_router::ModelRole::Evaluator => serde_json::from_str::<Value>(text.trim())
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("result")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .is_some_and(|result| {
+                    (case.id == "evaluator-complete" && result == "satisfied")
+                        || (case.id != "evaluator-complete" && result == "gap")
+                }),
+            _ => text.contains("CALIBRATION_OK"),
+        };
+        Ok(passed)
+    })();
+    let elapsed_ms = Some(
+        u64::try_from(started.elapsed().as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX),
+    );
+    match result {
+        Ok(passed) => Ok(model_router::CalibrationCaseResult {
+            first_pass_success: passed,
+            validation_passed: passed,
+            evaluation_passed: Some(passed),
+            rework_required: !passed,
+            elapsed_ms,
+            ..model_router::CalibrationCaseResult::default()
+        }),
+        Err(error) => Err(error),
+    }
 }
 
 fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>> {
