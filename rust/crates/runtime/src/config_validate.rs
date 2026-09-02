@@ -91,6 +91,7 @@ enum FieldType {
     String,
     Bool,
     Object,
+    ObjectArray,
     StringArray,
     Number,
 }
@@ -101,6 +102,7 @@ impl FieldType {
             Self::String => "a string",
             Self::Bool => "a boolean",
             Self::Object => "an object",
+            Self::ObjectArray => "an array of objects",
             Self::StringArray => "an array of strings",
             Self::Number => "a number",
         }
@@ -111,6 +113,9 @@ impl FieldType {
             Self::String => value.as_str().is_some(),
             Self::Bool => value.as_bool().is_some(),
             Self::Object => value.as_object().is_some(),
+            Self::ObjectArray => value
+                .as_array()
+                .is_some_and(|arr| arr.iter().all(|v| v.as_object().is_some())),
             Self::StringArray => value
                 .as_array()
                 .is_some_and(|arr| arr.iter().all(|v| v.as_str().is_some())),
@@ -196,6 +201,14 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
     FieldSpec {
         name: "trustedRoots",
         expected: FieldType::StringArray,
+    },
+    FieldSpec {
+        name: "modelResources",
+        expected: FieldType::ObjectArray,
+    },
+    FieldSpec {
+        name: "routing",
+        expected: FieldType::Object,
     },
 ];
 

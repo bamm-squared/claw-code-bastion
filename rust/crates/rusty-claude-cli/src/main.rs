@@ -3710,6 +3710,9 @@ struct LiveCli {
     attachments: Vec<attachments::TaskAttachment>,
     task_plan: task_plan::TaskPlan,
     evaluation: Option<requirement_evaluator::EvaluationReport>,
+    model_pool: model_router::ModelPool,
+    routing_policy: model_router::RoutingPolicy,
+    last_routing_explanation: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -4510,6 +4513,15 @@ impl LiveCli {
         permission_mode: PermissionMode,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
+        let cwd = env::current_dir()?;
+        let config = ConfigLoader::default_for(&cwd).load()?;
+        let model_pool = model_router::ModelPool::from_runtime_config(&config, &model);
+        let mut routing_policy = model_router::RoutingPolicy::from_runtime_config(&config);
+        if is_private_mode() && env::var("CLAW_PRIVATE_ALLOW_REMOTE_PROVIDER").as_deref() != Ok("1")
+        {
+            routing_policy.local_only = true;
+            routing_policy.allow_remote = false;
+        }
         let session_state = new_cli_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
         let session_state = if is_private_mode() {
@@ -4542,6 +4554,9 @@ impl LiveCli {
             attachments: Vec::new(),
             task_plan: task_plan::TaskPlan::default(),
             evaluation: None,
+            model_pool,
+            routing_policy,
+            last_routing_explanation: None,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -4550,6 +4565,25 @@ impl LiveCli {
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
         if let Some(rt) = self.runtime.runtime.as_mut() {
             rt.api_client_mut().set_reasoning_effort(effort);
+        }
+    }
+
+    fn route_writer_for_current_task(&mut self) {
+        if self.routing_policy.disable_automatic {
+            self.last_routing_explanation =
+                Some("Automatic routing disabled by user policy.".to_string());
+            return;
+        }
+        let signals = routing_signals(&self.task_plan);
+        let decision = model_router::ModelRouter::route(
+            &self.model_pool,
+            model_router::ModelRole::Writer,
+            signals,
+            &self.routing_policy,
+        );
+        self.last_routing_explanation = Some(decision.reason.clone());
+        if let Some(profile) = decision.selected {
+            self.model = profile.model;
         }
     }
 
@@ -4810,6 +4844,7 @@ impl LiveCli {
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (_prompt, image_blocks) = self.prepare_user_turn(input)?;
+        self.route_writer_for_current_task();
         if !image_blocks.is_empty() {
             match image_capability(&self.model) {
                 ImageCapability::Supported => {}
@@ -4922,6 +4957,7 @@ impl LiveCli {
     }
 
     fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.route_writer_for_current_task();
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false, input)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
@@ -4943,6 +4979,7 @@ impl LiveCli {
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.route_writer_for_current_task();
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false, input)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
@@ -5029,6 +5066,25 @@ impl LiveCli {
             normal_apply_allowed,
         );
         self.evaluation = Some(evaluation.clone());
+        if !evaluation.deterministic {
+            let request = requirement_evaluator::RequirementEvaluator::request(
+                &self.task_plan,
+                &evaluation,
+                &changed_paths,
+                if normal_apply_allowed { "PASS" } else { "FAIL" },
+            );
+            let evaluator_route = model_router::ModelRouter::route(
+                &self.model_pool,
+                model_router::ModelRole::Evaluator,
+                routing_signals(&self.task_plan),
+                &self.routing_policy,
+            );
+            println!(
+                "Evaluator routing: {}\nEvidence package: {} bytes; writer conversation excluded",
+                evaluator_route.reason,
+                requirement_evaluator::RequirementEvaluator::render_request(&request).len()
+            );
+        }
         if !normal_apply_allowed {
             self.task_plan
                 .mark_validation_failure("trusted validation did not permit normal Apply");
@@ -6099,6 +6155,38 @@ impl LiveCli {
     fn run_issue(&self, context: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", format_issue_report(context));
         Ok(())
+    }
+}
+
+fn routing_signals(plan: &task_plan::TaskPlan) -> model_router::TaskSignals {
+    let request = plan.original_request.to_ascii_lowercase();
+    model_router::TaskSignals {
+        ambiguity: u8::try_from(plan.open_questions.len().min(u8::MAX as usize))
+            .unwrap_or(u8::MAX)
+            .saturating_mul(20)
+            .min(100),
+        impacted_modules: u8::try_from(plan.known_impact.len().min(u8::MAX as usize))
+            .unwrap_or(u8::MAX),
+        dependency_depth: u8::try_from(
+            plan.known_impact
+                .len()
+                .saturating_sub(1)
+                .min(u8::MAX as usize),
+        )
+        .unwrap_or(u8::MAX),
+        security_sensitive: ["security", "privacy", "credential", "secret", "permission"]
+            .iter()
+            .any(|term| request.contains(term)),
+        concurrency_sensitive: ["async", "concurr", "race", "thread", "lock"]
+            .iter()
+            .any(|term| request.contains(term)),
+        public_api_change: ["api", "public", "interface", "endpoint"]
+            .iter()
+            .any(|term| request.contains(term)),
+        unresolved_relationships: u8::try_from(plan.open_questions.len().min(u8::MAX as usize))
+            .unwrap_or(u8::MAX),
+        context_window: 8_192,
+        ..model_router::TaskSignals::default()
     }
 }
 

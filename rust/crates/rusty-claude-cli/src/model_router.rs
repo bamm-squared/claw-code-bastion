@@ -5,6 +5,7 @@
 //! remains owned by the existing runtime.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ModelRole {
@@ -35,6 +36,7 @@ pub struct Capability {
 #[allow(clippy::struct_field_names)]
 pub struct Pricing {
     /// Actual price in microdollars per million tokens.
+    pub actual_cost_known: bool,
     pub actual_input_micros: u64,
     pub actual_output_micros: u64,
     /// Optional comparison-only price, never used as actual spend.
@@ -83,6 +85,42 @@ impl ModelProfile {
             enabled: true,
         }
     }
+
+    #[must_use]
+    pub fn legacy(model: impl Into<String>) -> Self {
+        let model = model.into();
+        let local = std::env::var_os("OLLAMA_HOST").is_some()
+            || std::env::var("OPENAI_BASE_URL")
+                .is_ok_and(|url| url.contains("localhost") || url.contains("127.0.0.1"));
+        Self {
+            id: "legacy-default".to_string(),
+            provider: "configured".to_string(),
+            model,
+            endpoint: None,
+            reasoning_profile: None,
+            privacy: if local {
+                PrivacyClass::Local
+            } else {
+                PrivacyClass::Remote
+            },
+            capability: Capability {
+                coding: 100,
+                reasoning: 100,
+                agent_tool_use: 100,
+                planning: 100,
+                evaluation: 100,
+                context_window: 200_000,
+            },
+            pricing: Pricing {
+                actual_cost_known: false,
+                ..Pricing::default()
+            },
+            expected_latency_ms: None,
+            observed_reliability_percent: None,
+            user_preference: 0,
+            enabled: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -97,9 +135,32 @@ impl ModelPool {
             profiles: vec![profile],
         }
     }
+
+    /// Reads the optional user pool from merged settings. Invalid optional
+    /// entries are ignored, preserving the legacy model fallback rather than
+    /// making provider startup or authority decisions from partial metadata.
+    #[must_use]
+    pub fn from_runtime_config(config: &runtime::RuntimeConfig, legacy_model: &str) -> Self {
+        let json = config.as_json().render();
+        let value = serde_json::from_str::<Value>(&json).ok();
+        let profiles = value
+            .as_ref()
+            .and_then(|root| root.get("modelResources"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(parse_profile)
+            .collect::<Vec<_>>();
+        if profiles.is_empty() {
+            Self::one(ModelProfile::legacy(legacy_model))
+        } else {
+            Self { profiles }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct RoutingPolicy {
     pub local_only: bool,
     pub allow_remote: bool,
@@ -107,6 +168,7 @@ pub struct RoutingPolicy {
     pub preferred_provider: Option<String>,
     pub forced_profile: Option<String>,
     pub minimum_margin: u8,
+    pub disable_automatic: bool,
 }
 
 impl Default for RoutingPolicy {
@@ -118,7 +180,36 @@ impl Default for RoutingPolicy {
             preferred_provider: None,
             forced_profile: None,
             minimum_margin: 8,
+            disable_automatic: false,
         }
+    }
+}
+
+impl RoutingPolicy {
+    #[must_use]
+    pub fn from_runtime_config(config: &runtime::RuntimeConfig) -> Self {
+        let mut policy = Self::default();
+        let value = serde_json::from_str::<Value>(&config.as_json().render()).ok();
+        let Some(root) = value.as_ref().and_then(Value::as_object) else {
+            return policy;
+        };
+        let Some(settings) = root.get("routing").and_then(Value::as_object) else {
+            return policy;
+        };
+        policy.local_only = bool_field(settings, "localOnly", policy.local_only);
+        policy.allow_remote = bool_field(settings, "allowRemote", policy.allow_remote);
+        policy.allow_confidential =
+            bool_field(settings, "allowConfidential", policy.allow_confidential);
+        policy.disable_automatic =
+            bool_field(settings, "disableAutomatic", policy.disable_automatic);
+        policy.preferred_provider = string_field(settings, "preferredProvider");
+        policy.forced_profile = string_field(settings, "forcedProfile");
+        policy.minimum_margin = settings
+            .get("minimumMargin")
+            .and_then(Value::as_u64)
+            .and_then(|value| u8::try_from(value).ok())
+            .unwrap_or(policy.minimum_margin);
+        policy
     }
 }
 
@@ -297,6 +388,12 @@ impl ModelRouter {
         eligible.sort_by_key(|profile| {
             (
                 estimated_cost(profile, signals),
+                u8::from(
+                    policy
+                        .preferred_provider
+                        .as_deref()
+                        .is_some_and(|provider| profile.provider != provider),
+                ),
                 profile.expected_latency_ms.unwrap_or(u64::MAX),
                 u8::MAX - profile.observed_reliability_percent.unwrap_or(50),
                 -profile.user_preference,
@@ -340,6 +437,130 @@ fn reject(profile: &ModelProfile, reason: &str) -> Rejection {
     }
 }
 
+fn bool_field(settings: &serde_json::Map<String, Value>, name: &str, default: bool) -> bool {
+    settings
+        .get(name)
+        .and_then(Value::as_bool)
+        .unwrap_or(default)
+}
+
+fn string_field(settings: &serde_json::Map<String, Value>, name: &str) -> Option<String> {
+    settings
+        .get(name)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn parse_profile(value: &Value) -> Option<ModelProfile> {
+    let object = value.as_object()?;
+    let model = object.get("model")?.as_str()?.trim();
+    if model.is_empty() {
+        return None;
+    }
+    let capability = object.get("capability").and_then(Value::as_object);
+    let pricing = object.get("pricing").and_then(Value::as_object);
+    let privacy = match object
+        .get("privacy")
+        .and_then(Value::as_str)
+        .unwrap_or("remote")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "local" => PrivacyClass::Local,
+        "confidential" => PrivacyClass::Confidential,
+        _ => PrivacyClass::Remote,
+    };
+    let profile = ModelProfile {
+        id: object
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or(model)
+            .to_string(),
+        provider: object
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or("configured")
+            .to_string(),
+        model: model.to_string(),
+        endpoint: object
+            .get("endpoint")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        reasoning_profile: object
+            .get("reasoningProfile")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        privacy,
+        capability: Capability {
+            coding: number_field(capability, "coding", 50),
+            reasoning: number_field(capability, "reasoning", 50),
+            agent_tool_use: number_field(capability, "agentToolUse", 50),
+            planning: number_field(capability, "planning", 50),
+            evaluation: number_field(capability, "evaluation", 50),
+            context_window: number_field_u32(capability, "contextWindow", 8_192),
+        },
+        pricing: Pricing {
+            actual_cost_known: pricing
+                .and_then(|value| value.get("actualCostKnown"))
+                .and_then(Value::as_bool)
+                .unwrap_or(pricing.is_some_and(|value| {
+                    value.get("actualInputMicros").is_some()
+                        || value.get("actualOutputMicros").is_some()
+                })),
+            actual_input_micros: number_field_u64(pricing, "actualInputMicros", 0),
+            actual_output_micros: number_field_u64(pricing, "actualOutputMicros", 0),
+            reference_input_micros: pricing
+                .and_then(|value| value.get("referenceInputMicros"))
+                .and_then(Value::as_u64),
+            reference_output_micros: pricing
+                .and_then(|value| value.get("referenceOutputMicros"))
+                .and_then(Value::as_u64),
+        },
+        expected_latency_ms: object.get("expectedLatencyMs").and_then(Value::as_u64),
+        observed_reliability_percent: object
+            .get("observedReliabilityPercent")
+            .and_then(Value::as_u64)
+            .and_then(|value| u8::try_from(value).ok()),
+        user_preference: object
+            .get("userPreference")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
+            .unwrap_or(0),
+        enabled: object
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+    };
+    Some(profile)
+}
+
+fn number_field(source: Option<&serde_json::Map<String, Value>>, name: &str, default: u8) -> u8 {
+    number_field_u64(source, name, u64::from(default))
+        .try_into()
+        .unwrap_or(default)
+}
+
+fn number_field_u32(
+    source: Option<&serde_json::Map<String, Value>>,
+    name: &str,
+    default: u32,
+) -> u32 {
+    number_field_u64(source, name, u64::from(default))
+        .try_into()
+        .unwrap_or(default)
+}
+
+fn number_field_u64(
+    source: Option<&serde_json::Map<String, Value>>,
+    name: &str,
+    default: u64,
+) -> u64 {
+    source
+        .and_then(|value| value.get(name))
+        .and_then(Value::as_u64)
+        .unwrap_or(default)
+}
+
 fn policy_allows(profile: &ModelProfile, policy: &RoutingPolicy) -> bool {
     if policy.local_only && profile.privacy != PrivacyClass::Local {
         return false;
@@ -350,10 +571,7 @@ fn policy_allows(profile: &ModelProfile, policy: &RoutingPolicy) -> bool {
     if !policy.allow_confidential && profile.privacy == PrivacyClass::Confidential {
         return false;
     }
-    policy
-        .preferred_provider
-        .as_deref()
-        .is_none_or(|provider| profile.provider == provider)
+    true
 }
 
 fn capable(profile: &ModelProfile, estimate: DifficultyEstimate) -> bool {
@@ -368,6 +586,9 @@ fn capable(profile: &ModelProfile, estimate: DifficultyEstimate) -> bool {
 }
 
 fn estimated_cost(profile: &ModelProfile, signals: TaskSignals) -> u64 {
+    if !profile.pricing.actual_cost_known {
+        return u64::MAX;
+    }
     let input = u64::from(signals.expected_input_tokens);
     let output = u64::from(signals.expected_output_tokens);
     input * profile.pricing.actual_input_micros + output * profile.pricing.actual_output_micros
@@ -394,6 +615,7 @@ mod tests {
                 context_window: 64_000,
             },
             pricing: Pricing {
+                actual_cost_known: true,
                 actual_input_micros: cost,
                 actual_output_micros: cost,
                 ..Pricing::default()
