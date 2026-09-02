@@ -3718,6 +3718,7 @@ struct LiveCli {
     pending_rework: Option<model_router::EscalationPackage>,
     rework_cycles: u8,
     escalation_requested: bool,
+    rework_blocked: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -4566,6 +4567,7 @@ impl LiveCli {
             pending_rework: None,
             rework_cycles: 0,
             escalation_requested: false,
+            rework_blocked: None,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -4610,6 +4612,13 @@ impl LiveCli {
             )
         };
         self.last_routing_explanation = Some(decision.reason.clone());
+        if self.escalation_requested && decision.selected.is_none() {
+            self.rework_blocked = Some(
+                "REWORK REQUIRES STRONGER MODEL; NO ELIGIBLE CONFIGURED PROFILE AVAILABLE"
+                    .to_string(),
+            );
+            return;
+        }
         if let Some(profile) = decision.selected {
             self.model.clone_from(&profile.model);
             self.selected_writer_profile = Some(profile);
@@ -4832,11 +4841,19 @@ impl LiveCli {
                 .map_err(std::io::Error::other)?;
         }
         let hook_abort_signal = runtime::HookAbortSignal::new();
-        let repository_context = build_repository_context(task_input, retained_backend.as_ref());
+        let is_rework = self.pending_rework.is_some();
+        let context_input = if is_rework {
+            self.task_plan.original_request.as_str()
+        } else {
+            task_input
+        };
+        let repository_context = build_repository_context(context_input, retained_backend.as_ref());
         let repository_text = repository_context
             .as_ref()
             .map(|selection| selection.text.as_str());
-        self.task_plan.update(task_input, repository_text);
+        if !is_rework {
+            self.task_plan.update(task_input, repository_text);
+        }
         let plan_text = self.task_plan.render();
         let pending_rework = self.pending_rework.take();
         let plan_text = pending_rework
@@ -4895,6 +4912,9 @@ impl LiveCli {
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (_prompt, image_blocks) = self.prepare_user_turn(input)?;
         self.route_writer_for_current_task();
+        if let Some(reason) = self.rework_blocked.take() {
+            return Err(reason.into());
+        }
         if !image_blocks.is_empty() {
             match image_capability(&self.model) {
                 ImageCapability::Supported => {}
@@ -4926,8 +4946,11 @@ impl LiveCli {
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
-                self.review_candidate_changes(&mut runtime)?;
+                let automatic_rework = self.review_candidate_changes(&mut runtime)?;
                 self.replace_runtime(runtime)?;
+                if automatic_rework {
+                    self.run_automatic_rework(input, true)?;
+                }
                 spinner.finish(
                     "✨ Done",
                     TerminalRenderer::new().color_theme(),
@@ -5008,6 +5031,9 @@ impl LiveCli {
 
     fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         self.route_writer_for_current_task();
+        if let Some(reason) = self.rework_blocked.take() {
+            return Err(reason.into());
+        }
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false, input)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
@@ -5020,8 +5046,11 @@ impl LiveCli {
                 return Err(Box::new(error));
             }
         };
-        self.review_candidate_changes(&mut runtime)?;
+        let automatic_rework = self.review_candidate_changes(&mut runtime)?;
         self.replace_runtime(runtime)?;
+        if automatic_rework {
+            self.run_automatic_rework(input, false)?;
+        }
         self.persist_session()?;
         let final_text = final_assistant_text(&summary);
         println!("{final_text}");
@@ -5030,6 +5059,9 @@ impl LiveCli {
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         self.route_writer_for_current_task();
+        if let Some(reason) = self.rework_blocked.take() {
+            return Err(reason.into());
+        }
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false, input)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
@@ -5042,8 +5074,11 @@ impl LiveCli {
                 return Err(Box::new(error));
             }
         };
-        self.review_candidate_changes(&mut runtime)?;
+        let automatic_rework = self.review_candidate_changes(&mut runtime)?;
         self.replace_runtime(runtime)?;
+        if automatic_rework {
+            self.run_automatic_rework(input, false)?;
+        }
         self.persist_session()?;
         println!(
             "{}",
@@ -5079,9 +5114,9 @@ impl LiveCli {
     fn review_candidate_changes(
         &mut self,
         runtime: &mut BuiltRuntime,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<bool, Box<dyn std::error::Error>> {
         let Some(changes) = runtime.finish_candidate()? else {
-            return Ok(());
+            return Ok(false);
         };
 
         if !changes.changes.is_empty() {
@@ -5090,13 +5125,13 @@ impl LiveCli {
 
         if changes.changes.is_empty() {
             self.candidate_state = CandidateLifecycleState::Editing;
-            return Ok(());
+            return Ok(false);
         }
 
         if !io::stdin().is_terminal() {
             runtime.discard_candidate()?;
             self.candidate_state = CandidateLifecycleState::Discarded;
-            return Ok(());
+            return Ok(false);
         }
 
         let validation = runtime.validate_candidate(&changes)?;
@@ -5172,6 +5207,14 @@ impl LiveCli {
 
         if active_evaluation.has_rework_finding() {
             self.record_evaluation_rework(&active_evaluation, &changed_paths, normal_apply_allowed);
+            if self.pending_rework.is_some() {
+                self.candidate_state = CandidateLifecycleState::Editing;
+                println!("↻ Independent evaluation requested bounded automatic rework.");
+                return Ok(true);
+            }
+        }
+        if let Some(reason) = &self.rework_blocked {
+            println!("Automatic correction unavailable: {reason}");
         }
 
         let action = loop {
@@ -5236,7 +5279,7 @@ impl LiveCli {
                     runtime.discard_candidate()?;
                     self.candidate_state = CandidateLifecycleState::Discarded;
                     println!("Candidate discarded; apply was not confirmed.");
-                    return Ok(());
+                    return Ok(false);
                 }
                 runtime.apply_candidate_changes(&changes, &validation, true)?;
                 runtime.discard_candidate()?;
@@ -5258,7 +5301,51 @@ impl LiveCli {
             }
         }
 
-        Ok(())
+        Ok(false)
+    }
+
+    fn run_automatic_rework(
+        &mut self,
+        original_input: &str,
+        emit_output: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        loop {
+            if self.pending_rework.is_none() {
+                return Ok(());
+            }
+            if let Some(reason) = self.rework_blocked.take() {
+                println!("Automatic rework stopped: {reason}");
+                return Ok(());
+            }
+            self.route_writer_for_current_task();
+            if let Some(reason) = self.rework_blocked.take() {
+                println!("Automatic rework stopped: {reason}");
+                return Ok(());
+            }
+            let image_blocks = self.image_blocks()?;
+            let (mut runtime, hook_abort_monitor) =
+                self.prepare_turn_runtime(emit_output, original_input)?;
+            let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+            let result = runtime.run_turn_with_images(
+                "Apply the focused evaluator rework package to the retained candidate. Do not discard valid existing changes.",
+                image_blocks,
+                Some(&mut permission_prompter),
+            );
+            hook_abort_monitor.stop();
+            match result {
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = runtime.discard_candidate();
+                    self.candidate_state = CandidateLifecycleState::Discarded;
+                    return Err(Box::new(error));
+                }
+            }
+            let continue_rework = self.review_candidate_changes(&mut runtime)?;
+            self.replace_runtime(runtime)?;
+            if !continue_rework {
+                return Ok(());
+            }
+        }
     }
 
     fn record_evaluation_rework(
@@ -5272,6 +5359,7 @@ impl LiveCli {
                 "Resolve remaining requirement evaluation findings with user guidance",
                 "rework limit reached",
             );
+            self.rework_blocked = Some("rework limit reached".to_string());
             return;
         }
         for finding in &evaluation.requirements {
@@ -5295,6 +5383,38 @@ impl LiveCli {
                 .any(|term| finding.finding.to_ascii_lowercase().contains(term))
         });
         self.escalation_requested = escalation;
+        self.rework_blocked = None;
+        if escalation {
+            let current_id = self
+                .selected_writer_profile
+                .as_ref()
+                .map(|profile| profile.id.as_str());
+            let stronger_pool = model_router::ModelPool {
+                profiles: self
+                    .model_pool
+                    .profiles
+                    .iter()
+                    .filter(|profile| Some(profile.id.as_str()) != current_id)
+                    .cloned()
+                    .collect(),
+            };
+            let decision = model_router::ModelRouter::escalation(
+                &stronger_pool,
+                model_router::ModelRole::Writer,
+                routing_signals(&self.task_plan),
+                self.routing_policy.clone(),
+            );
+            if decision.selected.is_none() {
+                self.rework_blocked = Some(
+                    "REWORK REQUIRES STRONGER MODEL; NO ELIGIBLE CONFIGURED PROFILE AVAILABLE"
+                        .to_string(),
+                );
+            }
+        }
+        if self.rework_blocked.is_some() {
+            self.pending_rework = None;
+            return;
+        }
         self.pending_rework = Some(model_router::EscalationPackage {
             original_requirement: self.task_plan.original_request.clone(),
             task_plan: self.task_plan.render(),
