@@ -5974,7 +5974,7 @@ impl LiveCli {
             return;
         }
         self.pending_rework = Some(model_router::EscalationPackage {
-            original_requirement: self.task_plan.original_request.clone(),
+            original_requirement: self.task_plan.authoritative_request().to_string(),
             task_plan: self.task_plan.render(),
             candidate_summary: format!("Changed paths: {}", changed_paths.join(", ")),
             expected_contracts: self

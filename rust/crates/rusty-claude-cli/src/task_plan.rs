@@ -41,6 +41,11 @@ pub struct ExpectedContract {
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TaskPlan {
+    /// The complete user request. This is authoritative input for evaluation;
+    /// it is never replaced by the bounded model/display representation.
+    #[serde(default)]
+    pub full_request: String,
+    /// Bounded request text used in compact planning displays.
     pub original_request: String,
     pub revision: u32,
     pub items: Vec<PlanItem>,
@@ -76,8 +81,10 @@ impl TaskPlan {
 
     #[must_use]
     pub fn from_request(request: &str, repository_context: Option<&str>) -> Self {
+        let full_request = request.trim().to_string();
         let mut plan = Self {
-            original_request: truncate(request.trim(), MAX_REQUEST_BYTES),
+            original_request: truncate(&full_request, MAX_REQUEST_BYTES),
+            full_request,
             ..Self::default()
         };
         plan.rebuild_from_request(repository_context);
@@ -85,9 +92,10 @@ impl TaskPlan {
     }
 
     pub fn update(&mut self, request: &str, repository_context: Option<&str>) {
-        let request = truncate(request.trim(), MAX_REQUEST_BYTES);
-        if self.original_request != request {
-            self.original_request = request;
+        let request = request.trim().to_string();
+        if self.full_request != request {
+            self.full_request = request;
+            self.original_request = truncate(&self.full_request, MAX_REQUEST_BYTES);
             self.revision = self.revision.saturating_add(1);
             self.rebuild_from_request(repository_context);
         } else if self.items.is_empty() {
@@ -96,7 +104,7 @@ impl TaskPlan {
     }
 
     fn rebuild_from_request(&mut self, repository_context: Option<&str>) {
-        self.items = clauses(&self.original_request)
+        self.items = clauses(&self.full_request)
             .into_iter()
             .take(MAX_ITEMS)
             .enumerate()
@@ -107,7 +115,7 @@ impl TaskPlan {
                 provenance: "user request".to_string(),
             })
             .collect();
-        self.contracts = clauses(&self.original_request)
+        self.contracts = clauses(&self.full_request)
             .into_iter()
             .filter(|clause| contains_constraint_language(clause))
             .take(MAX_CONTRACTS)
@@ -134,6 +142,15 @@ impl TaskPlan {
         } else {
             vec!["Confirm the selected repository relationships against exact source.".to_string()]
         };
+    }
+
+    #[must_use]
+    pub fn authoritative_request(&self) -> &str {
+        if self.full_request.is_empty() {
+            &self.original_request
+        } else {
+            &self.full_request
+        }
     }
 
     pub fn add_discovered_item(&mut self, statement: &str, provenance: &str) {
@@ -353,5 +370,24 @@ mod tests {
             .open_questions
             .iter()
             .any(|question| question.contains("restored candidate")));
+    }
+
+    #[test]
+    fn authoritative_request_is_not_limited_by_display_bound() {
+        let request = format!(
+            "{} Update the provider behavior. Preserve private mode.",
+            "context ".repeat(80)
+        );
+        let plan = TaskPlan::from_request(&request, None);
+
+        assert!(plan.original_request.len() <= MAX_REQUEST_BYTES);
+        assert_eq!(plan.authoritative_request(), request.trim());
+        assert!(plan
+            .authoritative_request()
+            .ends_with("Preserve private mode."));
+        assert!(plan
+            .contracts
+            .iter()
+            .any(|contract| contract.expectation.contains("Preserve private mode")));
     }
 }

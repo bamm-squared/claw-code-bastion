@@ -118,7 +118,7 @@ impl RequirementEvaluator {
         validation_summary: &str,
     ) -> EvaluationRequest {
         EvaluationRequest {
-            original_requirement: plan.original_request.clone(),
+            original_requirement: plan.authoritative_request().to_string(),
             contracts: plan.contracts.clone(),
             unresolved_requirement_ids: report
                 .requirements
