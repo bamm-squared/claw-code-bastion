@@ -9,6 +9,7 @@
 mod attachments;
 mod benchmark_telemetry;
 mod context_reference;
+mod exploration;
 mod init;
 mod input;
 mod model_router;
@@ -4037,6 +4038,8 @@ struct LiveCli {
     rework_cycles: u8,
     escalation_requested: bool,
     rework_blocked: Option<String>,
+    exploration_input: Option<String>,
+    exploration_context: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -4898,6 +4901,8 @@ impl LiveCli {
             rework_cycles: 0,
             escalation_requested: false,
             rework_blocked: None,
+            exploration_input: None,
+            exploration_context: None,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -5152,7 +5157,61 @@ impl LiveCli {
                 );
             }
         }
+        if let Some(exploration) = &self.exploration_context {
+            let _ = writeln!(expanded, "\n{exploration}");
+        }
         Ok(expanded)
+    }
+
+    fn prepare_exploration(&mut self, input: &str) {
+        if self.exploration_input.as_deref() == Some(input) || self.pending_rework.is_some() {
+            return;
+        }
+        let Some(repository_context) = build_repository_context(input, None) else {
+            self.exploration_input = Some(input.to_string());
+            return;
+        };
+        self.task_plan.update(input, Some(&repository_context.text));
+        let signals = routing_signals(&self.task_plan);
+        let questions = exploration::questions_for(signals);
+        self.exploration_input = Some(input.to_string());
+        if questions.is_empty() || self.routing_policy.disable_automatic {
+            return;
+        }
+        let mut jobs = Vec::new();
+        for question in questions {
+            let decision = model_router::ModelRouter::route_with_calibration(
+                &self.model_pool,
+                &self.calibration,
+                model_router::ModelRole::Other,
+                signals,
+                &self.routing_policy,
+            );
+            if let Some(profile) = decision.selected {
+                jobs.push((question, profile));
+            }
+        }
+        if jobs.is_empty() {
+            return;
+        }
+        let same_endpoint = jobs.windows(2).all(|pair| {
+            pair[0].1.provider == pair[1].1.provider && pair[0].1.endpoint == pair[1].1.endpoint
+        });
+        let configured_limit = env::var("CLAW_MAX_EXPLORERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(3);
+        let max_concurrent = if same_endpoint { 1 } else { configured_limit };
+        let evidence = format!("Requirement: {}\n{}", input, repository_context.text);
+        let synthesis = exploration::run_parallel(
+            jobs,
+            evidence,
+            max_concurrent,
+            |question, profile, evidence| execute_explorer_profile(profile, question, evidence),
+        );
+        if synthesis.launched > 0 {
+            self.exploration_context = Some(synthesis.context);
+        }
     }
 
     fn prepare_turn_runtime(
@@ -5318,6 +5377,7 @@ impl LiveCli {
         &mut self,
         input: &str,
     ) -> Result<(String, Vec<ContentBlock>), Box<dyn std::error::Error>> {
+        self.prepare_exploration(input);
         let prompt = self.prompt_with_context(input)?;
         let image_blocks = self.image_blocks()?;
         Ok((prompt, image_blocks))
@@ -5362,6 +5422,7 @@ impl LiveCli {
     }
 
     fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.prepare_exploration(input);
         self.route_writer_for_current_task();
         if let Some(reason) = self.rework_blocked.take() {
             return Err(reason.into());
@@ -5390,6 +5451,7 @@ impl LiveCli {
     }
 
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.prepare_exploration(input);
         self.route_writer_for_current_task();
         if let Some(reason) = self.rework_blocked.take() {
             return Err(reason.into());
@@ -9482,6 +9544,66 @@ fn execute_evaluator_profile(
     } else {
         Ok(text)
     }
+}
+
+fn execute_explorer_profile(
+    profile: &model_router::ModelProfile,
+    question: &exploration::ExplorerQuestion,
+    evidence: &str,
+) -> Result<Vec<exploration::ExplorerFinding>, String> {
+    let resolved_model = api::resolve_model_alias(&profile.model);
+    enforce_private_provider(&resolved_model).map_err(|error| error.to_string())?;
+    let client = ApiProviderClient::from_model_with_profile(
+        &resolved_model,
+        Some(&profile.provider),
+        (profile.provider.eq_ignore_ascii_case("anthropic"))
+            .then(resolve_cli_auth_source)
+            .transpose()
+            .map_err(|error| error.to_string())?,
+        profile.endpoint.as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
+    let request_text = format!(
+        "You are a bounded read-only repository explorer.\nQuestion: {}\nEvidence:\n{}\nReturn only JSON: {{\"findings\":[{{\"subject\":\"...\",\"claim\":\"...\",\"evidence\":\"...\",\"confidence\":0}}]}}. Do not suggest edits or claim certainty beyond evidence.",
+        question.prompt, evidence
+    );
+    let message_request = MessageRequest {
+        model: resolved_model,
+        max_tokens: 1_536,
+        messages: vec![InputMessage::user_text(request_text)],
+        system: Some("Return compact structured findings only.".to_string()),
+        stream: false,
+        reasoning_effort: normalize_profile_reasoning(profile.reasoning_profile.as_deref())?,
+        ..Default::default()
+    };
+    if let Ok(bytes) = serde_json::to_vec(&message_request) {
+        benchmark_telemetry::provider_call();
+        benchmark_telemetry::model_turn();
+        benchmark_telemetry::model_request_bytes(bytes.len() as u64);
+    }
+    let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+    let response = runtime
+        .block_on(client.send_message(&message_request))
+        .map_err(|error| error.to_string())?;
+    let text = response
+        .content
+        .into_iter()
+        .filter_map(|block| match block {
+            OutputContentBlock::Text { text } => Some(text),
+            OutputContentBlock::ToolUse { .. }
+            | OutputContentBlock::Thinking { .. }
+            | OutputContentBlock::RedactedThinking { .. } => None,
+        })
+        .collect::<String>();
+    let value = serde_json::from_str::<Value>(text.trim())
+        .map_err(|error| format!("explorer returned malformed JSON: {error}"))?;
+    serde_json::from_value::<Vec<exploration::ExplorerFinding>>(
+        value
+            .get("findings")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+    )
+    .map_err(|error| format!("explorer returned malformed findings: {error}"))
 }
 
 fn normalize_profile_reasoning(value: Option<&str>) -> Result<Option<String>, String> {
