@@ -6,6 +6,16 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::Path;
+
+pub const CALIBRATION_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum CalibrationEvidenceKind {
+    #[default]
+    LocalCalibration,
+    ObservedOutcome,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ModelRole {
@@ -156,6 +166,417 @@ impl ModelPool {
         } else {
             Self { profiles }
         }
+    }
+
+    /// Returns a pool whose capabilities include only the supplied evidence.
+    /// The configured profile is never modified, so user priors remain
+    /// inspectable and can be replaced without losing their provenance.
+    #[must_use]
+    pub fn with_calibration(&self, calibration: &CalibrationStore) -> Self {
+        Self {
+            profiles: self
+                .profiles
+                .iter()
+                .map(|profile| calibration.effective_profile(profile))
+                .collect(),
+        }
+    }
+}
+
+/// Stable identity for calibration evidence. A model name alone is not enough:
+/// endpoint and reasoning settings can materially change behavior.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CalibrationIdentity {
+    pub provider: String,
+    pub model: String,
+    pub endpoint: Option<String>,
+    pub reasoning_profile: Option<String>,
+}
+
+impl CalibrationIdentity {
+    #[must_use]
+    pub fn from_profile(profile: &ModelProfile) -> Self {
+        Self {
+            provider: profile.provider.clone(),
+            model: profile.model.clone(),
+            endpoint: profile.endpoint.clone(),
+            reasoning_profile: profile.reasoning_profile.clone(),
+        }
+    }
+}
+
+/// A compact, source-only observation. It deliberately contains no prompt,
+/// source, candidate, or evaluator transcript.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct CalibrationObservation {
+    pub profile_id: String,
+    pub identity: CalibrationIdentity,
+    pub role: ModelRole,
+    pub corpus_version: String,
+    pub bastion_version: String,
+    pub runtime_identity: String,
+    pub difficulty_bucket: u8,
+    pub first_pass_success: bool,
+    pub validation_passed: bool,
+    pub evaluation_passed: Option<bool>,
+    pub rework_required: bool,
+    pub escalation_required: bool,
+    pub elapsed_ms: Option<u64>,
+    #[serde(default)]
+    pub evidence_kind: CalibrationEvidenceKind,
+    #[serde(default)]
+    pub recorded_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct OutcomeMetadata {
+    pub profile_id: String,
+    pub identity: CalibrationIdentity,
+    pub role: ModelRole,
+    pub runtime_identity: String,
+    pub difficulty_bucket: u8,
+    pub first_pass_success: bool,
+    pub validation_passed: bool,
+    pub evaluation_passed: Option<bool>,
+    pub rework_required: bool,
+    pub escalation_required: bool,
+    pub elapsed_ms: Option<u64>,
+    pub recorded_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CalibrationCase {
+    pub id: &'static str,
+    pub role: ModelRole,
+    pub difficulty_bucket: u8,
+    pub description: &'static str,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CalibrationRunSummary {
+    pub observations: Vec<CalibrationObservation>,
+    pub first_pass_successes: usize,
+    pub cases_run: usize,
+}
+
+pub type CalibrationCaseExecutor = dyn Fn(&CalibrationCase) -> CalibrationCaseResult;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct CalibrationCaseResult {
+    pub first_pass_success: bool,
+    pub validation_passed: bool,
+    pub evaluation_passed: Option<bool>,
+    pub rework_required: bool,
+    pub escalation_required: bool,
+    pub elapsed_ms: Option<u64>,
+}
+
+/// Small, versioned, non-sensitive calibration corpus. The executor is
+/// supplied by the caller so the router does not own provider/network code.
+#[must_use]
+pub fn default_calibration_cases() -> Vec<CalibrationCase> {
+    vec![
+        CalibrationCase {
+            id: "writer-mechanical",
+            role: ModelRole::Writer,
+            difficulty_bucket: 1,
+            description: "make a bounded mechanical code change",
+        },
+        CalibrationCase {
+            id: "writer-cross-module",
+            role: ModelRole::Writer,
+            difficulty_bucket: 3,
+            description: "change behavior across two modules and preserve a caller",
+        },
+        CalibrationCase {
+            id: "writer-risk-sensitive",
+            role: ModelRole::Writer,
+            difficulty_bucket: 5,
+            description: "reason about a security or concurrency constraint",
+        },
+        CalibrationCase {
+            id: "evaluator-complete",
+            role: ModelRole::Evaluator,
+            difficulty_bucket: 1,
+            description: "classify a complete candidate from bounded evidence",
+        },
+        CalibrationCase {
+            id: "evaluator-obvious-gap",
+            role: ModelRole::Evaluator,
+            difficulty_bucket: 2,
+            description: "identify an explicit missing requirement",
+        },
+        CalibrationCase {
+            id: "evaluator-subtle-gap",
+            role: ModelRole::Evaluator,
+            difficulty_bucket: 4,
+            description: "identify an untested semantic omission",
+        },
+    ]
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExternalBenchmarkPrior {
+    pub source: String,
+    pub source_version: String,
+    pub source_date: String,
+    pub identity: CalibrationIdentity,
+    pub role: ModelRole,
+    pub capability: Capability,
+    pub reference_input_micros: Option<u64>,
+    pub reference_output_micros: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CalibrationStore {
+    pub schema_version: u32,
+    pub observations: Vec<CalibrationObservation>,
+    pub external_priors: Vec<ExternalBenchmarkPrior>,
+}
+
+impl CalibrationStore {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            schema_version: CALIBRATION_SCHEMA_VERSION,
+            ..Self::default()
+        }
+    }
+
+    #[must_use]
+    pub fn from_runtime_config(config: &runtime::RuntimeConfig) -> Self {
+        let value = serde_json::from_str::<Value>(&config.as_json().render()).ok();
+        value
+            .as_ref()
+            .and_then(|root| root.get("modelCalibration"))
+            .and_then(|value| serde_json::from_value::<Self>(value.clone()).ok())
+            .filter(|store| store.schema_version == CALIBRATION_SCHEMA_VERSION)
+            .unwrap_or_default()
+    }
+
+    pub fn record(&mut self, observation: CalibrationObservation) -> Result<(), String> {
+        if observation.profile_id.trim().is_empty()
+            || observation.identity.provider.trim().is_empty()
+            || observation.identity.model.trim().is_empty()
+        {
+            return Err("calibration observation has an incomplete profile identity".to_string());
+        }
+        self.schema_version = CALIBRATION_SCHEMA_VERSION;
+        self.observations.push(observation);
+        Ok(())
+    }
+
+    pub fn record_outcome(
+        &mut self,
+        outcome: OutcomeMetadata,
+        private_mode: bool,
+    ) -> Result<(), String> {
+        if private_mode {
+            return Err("private mode forbids durable outcome calibration".to_string());
+        }
+        self.record(CalibrationObservation {
+            profile_id: outcome.profile_id,
+            identity: outcome.identity,
+            role: outcome.role,
+            corpus_version: "production-outcome".to_string(),
+            bastion_version: "runtime".to_string(),
+            runtime_identity: outcome.runtime_identity,
+            difficulty_bucket: outcome.difficulty_bucket,
+            first_pass_success: outcome.first_pass_success,
+            validation_passed: outcome.validation_passed,
+            evaluation_passed: outcome.evaluation_passed,
+            rework_required: outcome.rework_required,
+            escalation_required: outcome.escalation_required,
+            elapsed_ms: outcome.elapsed_ms,
+            evidence_kind: CalibrationEvidenceKind::ObservedOutcome,
+            recorded_at: outcome.recorded_at,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_local_calibration(
+        &mut self,
+        profile: &ModelProfile,
+        corpus_version: &str,
+        bastion_version: &str,
+        runtime_identity: &str,
+        cases: &[CalibrationCase],
+        execute: &CalibrationCaseExecutor,
+        recorded_at: &str,
+    ) -> Result<CalibrationRunSummary, String> {
+        let mut summary = CalibrationRunSummary::default();
+        for case in cases {
+            let result = execute(case);
+            let observation = CalibrationObservation {
+                profile_id: profile.id.clone(),
+                identity: CalibrationIdentity::from_profile(profile),
+                role: case.role,
+                corpus_version: corpus_version.to_string(),
+                bastion_version: bastion_version.to_string(),
+                runtime_identity: runtime_identity.to_string(),
+                difficulty_bucket: case.difficulty_bucket,
+                first_pass_success: result.first_pass_success,
+                validation_passed: result.validation_passed,
+                evaluation_passed: result.evaluation_passed,
+                rework_required: result.rework_required,
+                escalation_required: result.escalation_required,
+                elapsed_ms: result.elapsed_ms,
+                evidence_kind: CalibrationEvidenceKind::LocalCalibration,
+                recorded_at: recorded_at.to_string(),
+            };
+            if result.first_pass_success {
+                summary.first_pass_successes += 1;
+            }
+            summary.cases_run += 1;
+            self.record(observation.clone())?;
+            summary.observations.push(observation);
+        }
+        Ok(summary)
+    }
+
+    pub fn import_external_prior(&mut self, prior: ExternalBenchmarkPrior) -> Result<(), String> {
+        if prior.source.trim().is_empty()
+            || prior.identity.provider.trim().is_empty()
+            || prior.identity.model.trim().is_empty()
+        {
+            return Err("external prior has an incomplete source or profile identity".to_string());
+        }
+        self.schema_version = CALIBRATION_SCHEMA_VERSION;
+        self.external_priors.push(prior);
+        Ok(())
+    }
+
+    /// Imports an explicit metadata document. This method performs no network
+    /// access; callers decide if and when a file is obtained.
+    pub fn import_external_json(&mut self, json: &str) -> Result<usize, String> {
+        let document = serde_json::from_str::<CalibrationStore>(json)
+            .map_err(|error| format!("invalid calibration document: {error}"))?;
+        if document.schema_version != CALIBRATION_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported calibration schema {}",
+                document.schema_version
+            ));
+        }
+        let count = document.external_priors.len();
+        for prior in document.external_priors {
+            self.import_external_prior(prior)?;
+        }
+        Ok(count)
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        let text = serde_json::to_vec_pretty(self).map_err(|error| error.to_string())?;
+        std::fs::write(path, text).map_err(|error| error.to_string())
+    }
+
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+        let store = serde_json::from_str::<Self>(&text).map_err(|error| error.to_string())?;
+        if store.schema_version != CALIBRATION_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported calibration schema {}",
+                store.schema_version
+            ));
+        }
+        Ok(store)
+    }
+
+    pub fn clear(&mut self) {
+        self.observations.clear();
+        self.external_priors.clear();
+    }
+
+    #[must_use]
+    pub fn effective_profile(&self, profile: &ModelProfile) -> ModelProfile {
+        let identity = CalibrationIdentity::from_profile(profile);
+        let mut effective = profile.clone();
+        for role in [
+            ModelRole::Writer,
+            ModelRole::Evaluator,
+            ModelRole::Planner,
+            ModelRole::Other,
+        ] {
+            let observations = self
+                .observations
+                .iter()
+                .filter(|observation| {
+                    observation.profile_id == profile.id
+                        && observation.identity == identity
+                        && observation.role == role
+                })
+                .collect::<Vec<_>>();
+            let prior = self
+                .external_priors
+                .iter()
+                .filter(|prior| prior.identity == identity && prior.role == role)
+                .max_by_key(|prior| prior.source_date.as_str());
+            let Some(capability) =
+                self.effective_capability(profile.capability, role, &observations, prior)
+            else {
+                continue;
+            };
+            // A profile has one capability vector, while evidence is role-specific.
+            // Apply the evidence-supported value without mutating the configured prior.
+            effective.capability.coding = capability.coding;
+            effective.capability.reasoning = capability.reasoning;
+            effective.capability.agent_tool_use = capability.agent_tool_use;
+            effective.capability.planning = capability.planning;
+            effective.capability.evaluation = capability.evaluation;
+        }
+        effective
+    }
+
+    fn effective_capability(
+        &self,
+        configured: Capability,
+        role: ModelRole,
+        observations: &[&CalibrationObservation],
+        external: Option<&ExternalBenchmarkPrior>,
+    ) -> Option<Capability> {
+        let external_score = external.map(|prior| {
+            let values = match role {
+                ModelRole::Writer => [prior.capability.coding, prior.capability.agent_tool_use],
+                ModelRole::Evaluator => [prior.capability.evaluation, prior.capability.reasoning],
+                ModelRole::Planner => [prior.capability.planning, prior.capability.reasoning],
+                ModelRole::Other => [
+                    prior.capability.reasoning,
+                    prior.capability.context_window.min(100) as u8,
+                ],
+            };
+            u16::midpoint(u16::from(values[0]), u16::from(values[1]))
+        });
+        let mut successes = external_score.map_or(0, u32::from);
+        let mut attempts = external.map_or(0, |_| 1u32);
+        for observation in observations {
+            successes += u32::from(observation.first_pass_success);
+            attempts += 1;
+        }
+        if attempts == 0 {
+            return None;
+        }
+        // Beta(1,1) smoothing and a five-observation cap keep sparse data
+        // conservative. Local observations outweigh a single imported prior.
+        let observed = ((successes + 1) * 100 / (attempts + 2)).min(100) as u8;
+        let weight = attempts.min(5);
+        let blend = |prior: u8| {
+            let numerator = u32::from(prior) * (5 - weight) + u32::from(observed) * weight;
+            u8::try_from(numerator / 5).unwrap_or(u8::MAX)
+        };
+        let mut capability = configured;
+        match role {
+            ModelRole::Writer => {
+                capability.coding = blend(configured.coding);
+                capability.agent_tool_use = blend(configured.agent_tool_use);
+            }
+            ModelRole::Evaluator => capability.evaluation = blend(configured.evaluation),
+            ModelRole::Planner => capability.planning = blend(configured.planning),
+            ModelRole::Other => {}
+        }
+        capability.reasoning = blend(configured.reasoning);
+        Some(capability)
     }
 }
 
@@ -416,6 +837,18 @@ impl ModelRouter {
     }
 
     #[must_use]
+    pub fn route_with_calibration(
+        pool: &ModelPool,
+        calibration: &CalibrationStore,
+        role: ModelRole,
+        signals: TaskSignals,
+        policy: &RoutingPolicy,
+    ) -> RouteDecision {
+        let effective_pool = pool.with_calibration(calibration);
+        Self::route(&effective_pool, role, signals, policy)
+    }
+
+    #[must_use]
     pub fn escalation(
         pool: &ModelPool,
         role: ModelRole,
@@ -427,6 +860,18 @@ impl ModelRouter {
             ..policy
         };
         Self::route(pool, role, signals, &stronger)
+    }
+
+    #[must_use]
+    pub fn escalation_with_calibration(
+        pool: &ModelPool,
+        calibration: &CalibrationStore,
+        role: ModelRole,
+        signals: TaskSignals,
+        policy: RoutingPolicy,
+    ) -> RouteDecision {
+        let effective_pool = pool.with_calibration(calibration);
+        Self::escalation(&effective_pool, role, signals, policy)
     }
 }
 
@@ -750,5 +1195,196 @@ mod tests {
             &RoutingPolicy::default(),
         );
         assert_eq!(decision.selected.unwrap().id, "fast");
+    }
+
+    fn observation(
+        profile: &ModelProfile,
+        role: ModelRole,
+        success: bool,
+    ) -> CalibrationObservation {
+        CalibrationObservation {
+            profile_id: profile.id.clone(),
+            identity: CalibrationIdentity::from_profile(profile),
+            role,
+            corpus_version: "fixture-v1".to_string(),
+            bastion_version: "test".to_string(),
+            runtime_identity: "mock-runtime-v1".to_string(),
+            difficulty_bucket: 2,
+            first_pass_success: success,
+            validation_passed: success,
+            evaluation_passed: Some(success),
+            rework_required: !success,
+            escalation_required: false,
+            elapsed_ms: Some(10),
+            evidence_kind: CalibrationEvidenceKind::LocalCalibration,
+            recorded_at: "2026-09-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn calibration_preserves_configured_prior_and_is_conservative_for_sparse_data() {
+        let profile = profile("calibrated", PrivacyClass::Local, 80, 1);
+        let mut store = CalibrationStore::new();
+        store
+            .record(observation(&profile, ModelRole::Writer, false))
+            .unwrap();
+        let effective = store.effective_profile(&profile);
+        assert_eq!(profile.capability.coding, 80);
+        assert!(effective.capability.coding < 80);
+        assert!(effective.capability.coding > 0);
+    }
+
+    #[test]
+    fn repeated_local_evidence_can_cross_a_routing_boundary() {
+        let weak = profile("local", PrivacyClass::Local, 40, 0);
+        let strong = profile("strong", PrivacyClass::Local, 90, 10);
+        let mut store = CalibrationStore::new();
+        for _ in 0..5 {
+            store
+                .record(observation(&weak, ModelRole::Writer, true))
+                .unwrap();
+        }
+        let decision = ModelRouter::route_with_calibration(
+            &ModelPool {
+                profiles: vec![weak, strong],
+            },
+            &store,
+            ModelRole::Writer,
+            signals(),
+            &RoutingPolicy::default(),
+        );
+        assert_eq!(decision.selected.unwrap().id, "local");
+    }
+
+    #[test]
+    fn calibration_is_role_specific_and_reasoning_profile_specific() {
+        let mut profile = profile("same", PrivacyClass::Local, 80, 1);
+        profile.reasoning_profile = Some("low".to_string());
+        let mut store = CalibrationStore::new();
+        store
+            .record(observation(&profile, ModelRole::Evaluator, false))
+            .unwrap();
+        let mut high = profile.clone();
+        high.reasoning_profile = Some("high".to_string());
+        assert_eq!(store.effective_profile(&high), high);
+        assert_eq!(store.effective_profile(&profile).capability.coding, 80);
+        assert!(store.effective_profile(&profile).capability.evaluation < 80);
+    }
+
+    #[test]
+    fn external_prior_import_is_explicit_and_keeps_reference_price_separate() {
+        let profile = profile("custom", PrivacyClass::Local, 50, 0);
+        let prior = ExternalBenchmarkPrior {
+            source: "fixture".to_string(),
+            source_version: "2026-01".to_string(),
+            source_date: "2026-01-01".to_string(),
+            identity: CalibrationIdentity::from_profile(&profile),
+            role: ModelRole::Writer,
+            capability: Capability {
+                coding: 90,
+                reasoning: 90,
+                agent_tool_use: 90,
+                planning: 90,
+                evaluation: 90,
+                context_window: 64_000,
+            },
+            reference_input_micros: Some(123),
+            reference_output_micros: Some(456),
+        };
+        let document = serde_json::to_string(&CalibrationStore {
+            schema_version: CALIBRATION_SCHEMA_VERSION,
+            observations: Vec::new(),
+            external_priors: vec![prior],
+        })
+        .unwrap();
+        let mut store = CalibrationStore::new();
+        assert_eq!(store.import_external_json(&document).unwrap(), 1);
+        assert_eq!(store.external_priors[0].reference_input_micros, Some(123));
+        assert_eq!(profile.pricing.actual_input_micros, 0);
+    }
+
+    #[test]
+    fn policy_filtering_still_precedes_calibrated_capability() {
+        let remote = profile("remote", PrivacyClass::Remote, 100, 0);
+        let local = profile("local", PrivacyClass::Local, 70, 20);
+        let mut store = CalibrationStore::new();
+        for _ in 0..5 {
+            store
+                .record(observation(&remote, ModelRole::Writer, true))
+                .unwrap();
+        }
+        let decision = ModelRouter::route_with_calibration(
+            &ModelPool {
+                profiles: vec![remote, local],
+            },
+            &store,
+            ModelRole::Writer,
+            signals(),
+            &RoutingPolicy {
+                local_only: true,
+                ..RoutingPolicy::default()
+            },
+        );
+        assert_eq!(decision.selected.unwrap().id, "local");
+    }
+
+    #[test]
+    fn local_calibration_runner_records_versioned_role_specific_observations() {
+        let profile = profile("fixture", PrivacyClass::Local, 70, 0);
+        let mut store = CalibrationStore::new();
+        let cases = default_calibration_cases();
+        let summary = store
+            .run_local_calibration(
+                &profile,
+                "calibration-v1",
+                "bastion-test",
+                "mock-runtime-v1",
+                &cases,
+                &|case| CalibrationCaseResult {
+                    first_pass_success: case.difficulty_bucket < 4,
+                    validation_passed: case.difficulty_bucket < 4,
+                    evaluation_passed: Some(case.difficulty_bucket < 4),
+                    rework_required: case.difficulty_bucket >= 4,
+                    ..CalibrationCaseResult::default()
+                },
+                "2026-09-01T00:00:00Z",
+            )
+            .unwrap();
+        assert_eq!(summary.cases_run, 6);
+        assert_eq!(summary.first_pass_successes, 4);
+        assert!(summary
+            .observations
+            .iter()
+            .all(|item| item.corpus_version == "calibration-v1"));
+        assert_eq!(
+            summary
+                .observations
+                .iter()
+                .filter(|item| item.role == ModelRole::Evaluator)
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn private_outcome_ingestion_is_rejected_without_mutating_store() {
+        let profile = profile("private", PrivacyClass::Local, 70, 0);
+        let mut store = CalibrationStore::new();
+        let outcome = OutcomeMetadata {
+            profile_id: profile.id.clone(),
+            identity: CalibrationIdentity::from_profile(&profile),
+            role: ModelRole::Writer,
+            runtime_identity: "runtime".to_string(),
+            difficulty_bucket: 2,
+            first_pass_success: true,
+            validation_passed: true,
+            evaluation_passed: Some(true),
+            rework_required: false,
+            escalation_required: false,
+            elapsed_ms: Some(1),
+            recorded_at: "now".to_string(),
+        };
+        assert!(store.record_outcome(outcome, true).is_err());
+        assert!(store.observations.is_empty());
     }
 }

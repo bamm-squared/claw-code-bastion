@@ -3712,6 +3712,7 @@ struct LiveCli {
     task_plan: task_plan::TaskPlan,
     evaluation: Option<requirement_evaluator::EvaluationReport>,
     model_pool: model_router::ModelPool,
+    calibration: model_router::CalibrationStore,
     routing_policy: model_router::RoutingPolicy,
     last_routing_explanation: Option<String>,
     selected_writer_profile: Option<model_router::ModelProfile>,
@@ -4522,6 +4523,11 @@ impl LiveCli {
         let cwd = env::current_dir()?;
         let config = ConfigLoader::default_for(&cwd).load()?;
         let model_pool = model_router::ModelPool::from_runtime_config(&config, &model);
+        let calibration = if is_private_mode() {
+            model_router::CalibrationStore::new()
+        } else {
+            model_router::CalibrationStore::from_runtime_config(&config)
+        };
         let mut routing_policy = model_router::RoutingPolicy::from_runtime_config(&config);
         if is_private_mode() && env::var("CLAW_PRIVATE_ALLOW_REMOTE_PROVIDER").as_deref() != Ok("1")
         {
@@ -4561,6 +4567,7 @@ impl LiveCli {
             task_plan: task_plan::TaskPlan::default(),
             evaluation: None,
             model_pool,
+            calibration,
             routing_policy,
             last_routing_explanation: None,
             selected_writer_profile: None,
@@ -4597,15 +4604,17 @@ impl LiveCli {
                     .cloned()
                     .collect(),
             };
-            model_router::ModelRouter::escalation(
+            model_router::ModelRouter::escalation_with_calibration(
                 &pool,
+                &self.calibration,
                 model_router::ModelRole::Writer,
                 signals,
                 self.routing_policy.clone(),
             )
         } else {
-            model_router::ModelRouter::route(
+            model_router::ModelRouter::route_with_calibration(
                 &self.model_pool,
+                &self.calibration,
                 model_router::ModelRole::Writer,
                 signals,
                 &self.routing_policy,
@@ -5158,8 +5167,9 @@ impl LiveCli {
                 &changed_paths,
                 if normal_apply_allowed { "PASS" } else { "FAIL" },
             );
-            let evaluator_route = model_router::ModelRouter::route(
+            let evaluator_route = model_router::ModelRouter::route_with_calibration(
                 &self.model_pool,
+                &self.calibration,
                 model_router::ModelRole::Evaluator,
                 routing_signals(&self.task_plan),
                 &self.routing_policy,
