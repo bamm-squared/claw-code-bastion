@@ -4040,6 +4040,7 @@ struct LiveCli {
     rework_blocked: Option<String>,
     exploration_input: Option<String>,
     exploration_context: Option<String>,
+    checkpoint_store: runtime::CandidateCheckpointStore,
 }
 
 #[derive(Debug, Clone)]
@@ -4860,6 +4861,8 @@ impl LiveCli {
         }
         let session_state = new_cli_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
+        let checkpoint_store =
+            runtime::CandidateCheckpointStore::new(session.id.clone(), is_private_mode())?;
         let session_state = if is_private_mode() {
             session_state
         } else {
@@ -4903,6 +4906,7 @@ impl LiveCli {
             rework_blocked: None,
             exploration_input: None,
             exploration_context: None,
+            checkpoint_store,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -5607,6 +5611,11 @@ impl LiveCli {
         );
 
         if active_evaluation.has_rework_finding() {
+            if let Err(error) = self.checkpoint_before_rework(runtime, &changes) {
+                eprintln!("warning: unable to create candidate checkpoint: {error}");
+            } else {
+                println!("Saved trusted candidate checkpoint before automatic rework.");
+            }
             self.record_evaluation_rework(&active_evaluation, &changed_paths, normal_apply_allowed);
             if self.pending_rework.is_some() {
                 self.candidate_state = CandidateLifecycleState::Editing;
@@ -5666,6 +5675,7 @@ impl LiveCli {
             CandidateReviewAction::Apply => {
                 runtime.apply_candidate_changes(&changes, &validation, false)?;
                 runtime.discard_candidate()?;
+                self.checkpoint_store.clear();
                 self.candidate_state = CandidateLifecycleState::Applied;
                 self.pending_rework = None;
                 self.escalation_requested = false;
@@ -5684,6 +5694,7 @@ impl LiveCli {
                 }
                 runtime.apply_candidate_changes(&changes, &validation, true)?;
                 runtime.discard_candidate()?;
+                self.checkpoint_store.clear();
                 self.candidate_state = CandidateLifecycleState::Applied;
                 self.pending_rework = None;
                 self.escalation_requested = false;
@@ -5695,6 +5706,7 @@ impl LiveCli {
             }
             CandidateReviewAction::Discard => {
                 runtime.discard_candidate()?;
+                self.checkpoint_store.clear();
                 self.candidate_state = CandidateLifecycleState::Discarded;
                 self.pending_rework = None;
                 self.escalation_requested = false;
@@ -5806,6 +5818,40 @@ impl LiveCli {
                 return Ok(());
             }
         }
+    }
+
+    fn checkpoint_before_rework(
+        &mut self,
+        runtime: &BuiltRuntime,
+        changes: &CandidateChangeSet,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some((_, candidate_root)) = runtime.candidate_review_roots() else {
+            return Err("candidate checkpoint requires an isolated candidate root".into());
+        };
+        let _ = self.checkpoint_store.create(
+            &candidate_root,
+            changes.id,
+            "before evaluator-driven rework or capability escalation",
+        )?;
+        Ok(())
+    }
+
+    fn restore_checkpoint(
+        &mut self,
+        checkpoint_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some((_, candidate_root)) = self.runtime.candidate_review_roots() else {
+            return Err("candidate checkpoint requires an isolated candidate root".into());
+        };
+        self.checkpoint_store
+            .restore(checkpoint_id, &candidate_root)?;
+        self.evaluation = None;
+        self.pending_rework = None;
+        self.escalation_requested = false;
+        self.rework_blocked = None;
+        self.candidate_state = CandidateLifecycleState::Editing;
+        println!("Restored trusted candidate checkpoint {checkpoint_id}; validation and evaluation are stale.");
+        Ok(())
     }
 
     fn record_evaluation_rework(
