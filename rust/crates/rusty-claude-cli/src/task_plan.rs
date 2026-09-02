@@ -134,6 +134,19 @@ impl TaskPlan {
         }
     }
 
+    pub fn reopen_for_evaluation(&mut self, item_id: &str, reason: &str) {
+        if let Some(item) = self.items.iter_mut().find(|item| item.id == item_id) {
+            item.status = PlanItemStatus::NeedsResearch;
+            item.provenance = truncate(reason, MAX_STATEMENT_BYTES);
+            self.revision = self.revision.saturating_add(1);
+        }
+        self.open_questions.push(format!(
+            "Evaluation follow-up for {item_id}: {}",
+            truncate(reason, 160)
+        ));
+        self.open_questions.truncate(MAX_CONTRACTS);
+    }
+
     pub fn mark_validation_failure(&mut self, reason: &str) {
         for item in &mut self.items {
             if matches!(
@@ -288,5 +301,17 @@ mod tests {
         let revision = plan.revision;
         plan.update("Inspect provider.rs", None);
         assert_eq!(plan.revision, revision);
+    }
+
+    #[test]
+    fn evaluation_reopens_item_without_claiming_verification() {
+        let mut plan = TaskPlan::from_request("Update the provider path", None);
+        plan.mark_implemented("item-1", "candidate writer");
+        plan.reopen_for_evaluation("item-1", "cross-module behavior remains incomplete");
+        assert_eq!(plan.items[0].status, PlanItemStatus::NeedsResearch);
+        assert!(plan
+            .open_questions
+            .iter()
+            .any(|question| question.contains("Evaluation follow-up")));
     }
 }

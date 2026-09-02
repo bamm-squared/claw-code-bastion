@@ -73,6 +73,7 @@ use tools::{
 };
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
+const MAX_REWORK_CYCLES: u8 = 2;
 fn max_tokens_for_model(model: &str) -> u32 {
     if model.contains("opus") {
         32_000
@@ -3714,6 +3715,9 @@ struct LiveCli {
     routing_policy: model_router::RoutingPolicy,
     last_routing_explanation: Option<String>,
     selected_writer_profile: Option<model_router::ModelProfile>,
+    pending_rework: Option<model_router::EscalationPackage>,
+    rework_cycles: u8,
+    escalation_requested: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -4559,6 +4563,9 @@ impl LiveCli {
             routing_policy,
             last_routing_explanation: None,
             selected_writer_profile: None,
+            pending_rework: None,
+            rework_cycles: 0,
+            escalation_requested: false,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -4577,16 +4584,36 @@ impl LiveCli {
             return;
         }
         let signals = routing_signals(&self.task_plan);
-        let decision = model_router::ModelRouter::route(
-            &self.model_pool,
-            model_router::ModelRole::Writer,
-            signals,
-            &self.routing_policy,
-        );
+        let decision = if self.escalation_requested {
+            let current_id = self.selected_writer_profile.as_ref().map(|p| p.id.as_str());
+            let pool = model_router::ModelPool {
+                profiles: self
+                    .model_pool
+                    .profiles
+                    .iter()
+                    .filter(|profile| Some(profile.id.as_str()) != current_id)
+                    .cloned()
+                    .collect(),
+            };
+            model_router::ModelRouter::escalation(
+                &pool,
+                model_router::ModelRole::Writer,
+                signals,
+                self.routing_policy.clone(),
+            )
+        } else {
+            model_router::ModelRouter::route(
+                &self.model_pool,
+                model_router::ModelRole::Writer,
+                signals,
+                &self.routing_policy,
+            )
+        };
         self.last_routing_explanation = Some(decision.reason.clone());
         if let Some(profile) = decision.selected {
             self.model.clone_from(&profile.model);
             self.selected_writer_profile = Some(profile);
+            self.escalation_requested = false;
         }
     }
 
@@ -4811,6 +4838,15 @@ impl LiveCli {
             .map(|selection| selection.text.as_str());
         self.task_plan.update(task_input, repository_text);
         let plan_text = self.task_plan.render();
+        let pending_rework = self.pending_rework.take();
+        let plan_text = pending_rework
+            .as_ref()
+            .map_or(plan_text.clone(), |package| {
+                format!(
+                    "{plan_text}\n\n[Focused Rework Package]\n{}\n",
+                    render_escalation_package(package)
+                )
+            });
         let runtime = build_runtime_with_backend_profile(
             self.runtime.session().clone(),
             &self.session.id,
@@ -5128,7 +5164,15 @@ impl LiveCli {
             self.task_plan
                 .mark_validation_failure("trusted validation did not permit normal Apply");
         }
-        println!("\nRequirement evaluation\n{}", evaluation.summary());
+        let active_evaluation = self
+            .evaluation
+            .clone()
+            .unwrap_or_else(|| evaluation.clone());
+        println!("\nRequirement evaluation\n{}", active_evaluation.summary());
+
+        if active_evaluation.has_rework_finding() {
+            self.record_evaluation_rework(&active_evaluation, &changed_paths, normal_apply_allowed);
+        }
 
         let action = loop {
             println!("\n{}", render_review_overview(&changes, &validation));
@@ -5179,6 +5223,8 @@ impl LiveCli {
                 runtime.apply_candidate_changes(&changes, &validation, false)?;
                 runtime.discard_candidate()?;
                 self.candidate_state = CandidateLifecycleState::Applied;
+                self.pending_rework = None;
+                self.escalation_requested = false;
                 println!("✅ Candidate changes applied.");
             }
             CandidateReviewAction::ApplyAnyway => {
@@ -5195,6 +5241,8 @@ impl LiveCli {
                 runtime.apply_candidate_changes(&changes, &validation, true)?;
                 runtime.discard_candidate()?;
                 self.candidate_state = CandidateLifecycleState::Applied;
+                self.pending_rework = None;
+                self.escalation_requested = false;
                 println!("✅ Candidate changes applied with validation override.");
             }
             CandidateReviewAction::RequestChanges => {
@@ -5204,11 +5252,71 @@ impl LiveCli {
             CandidateReviewAction::Discard => {
                 runtime.discard_candidate()?;
                 self.candidate_state = CandidateLifecycleState::Discarded;
+                self.pending_rework = None;
+                self.escalation_requested = false;
                 println!("Candidate discarded.");
             }
         }
 
         Ok(())
+    }
+
+    fn record_evaluation_rework(
+        &mut self,
+        evaluation: &requirement_evaluator::EvaluationReport,
+        changed_paths: &[String],
+        validation_passed: bool,
+    ) {
+        if self.rework_cycles >= MAX_REWORK_CYCLES {
+            self.task_plan.add_discovered_item(
+                "Resolve remaining requirement evaluation findings with user guidance",
+                "rework limit reached",
+            );
+            return;
+        }
+        for finding in &evaluation.requirements {
+            if finding.state != requirement_evaluator::RequirementState::Satisfied {
+                self.task_plan
+                    .reopen_for_evaluation(&finding.requirement_id, &finding.finding);
+            }
+        }
+        self.rework_cycles = self.rework_cycles.saturating_add(1);
+        let signals = routing_signals(&self.task_plan);
+        let escalation = evaluation.requirements.iter().any(|finding| {
+            finding.rework_recommended
+                && [
+                    "architecture",
+                    "cross-module",
+                    "concurrency",
+                    "security",
+                    "privacy",
+                ]
+                .iter()
+                .any(|term| finding.finding.to_ascii_lowercase().contains(term))
+        });
+        self.escalation_requested = escalation;
+        self.pending_rework = Some(model_router::EscalationPackage {
+            original_requirement: self.task_plan.original_request.clone(),
+            task_plan: self.task_plan.render(),
+            candidate_summary: format!("Changed paths: {}", changed_paths.join(", ")),
+            expected_contracts: self
+                .task_plan
+                .contracts
+                .iter()
+                .map(|contract| format!("{}: {}", contract.id, contract.expectation))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            evaluation_findings: evaluation.summary(),
+            validation_evidence: if validation_passed { "PASS" } else { "FAIL" }.to_string(),
+            repository_intelligence: self.task_plan.known_impact.join("\n"),
+            unresolved_questions: self.task_plan.open_questions.clone(),
+        });
+        if escalation {
+            self.last_routing_explanation = Some(
+                "Evaluation identified a likely capability-sensitive gap; next retained-candidate rework may escalate."
+                    .to_string(),
+            );
+        }
     }
 
     fn run_review_command(
@@ -5302,6 +5410,8 @@ impl LiveCli {
                     .apply_candidate_changes(changes, validation, false)?;
                 self.runtime.discard_candidate()?;
                 self.candidate_state = CandidateLifecycleState::Applied;
+                self.pending_rework = None;
+                self.escalation_requested = false;
                 println!("Candidate changes applied.");
             }
             CandidateReviewAction::ApplyAnyway => {
@@ -5309,6 +5419,8 @@ impl LiveCli {
                     .apply_candidate_changes(changes, validation, true)?;
                 self.runtime.discard_candidate()?;
                 self.candidate_state = CandidateLifecycleState::Applied;
+                self.pending_rework = None;
+                self.escalation_requested = false;
                 println!("Candidate changes applied with validation override.");
             }
             CandidateReviewAction::RequestChanges => {
@@ -5318,6 +5430,8 @@ impl LiveCli {
             CandidateReviewAction::Discard => {
                 self.runtime.discard_candidate()?;
                 self.candidate_state = CandidateLifecycleState::Discarded;
+                self.pending_rework = None;
+                self.escalation_requested = false;
                 println!("Candidate discarded.");
             }
         }
@@ -8860,6 +8974,18 @@ fn normalize_profile_reasoning(value: Option<&str>) -> Result<Option<String>, St
             "unsupported routed reasoning profile '{other}'; supported values are default, off, none, low, medium, and high"
         )),
     }
+}
+
+fn render_escalation_package(package: &model_router::EscalationPackage) -> String {
+    format!(
+        "Original requirement: {}\nCandidate: {}\nValidation: {}\nEvaluation findings:\n{}\nUnresolved questions:\n{}\nRelevant repository facts:\n{}\n",
+        package.original_requirement,
+        package.candidate_summary,
+        package.validation_evidence,
+        package.evaluation_findings,
+        package.unresolved_questions.join("\n"),
+        package.repository_intelligence,
+    )
 }
 
 impl ApiClient for AnthropicRuntimeClient {
