@@ -3822,6 +3822,7 @@ fn run_resume_command(
         | SlashCommand::Copy { .. }
         | SlashCommand::Hooks { .. }
         | SlashCommand::Context { .. }
+        | SlashCommand::Checkpoint { .. }
         | SlashCommand::Attach { .. }
         | SlashCommand::Attachments
         | SlashCommand::Detach { .. }
@@ -5098,6 +5099,47 @@ impl LiveCli {
         }
     }
 
+    fn handle_checkpoint_command(
+        &mut self,
+        action: Option<&str>,
+        target: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match action.unwrap_or("list") {
+            "list" | "show" => {
+                if target.is_some() {
+                    return Err("Usage: /checkpoint [list|restore <id>]".into());
+                }
+                let checkpoints = self.checkpoint_store.list();
+                if checkpoints.is_empty() {
+                    println!("No trusted candidate checkpoints available.");
+                } else {
+                    println!("Trusted candidate checkpoints:");
+                    for checkpoint in checkpoints {
+                        println!(
+                            "  {} · candidate {} · {} · {} bytes",
+                            checkpoint.id,
+                            checkpoint.candidate_id,
+                            checkpoint.reason,
+                            checkpoint.bytes
+                        );
+                    }
+                }
+            }
+            "restore" => {
+                let checkpoint_id = target.ok_or("Usage: /checkpoint restore <id>")?;
+                self.restore_checkpoint(checkpoint_id)?;
+                println!("Continue from the restored candidate; fresh validation and evaluation are required.");
+            }
+            other => {
+                return Err(format!(
+                    "Unknown checkpoint action `{other}`. Use /checkpoint or /checkpoint restore <id>."
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
     fn attach_file(&mut self, raw: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         if self.attachments.len() >= attachments::MAX_ATTACHMENTS {
             return Err("attachment limit reached".into());
@@ -6222,6 +6264,10 @@ impl LiveCli {
                         eprintln!("unknown context action `{other}`; use /context, /context clear");
                     }
                 }
+                false
+            }
+            SlashCommand::Checkpoint { action, target } => {
+                self.handle_checkpoint_command(action.as_deref(), target.as_deref())?;
                 false
             }
             SlashCommand::Attach { path } => {
@@ -15784,5 +15830,81 @@ mod candidate_review_diff_tests {
         .contains("Binary file changed"));
         snapshot.discard().expect("snapshot should clean up");
         fs::remove_dir_all(root).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn integrated_candidate_state_lifecycle_preserves_identity_and_stale_evidence() {
+        let root = std::env::temp_dir().join(format!(
+            "claw-integrated-lifecycle-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("integration fixture root");
+        fs::create_dir_all(root.join("src")).expect("integration source root");
+        fs::write(root.join("src/provider.rs"), "fn provider() {}\n").expect("integration source");
+
+        let isolated = runtime::create_disposable_snapshot(&root)
+            .expect("trusted candidate snapshot should initialize");
+        fs::write(
+            isolated.candidate.root.join("src/provider.rs"),
+            "fn provider() { let routed = true; }\n",
+        )
+        .expect("candidate writer mutation");
+        let candidate_a = isolated.scan().expect("candidate A should scan");
+        assert!(!candidate_a.changes.is_empty());
+
+        let mut plan = super::task_plan::TaskPlan::from_request(
+            "Update provider routing and preserve private mode.",
+            Some("src/provider.rs\nreferences: session restoration"),
+        );
+        plan.mark_implemented("item-1", "candidate writer");
+        let evaluation_a = super::requirement_evaluator::RequirementEvaluator::deterministic(
+            &plan,
+            &["src/provider.rs".to_string()],
+            false,
+        );
+        assert!(!evaluation_a.requirements.is_empty());
+
+        let mut checkpoints = runtime::CandidateCheckpointStore::new("integrated-test", false)
+            .expect("checkpoint store");
+        let checkpoint = checkpoints
+            .create(
+                &isolated.candidate.root,
+                candidate_a.id,
+                "before evaluator-driven rework",
+            )
+            .expect("checkpoint should capture candidate A");
+
+        fs::write(
+            isolated.candidate.root.join("src/provider.rs"),
+            "fn provider() { let incorrect = true; }\n",
+        )
+        .expect("rework mutation");
+        let candidate_b = isolated.scan().expect("candidate B should scan");
+        assert_ne!(candidate_a.id, candidate_b.id);
+
+        checkpoints
+            .restore(&checkpoint.id, &isolated.candidate.root)
+            .expect("trusted restore should succeed");
+        let restored = isolated.scan().expect("restored candidate should scan");
+        assert_eq!(candidate_a.id, restored.id);
+        assert_eq!(
+            fs::read_to_string(isolated.candidate.root.join("src/provider.rs"))
+                .expect("restored candidate source"),
+            "fn provider() { let routed = true; }\n"
+        );
+        assert_ne!(candidate_b.id, restored.id);
+
+        plan.invalidate_after_candidate_restore();
+        assert_eq!(
+            plan.items[0].status,
+            super::task_plan::PlanItemStatus::NeedsResearch
+        );
+        assert!(evaluation_a.deterministic || !evaluation_a.requirements.is_empty());
+
+        isolated.discard().expect("integration fixture cleanup");
+        fs::remove_dir_all(root).expect("integration root cleanup");
     }
 }

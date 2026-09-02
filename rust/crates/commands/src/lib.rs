@@ -398,6 +398,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "checkpoint",
+        aliases: &[],
+        summary: "List or restore trusted candidate checkpoints",
+        argument_hint: Some("[list|restore <id>]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "attach",
         aliases: &[],
         summary: "Attach one explicit user-selected file to the next prompt",
@@ -1207,6 +1214,10 @@ pub enum SlashCommand {
     Context {
         action: Option<String>,
     },
+    Checkpoint {
+        action: Option<String>,
+        target: Option<String>,
+    },
     Attach {
         path: Option<String>,
     },
@@ -1333,6 +1344,7 @@ impl SlashCommand {
             Self::Copy { .. } => "/copy",
             Self::Hooks { .. } => "/hooks",
             Self::Context { .. } => "/context",
+            Self::Checkpoint { .. } => "/checkpoint",
             Self::Attach { .. } => "/attach",
             Self::Attachments => "/attachments",
             Self::Detach { .. } => "/detach",
@@ -1549,6 +1561,17 @@ pub fn validate_slash_command_input(
         "copy" => SlashCommand::Copy { target: remainder },
         "hooks" => SlashCommand::Hooks { args: remainder },
         "context" => SlashCommand::Context { action: remainder },
+        "checkpoint" => {
+            if args.len() > 2 {
+                return Err(SlashCommandParseError::new(
+                    "Usage: /checkpoint [list|restore <id>]",
+                ));
+            }
+            SlashCommand::Checkpoint {
+                action: args.first().map(|value| (*value).to_string()),
+                target: args.get(1).map(|value| (*value).to_string()),
+            }
+        }
         "attach" => SlashCommand::Attach { path: remainder },
         "attachments" => {
             validate_no_args(command, &args)?;
@@ -4195,6 +4218,7 @@ pub fn handle_slash_command(
         | SlashCommand::Copy { .. }
         | SlashCommand::Hooks { .. }
         | SlashCommand::Context { .. }
+        | SlashCommand::Checkpoint { .. }
         | SlashCommand::Attach { .. }
         | SlashCommand::Attachments
         | SlashCommand::Detach { .. }
@@ -4682,6 +4706,25 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_command_supports_bounded_list_and_restore_forms() {
+        assert_eq!(
+            SlashCommand::parse("/checkpoint"),
+            Ok(Some(SlashCommand::Checkpoint {
+                action: None,
+                target: None,
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/checkpoint restore checkpoint-1"),
+            Ok(Some(SlashCommand::Checkpoint {
+                action: Some("restore".to_string()),
+                target: Some("checkpoint-1".to_string()),
+            }))
+        );
+        assert!(parse_error_message("/checkpoint restore one two").contains("Usage: /checkpoint"));
+    }
+
+    #[test]
     fn rejects_invalid_mcp_arguments() {
         let show_error = parse_error_message("/mcp show alpha beta");
         assert!(show_error.contains("Unexpected arguments for /mcp show."));
@@ -4744,7 +4787,7 @@ mod tests {
         assert!(help.contains("aliases: /skill"));
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
-        assert_eq!(slash_command_specs().len(), 146);
+        assert_eq!(slash_command_specs().len(), 147);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 
