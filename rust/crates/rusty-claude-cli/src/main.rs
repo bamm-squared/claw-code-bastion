@@ -13,6 +13,7 @@ mod init;
 mod input;
 mod provider;
 mod render;
+mod task_plan;
 
 use std::collections::BTreeSet;
 use std::env;
@@ -3705,6 +3706,7 @@ struct LiveCli {
     review_file_index: Option<usize>,
     context_tray: Vec<ContextTrayItem>,
     attachments: Vec<attachments::TaskAttachment>,
+    task_plan: task_plan::TaskPlan,
 }
 
 #[derive(Debug, Clone)]
@@ -4535,6 +4537,7 @@ impl LiveCli {
             review_file_index: None,
             context_tray: Vec::new(),
             attachments: Vec::new(),
+            task_plan: task_plan::TaskPlan::default(),
         };
         cli.persist_session()?;
         Ok(cli)
@@ -4744,7 +4747,7 @@ impl LiveCli {
     }
 
     fn prepare_turn_runtime(
-        &self,
+        &mut self,
         emit_output: bool,
         task_input: &str,
     ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
@@ -4762,6 +4765,11 @@ impl LiveCli {
         }
         let hook_abort_signal = runtime::HookAbortSignal::new();
         let repository_context = build_repository_context(task_input, retained_backend.as_ref());
+        let repository_text = repository_context
+            .as_ref()
+            .map(|selection| selection.text.as_str());
+        self.task_plan.update(task_input, repository_text);
+        let plan_text = self.task_plan.render();
         let runtime = build_runtime_with_backend(
             self.runtime.session().clone(),
             &self.session.id,
@@ -4780,9 +4788,9 @@ impl LiveCli {
                 selection.selected_nodes,
                 selection.considered_edges,
             );
-            runtime.with_repository_context(selection.text)
+            runtime.with_repository_context(format!("{}\n\n{}", selection.text, plan_text))
         } else {
-            runtime
+            runtime.with_repository_context(plan_text)
         }
         .with_hook_abort_signal(hook_abort_signal.clone());
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
@@ -5006,6 +5014,10 @@ impl LiveCli {
         let policy = runtime::ValidationPolicy::default();
         let normal_apply_allowed = validation.allows_apply(changes.id, policy, false);
         let blocked_apply_allowed = validation.allows_apply(changes.id, policy, true);
+        if !normal_apply_allowed {
+            self.task_plan
+                .mark_validation_failure("trusted validation did not permit normal Apply");
+        }
 
         let action = loop {
             println!("\n{}", render_review_overview(&changes, &validation));
