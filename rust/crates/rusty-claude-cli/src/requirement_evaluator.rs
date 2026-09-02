@@ -41,6 +41,7 @@ pub struct EvaluationRequest {
     pub unresolved_requirement_ids: Vec<String>,
     pub changed_paths: Vec<String>,
     pub validation_summary: String,
+    pub validation_relevance: String,
     pub graph_evidence: Vec<String>,
 }
 
@@ -117,6 +118,17 @@ impl RequirementEvaluator {
         changed_paths: &[String],
         validation_summary: &str,
     ) -> EvaluationRequest {
+        Self::request_with_validation_evidence(plan, report, changed_paths, validation_summary, "")
+    }
+
+    #[must_use]
+    pub fn request_with_validation_evidence(
+        plan: &TaskPlan,
+        report: &EvaluationReport,
+        changed_paths: &[String],
+        validation_summary: &str,
+        validation_relevance: &str,
+    ) -> EvaluationRequest {
         EvaluationRequest {
             original_requirement: plan.authoritative_request().to_string(),
             contracts: plan.contracts.clone(),
@@ -128,6 +140,7 @@ impl RequirementEvaluator {
                 .collect(),
             changed_paths: changed_paths.to_vec(),
             validation_summary: validation_summary.to_string(),
+            validation_relevance: validation_relevance.to_string(),
             graph_evidence: plan.known_impact.clone(),
         }
     }
@@ -143,6 +156,10 @@ impl RequirementEvaluator {
         output.push_str(&request.changed_paths.join(", "));
         output.push_str("\nValidation evidence: ");
         output.push_str(&request.validation_summary);
+        if !request.validation_relevance.is_empty() {
+            output.push_str("\nValidation relevance:\n");
+            output.push_str(&request.validation_relevance);
+        }
         if !request.graph_evidence.is_empty() {
             output.push_str("\nGraph evidence:\n");
             for evidence in &request.graph_evidence {
@@ -322,6 +339,22 @@ mod tests {
         assert!(rendered.contains("Original requirement"));
         assert!(rendered.contains("writer conversation is intentionally excluded"));
         assert!(!rendered.contains("assistant history"));
+    }
+
+    #[test]
+    fn fresh_request_includes_bounded_validation_relevance() {
+        let report =
+            RequirementEvaluator::deterministic(&plan(), &["src/provider.rs".into()], true);
+        let request = RequirementEvaluator::request_with_validation_evidence(
+            &plan(),
+            &report,
+            &["src/provider.rs".into()],
+            "PASS",
+            "Missing or unknown evidence:\n- test relationship unknown",
+        );
+        let rendered = RequirementEvaluator::render_request(&request);
+        assert!(rendered.contains("Validation relevance"));
+        assert!(rendered.contains("test relationship unknown"));
     }
 
     #[test]

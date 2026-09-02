@@ -17,6 +17,7 @@ mod provider;
 mod render;
 mod requirement_evaluator;
 mod task_plan;
+mod validation_intelligence;
 
 use std::collections::BTreeSet;
 use std::env;
@@ -5589,6 +5590,17 @@ impl LiveCli {
             .iter()
             .map(|change| change.path().display().to_string())
             .collect::<Vec<_>>();
+        let repository_context = build_repository_context(
+            self.task_plan.authoritative_request(),
+            runtime.execution_backend().as_ref(),
+        );
+        let validation_evidence = validation_intelligence::analyze(
+            &changed_paths,
+            repository_context
+                .as_ref()
+                .map(|selection| selection.text.as_str()),
+            &self.task_plan.contracts,
+        );
         let evaluation = requirement_evaluator::RequirementEvaluator::deterministic(
             &self.task_plan,
             &changed_paths,
@@ -5596,12 +5608,14 @@ impl LiveCli {
         );
         self.evaluation = Some(evaluation.clone());
         if !evaluation.deterministic {
-            let request = requirement_evaluator::RequirementEvaluator::request(
-                &self.task_plan,
-                &evaluation,
-                &changed_paths,
-                if normal_apply_allowed { "PASS" } else { "FAIL" },
-            );
+            let request =
+                requirement_evaluator::RequirementEvaluator::request_with_validation_evidence(
+                    &self.task_plan,
+                    &evaluation,
+                    &changed_paths,
+                    if normal_apply_allowed { "PASS" } else { "FAIL" },
+                    &validation_evidence.render(),
+                );
             let evaluator_route = model_router::ModelRouter::route_with_calibration(
                 &self.model_pool,
                 &self.calibration,
