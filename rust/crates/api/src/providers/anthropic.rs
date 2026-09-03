@@ -324,12 +324,13 @@ impl AnthropicClient {
                     .with_property("total_tokens", Value::from(response.total_tokens()))
                     .with_property(
                         "estimated_cost_usd",
-                        Value::String(format_usd(
-                            response
-                                .usage
-                                .estimated_cost_usd(&response.model)
-                                .total_cost_usd(),
-                        )),
+                        response
+                            .usage
+                            .estimated_cost_usd(&response.model)
+                            .map_or_else(
+                                || Value::String("unknown".to_string()),
+                                |cost| Value::String(format_usd(cost.total_cost_usd())),
+                            ),
                     ),
             );
         }

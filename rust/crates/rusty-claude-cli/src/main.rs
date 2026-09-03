@@ -28,6 +28,7 @@ use std::net::TcpListener;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -77,7 +78,10 @@ use tools::{
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 const MAX_REWORK_CYCLES: u8 = 2;
 fn max_tokens_for_model(model: &str) -> u32 {
-    if model.contains("opus") {
+    let model = model.to_ascii_lowercase();
+    if model.starts_with("gpt-4o") {
+        16_384
+    } else if model.contains("opus") {
         32_000
     } else {
         64_000
@@ -215,6 +219,14 @@ fn provider_endpoint(model: &str) -> String {
                     .unwrap_or_else(|_| String::from("https://api.openai.com/v1"))
             }
         }
+    }
+}
+
+static PROVIDER_CALL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn provider_trace(message: impl AsRef<str>) {
+    if env::var("CLAW_PROVIDER_TRACE").as_deref() == Ok("1") {
+        eprintln!("[provider-trace] {}", message.as_ref());
     }
 }
 
@@ -5544,12 +5556,21 @@ impl LiveCli {
                     "cache_creation_input_tokens": summary.usage.cache_creation_input_tokens,
                     "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
                 },
-                "estimated_cost": format_usd(
-                    summary.usage.estimate_cost_usd_with_pricing(
-                        pricing_for_model(&self.model)
-                            .unwrap_or_else(runtime::ModelPricing::default_sonnet_tier)
-                    ).total_cost_usd()
-                )
+                "estimated_cost": self.selected_writer_profile
+                    .as_ref()
+                    .and_then(model_router::actual_pricing_for_profile)
+                    .or_else(|| pricing_for_model(&self.model))
+                    .map_or_else(
+                        || "unknown".to_string(),
+                        |pricing| {
+                            format_usd(
+                                summary
+                                    .usage
+                                    .estimate_cost_usd_with_pricing(pricing)
+                                    .total_cost_usd(),
+                            )
+                        },
+                    )
             })
         );
         Ok(())
@@ -9541,6 +9562,14 @@ impl AnthropicRuntimeClient {
         // skip it.
         let resolved_model = api::resolve_model_alias(&model);
         enforce_private_provider(&resolved_model)?;
+        provider_trace(format!(
+            "provider_constructor model={} provider_hint={} endpoint={} tools={} configured_model={}",
+            resolved_model,
+            provider.unwrap_or("none"),
+            endpoint.unwrap_or("env/default"),
+            enable_tools,
+            model
+        ));
         let client = match provider
             .map(str::to_ascii_lowercase)
             .as_deref()
@@ -9572,12 +9601,24 @@ impl AnthropicRuntimeClient {
                 // OpenRouter, xAI, DashScope, Ollama, and any other
                 // OpenAI-compat endpoint users configure via
                 // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
-                ApiProviderClient::from_model_with_profile(
+                let client = ApiProviderClient::from_model_with_profile(
                     &resolved_model,
                     provider,
                     None,
                     endpoint,
-                )?
+                )?;
+                provider_trace(format!(
+                    "provider_selected kind={:?} model={} effective_endpoint={} api_client={}",
+                    client.provider_kind(),
+                    resolved_model,
+                    endpoint.unwrap_or("env/default"),
+                    match client.provider_kind() {
+                        ProviderKind::OpenAi => "openai_compat",
+                        ProviderKind::Xai => "xai_compat",
+                        ProviderKind::Anthropic => "anthropic",
+                    }
+                ));
+                client
             }
         };
         Ok(Self {
@@ -9764,8 +9805,20 @@ impl ApiClient for AnthropicRuntimeClient {
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
             reasoning_effort: self.reasoning_effort.clone(),
+            provider_call_id: Some(format!(
+                "cli-provider-call-{}",
+                PROVIDER_CALL_COUNTER.fetch_add(1, Ordering::Relaxed) + 1
+            )),
             ..Default::default()
         };
+        provider_trace(format!(
+            "request_requested logical_call={} model={} tools={} reasoning={} stream=true max_tokens={}",
+            message_request.provider_call_id.as_deref().unwrap_or("unassigned"),
+            message_request.model,
+            message_request.tools.is_some(),
+            message_request.reasoning_effort.as_deref().unwrap_or("none"),
+            message_request.max_tokens
+        ));
         if let Ok(bytes) = serde_json::to_vec(&message_request) {
             benchmark_telemetry::model_request_bytes(bytes.len() as u64);
         }
@@ -9815,6 +9868,9 @@ impl AnthropicRuntimeClient {
             .map_err(|error| {
                 RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
             })?;
+        if let Some(request_id) = stream.request_id() {
+            benchmark_telemetry::provider_request_id(request_id);
+        }
         let mut stdout = io::stdout();
         let mut sink = io::sink();
         let out: &mut dyn Write = if self.emit_output {
@@ -9995,6 +10051,9 @@ impl AnthropicRuntimeClient {
             .map_err(|error| {
                 RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
             })?;
+        if let Some(request_id) = response.request_id.as_deref() {
+            benchmark_telemetry::provider_request_id(request_id);
+        }
         let mut events = response_to_events(response, out)?;
         push_prompt_cache_record(&self.client, &mut events);
         Ok(events)

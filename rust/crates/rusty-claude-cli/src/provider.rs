@@ -44,7 +44,20 @@ fn effective_model() -> String {
     ConfigLoader::default_for(cwd)
         .load()
         .ok()
-        .and_then(|config| config.model().map(ToOwned::to_owned))
+        .and_then(|config| {
+            config.model().map(ToOwned::to_owned).or_else(|| {
+                serde_json::from_str::<Value>(&config.as_json().render())
+                    .ok()
+                    .and_then(|root| {
+                        root.get("modelResources")?
+                            .as_array()?
+                            .first()?
+                            .get("model")?
+                            .as_str()
+                            .map(str::to_owned)
+                    })
+            })
+        })
         .or_else(|| {
             env::var("ANTHROPIC_MODEL")
                 .ok()

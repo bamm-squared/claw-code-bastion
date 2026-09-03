@@ -179,7 +179,8 @@ pub use task_packet::{validate_packet, TaskPacket, TaskPacketValidationError, Va
 #[cfg(test)]
 pub use trust_resolver::{TrustConfig, TrustDecision, TrustEvent, TrustPolicy, TrustResolver};
 pub use usage::{
-    format_usd, pricing_for_model, ModelPricing, TokenUsage, UsageCostEstimate, UsageTracker,
+    format_usd, pricing_for_model, provider_catalog_pricing, resolve_pricing, ModelPricing,
+    PricingResolution, PricingSource, TokenUsage, UsageCostEstimate, UsageTracker,
 };
 pub use validator::{
     detect_validation_plan, PodmanValidatorBackend, ValidatedCandidateInput, ValidationCheck,

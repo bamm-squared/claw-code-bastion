@@ -1,4 +1,5 @@
 use crate::session::Session;
+use std::fmt;
 
 const DEFAULT_INPUT_COST_PER_MILLION: f64 = 15.0;
 const DEFAULT_OUTPUT_COST_PER_MILLION: f64 = 75.0;
@@ -12,6 +13,129 @@ pub struct ModelPricing {
     pub output_cost_per_million: f64,
     pub cache_creation_cost_per_million: f64,
     pub cache_read_cost_per_million: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PricingSource {
+    ExplicitProfile,
+    ProviderCatalog,
+    ImportedProviderCatalog,
+    ReferenceEstimate,
+    Unknown,
+}
+
+impl fmt::Display for PricingSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ExplicitProfile => "explicit-profile",
+            Self::ProviderCatalog => "provider-catalog",
+            Self::ImportedProviderCatalog => "imported-provider-catalog",
+            Self::ReferenceEstimate => "reference-estimate",
+            Self::Unknown => "unknown",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PricingResolution {
+    pub actual: Option<ModelPricing>,
+    pub reference: Option<ModelPricing>,
+    pub source: PricingSource,
+}
+
+/// Resolves cost for an execution resource, never for a model name alone.
+/// `explicit_actual` is the user-authoritative profile price. Reference data
+/// is returned separately and never makes `actual` known.
+#[must_use]
+pub fn resolve_pricing(
+    provider: &str,
+    _endpoint: Option<&str>,
+    model: &str,
+    explicit_actual: Option<ModelPricing>,
+    reference: Option<ModelPricing>,
+) -> PricingResolution {
+    if let Some(actual) = explicit_actual {
+        return PricingResolution {
+            actual: Some(actual),
+            reference,
+            source: PricingSource::ExplicitProfile,
+        };
+    }
+    if let Some(actual) = provider_catalog_pricing(provider, model) {
+        return PricingResolution {
+            actual: Some(actual),
+            reference,
+            source: PricingSource::ProviderCatalog,
+        };
+    }
+    if reference.is_some() {
+        return PricingResolution {
+            actual: None,
+            reference,
+            source: PricingSource::ReferenceEstimate,
+        };
+    }
+    PricingResolution {
+        actual: None,
+        reference: None,
+        source: PricingSource::Unknown,
+    }
+}
+
+#[must_use]
+pub fn provider_catalog_pricing(provider: &str, model: &str) -> Option<ModelPricing> {
+    let provider = provider.trim().to_ascii_lowercase();
+    if provider == "openai" {
+        return openai_catalog_pricing(model);
+    }
+    if provider == "anthropic" {
+        return anthropic_catalog_pricing(model);
+    }
+    None
+}
+
+fn openai_catalog_pricing(model: &str) -> Option<ModelPricing> {
+    let normalized = model.to_ascii_lowercase();
+    let (input, output) = if normalized == "gpt-5.6-luna" {
+        (0.20, 1.20)
+    } else if normalized == "gpt-5.4-mini" {
+        (0.75, 4.50)
+    } else if normalized == "gpt-5.4-nano" {
+        (0.20, 1.25)
+    } else if normalized == "gpt-4o-mini" {
+        (0.15, 0.60)
+    } else {
+        return None;
+    };
+    Some(ModelPricing {
+        input_cost_per_million: input,
+        output_cost_per_million: output,
+        cache_creation_cost_per_million: 0.0,
+        cache_read_cost_per_million: 0.0,
+    })
+}
+
+fn anthropic_catalog_pricing(model: &str) -> Option<ModelPricing> {
+    let normalized = model.to_ascii_lowercase();
+    if normalized.contains("haiku") {
+        Some(ModelPricing {
+            input_cost_per_million: 1.0,
+            output_cost_per_million: 5.0,
+            cache_creation_cost_per_million: 1.25,
+            cache_read_cost_per_million: 0.1,
+        })
+    } else if normalized.contains("opus") {
+        Some(ModelPricing {
+            input_cost_per_million: 15.0,
+            output_cost_per_million: 75.0,
+            cache_creation_cost_per_million: 18.75,
+            cache_read_cost_per_million: 1.5,
+        })
+    } else if normalized.contains("sonnet") {
+        Some(ModelPricing::default_sonnet_tier())
+    } else {
+        None
+    }
 }
 
 impl ModelPricing {
@@ -57,27 +181,14 @@ impl UsageCostEstimate {
 /// Returns pricing metadata for a known model alias or family.
 #[must_use]
 pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
-    let normalized = model.to_ascii_lowercase();
-    if normalized.contains("haiku") {
-        return Some(ModelPricing {
-            input_cost_per_million: 1.0,
-            output_cost_per_million: 5.0,
-            cache_creation_cost_per_million: 1.25,
-            cache_read_cost_per_million: 0.1,
-        });
-    }
-    if normalized.contains("opus") {
-        return Some(ModelPricing {
-            input_cost_per_million: 15.0,
-            output_cost_per_million: 75.0,
-            cache_creation_cost_per_million: 18.75,
-            cache_read_cost_per_million: 1.5,
-        });
-    }
-    if normalized.contains("sonnet") {
-        return Some(ModelPricing::default_sonnet_tier());
-    }
-    None
+    provider_catalog_pricing(
+        if model.to_ascii_lowercase().contains("claude") {
+            "anthropic"
+        } else {
+            "openai"
+        },
+        model,
+    )
 }
 
 impl TokenUsage {
@@ -118,22 +229,26 @@ impl TokenUsage {
     #[must_use]
     pub fn summary_lines_for_model(self, label: &str, model: Option<&str>) -> Vec<String> {
         let pricing = model.and_then(pricing_for_model);
-        let cost = pricing.map_or_else(
-            || self.estimate_cost_usd(),
-            |pricing| self.estimate_cost_usd_with_pricing(pricing),
-        );
         let model_suffix =
             model.map_or_else(String::new, |model_name| format!(" model={model_name}"));
-        let pricing_suffix = if pricing.is_some() {
-            ""
-        } else if model.is_some() {
-            " pricing=estimated-default"
-        } else {
-            ""
+        let Some(pricing) = pricing else {
+            return vec![
+                format!(
+                    "{label}: total_tokens={} input={} output={} cache_write={} cache_read={} estimated_cost=unknown{}",
+                    self.total_tokens(),
+                    self.input_tokens,
+                    self.output_tokens,
+                    self.cache_creation_input_tokens,
+                    self.cache_read_input_tokens,
+                    model_suffix,
+                ),
+                "  cost breakdown: unavailable (actual execution pricing is unknown)".to_string(),
+            ];
         };
+        let cost = self.estimate_cost_usd_with_pricing(pricing);
         vec![
             format!(
-                "{label}: total_tokens={} input={} output={} cache_write={} cache_read={} estimated_cost={}{}{}",
+                "{label}: total_tokens={} input={} output={} cache_write={} cache_read={} estimated_cost={}{}",
                 self.total_tokens(),
                 self.input_tokens,
                 self.output_tokens,
@@ -141,7 +256,6 @@ impl TokenUsage {
                 self.cache_read_input_tokens,
                 format_usd(cost.total_cost_usd()),
                 model_suffix,
-                pricing_suffix,
             ),
             format!(
                 "  cost breakdown: input={} output={} cache_write={} cache_read={}",
@@ -216,7 +330,10 @@ impl UsageTracker {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_usd, pricing_for_model, TokenUsage, UsageTracker};
+    use super::{
+        format_usd, pricing_for_model, resolve_pricing, ModelPricing, PricingSource, TokenUsage,
+        UsageTracker,
+    };
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
     #[test]
@@ -279,7 +396,21 @@ mod tests {
     }
 
     #[test]
-    fn marks_unknown_model_pricing_as_fallback() {
+    fn supports_configured_openai_model_pricing() {
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..TokenUsage::default()
+        };
+        let mini = pricing_for_model("gpt-5.4-mini").expect("mini pricing");
+        let cost = usage.estimate_cost_usd_with_pricing(mini);
+        assert_eq!(format_usd(cost.input_cost_usd), "$0.7500");
+        assert_eq!(format_usd(cost.output_cost_usd), "$4.5000");
+        assert_eq!(format_usd(cost.total_cost_usd()), "$5.2500");
+    }
+
+    #[test]
+    fn marks_unknown_model_pricing_as_unknown() {
         let usage = TokenUsage {
             input_tokens: 100,
             output_tokens: 100,
@@ -287,7 +418,63 @@ mod tests {
             cache_read_input_tokens: 0,
         };
         let lines = usage.summary_lines_for_model("usage", Some("custom-model"));
-        assert!(lines[0].contains("pricing=estimated-default"));
+        assert!(lines[0].contains("estimated_cost=unknown"));
+        assert!(lines[1].contains("pricing is unknown"));
+    }
+
+    #[test]
+    fn explicit_profile_price_beats_provider_catalog() {
+        let explicit = ModelPricing {
+            input_cost_per_million: 0.123,
+            output_cost_per_million: 0.456,
+            cache_creation_cost_per_million: 0.0,
+            cache_read_cost_per_million: 0.0,
+        };
+        let resolution = resolve_pricing("openai", None, "gpt-5.4-mini", Some(explicit), None);
+        assert_eq!(resolution.source, PricingSource::ExplicitProfile);
+        assert_eq!(resolution.actual, Some(explicit));
+    }
+
+    #[test]
+    fn provider_catalog_requires_provider_identity() {
+        let together = ModelPricing {
+            input_cost_per_million: 1.0,
+            output_cost_per_million: 2.0,
+            cache_creation_cost_per_million: 0.0,
+            cache_read_cost_per_million: 0.0,
+        };
+        let fireworks = ModelPricing {
+            input_cost_per_million: 3.0,
+            output_cost_per_million: 4.0,
+            cache_creation_cost_per_million: 0.0,
+            cache_read_cost_per_million: 0.0,
+        };
+        let together_resolution =
+            resolve_pricing("together", None, "model-x", Some(together), None);
+        let fireworks_resolution =
+            resolve_pricing("fireworks", None, "model-x", Some(fireworks), None);
+        assert_ne!(together_resolution.actual, fireworks_resolution.actual);
+    }
+
+    #[test]
+    fn reference_price_is_not_actual_price() {
+        let reference = ModelPricing {
+            input_cost_per_million: 0.5,
+            output_cost_per_million: 1.0,
+            cache_creation_cost_per_million: 0.0,
+            cache_read_cost_per_million: 0.0,
+        };
+        let resolution = resolve_pricing("ollama", None, "qwen", None, Some(reference));
+        assert_eq!(resolution.source, PricingSource::ReferenceEstimate);
+        assert!(resolution.actual.is_none());
+        assert_eq!(resolution.reference, Some(reference));
+    }
+
+    #[test]
+    fn unknown_provider_model_remains_unknown() {
+        let resolution = resolve_pricing("unknown-provider", None, "unknown-model", None, None);
+        assert_eq!(resolution.source, PricingSource::Unknown);
+        assert!(resolution.actual.is_none());
     }
 
     #[test]

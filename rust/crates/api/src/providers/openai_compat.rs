@@ -25,6 +25,26 @@ const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
 const DEFAULT_MAX_RETRIES: u32 = 8;
+static HTTP_ATTEMPT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn provider_trace(message: impl AsRef<str>) {
+    if std::env::var("CLAW_PROVIDER_TRACE").as_deref() == Ok("1") {
+        eprintln!("[provider-trace] {}", message.as_ref());
+    }
+}
+
+fn trace_endpoint(base_url: &str) -> String {
+    let without_query = base_url.split(['?', '#']).next().unwrap_or(base_url);
+    let Some((scheme, rest)) = without_query.split_once("://") else {
+        return without_query.to_string();
+    };
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let authority = rest[..authority_end]
+        .rsplit('@')
+        .next()
+        .unwrap_or(&rest[..authority_end]);
+    format!("{scheme}://{authority}{}", &rest[authority_end..])
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenAiCompatConfig {
@@ -262,9 +282,26 @@ impl OpenAiCompatClient {
 
         let last_error = loop {
             attempts += 1;
+            provider_trace(format!(
+                "http_attempt logical_call={} attempt={} model={} endpoint={}",
+                request.provider_call_id.as_deref().unwrap_or("unassigned"),
+                attempts,
+                request.model,
+                trace_endpoint(&self.base_url)
+            ));
             let retryable_error = match self.send_raw_request(request).await {
                 Ok(response) => match expect_success(response).await {
-                    Ok(response) => return Ok(response),
+                    Ok(response) => {
+                        provider_trace(format!(
+                            "provider_response logical_call={} attempt={} status=2xx request_id={}",
+                            request.provider_call_id.as_deref().unwrap_or("unassigned"),
+                            attempts,
+                            request_id_from_headers(response.headers())
+                                .as_deref()
+                                .unwrap_or("none")
+                        ));
+                        return Ok(response);
+                    }
                     Err(error) if error.is_retryable() && attempts <= self.max_retries + 1 => error,
                     Err(error) => return Err(error),
                 },
@@ -290,14 +327,53 @@ impl OpenAiCompatClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let request_url = chat_completions_endpoint(&self.base_url);
-        self.http
+        let mut payload = build_chat_completion_request(request, self.config());
+        if request.tools.is_some() {
+            if let Some(object) = payload.as_object_mut() {
+                object.remove("reasoning_effort");
+            }
+        }
+        let attempt_id = HTTP_ATTEMPT_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+        provider_trace(format!(
+            "request_ready logical_call={} http_attempt_id={} api=chat_completions path=/chat/completions model={} tools={} tool_count={} reasoning_field={} reasoning={} stream={} max_tokens={} messages={}",
+            request.provider_call_id.as_deref().unwrap_or("unassigned"),
+            attempt_id,
+            request.model,
+            request.tools.is_some(),
+            request.tools.as_ref().map_or(0, Vec::len),
+            payload.get("reasoning_effort").is_some(),
+            request.reasoning_effort.as_deref().unwrap_or("none"),
+            request.stream,
+            payload.get("max_tokens").and_then(Value::as_u64).unwrap_or(0),
+            request.messages.len(),
+        ));
+        let response = self
+            .http
             .post(&request_url)
             .header("content-type", "application/json")
             .bearer_auth(&self.api_key)
-            .json(&build_chat_completion_request(request, self.config()))
+            .json(&payload)
             .send()
             .await
-            .map_err(ApiError::from)
+            .map_err(ApiError::from);
+        match &response {
+            Ok(response) => provider_trace(format!(
+                "http_response logical_call={} http_attempt_id={} status={} request_id={}",
+                request.provider_call_id.as_deref().unwrap_or("unassigned"),
+                attempt_id,
+                response.status().as_u16(),
+                request_id_from_headers(response.headers())
+                    .as_deref()
+                    .unwrap_or("none")
+            )),
+            Err(error) => provider_trace(format!(
+                "http_transport_error logical_call={} http_attempt_id={} error={}",
+                request.provider_call_id.as_deref().unwrap_or("unassigned"),
+                attempt_id,
+                error
+            )),
+        }
+        response
     }
 
     fn backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
@@ -966,9 +1042,15 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
             payload["stop"] = json!(stop);
         }
     }
-    // reasoning_effort for OpenAI-compatible reasoning models (o4-mini, o3, etc.)
+    // The Chat Completions path rejects reasoning_effort when function tools
+    // are present. The Responses API supports that combination, but this
+    // provider path intentionally uses Chat Completions, so omit the optional
+    // tuning field rather than producing a provider-side 400.
+    let function_tools_present = request.tools.is_some();
     if let Some(effort) = &request.reasoning_effort {
-        payload["reasoning_effort"] = json!(effort);
+        if !function_tools_present {
+            payload["reasoning_effort"] = json!(effort);
+        }
     }
 
     payload
@@ -1594,6 +1676,26 @@ mod tests {
     }
 
     #[test]
+    fn gpt5_function_tools_omit_unsupported_reasoning_effort() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "gpt-5.6-luna".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage::user_text("use a tool")],
+                tools: Some(vec![ToolDefinition {
+                    name: "read".to_string(),
+                    description: Some("read a file".to_string()),
+                    input_schema: json!({"type":"object"}),
+                }]),
+                reasoning_effort: Some("medium".to_string()),
+                ..Default::default()
+            },
+            OpenAiCompatConfig::openai(),
+        );
+        assert!(payload.get("reasoning_effort").is_none());
+    }
+
+    #[test]
     fn openai_streaming_requests_include_usage_opt_in() {
         let payload = build_chat_completion_request(
             &MessageRequest {
@@ -1711,6 +1813,7 @@ mod tests {
             presence_penalty: Some(0.3),
             stop: Some(vec!["\n".to_string()]),
             reasoning_effort: None,
+            provider_call_id: None,
         };
         let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
         assert_eq!(payload["temperature"], 0.7);

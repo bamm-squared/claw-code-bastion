@@ -1093,13 +1093,58 @@ fn capable(profile: &ModelProfile, estimate: DifficultyEstimate) -> bool {
         && profile.capability.context_window >= required.context_window
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 fn estimated_cost(profile: &ModelProfile, signals: TaskSignals) -> u64 {
-    if !profile.pricing.actual_cost_known {
+    let Some(pricing) = actual_pricing_for_profile(profile) else {
         return u64::MAX;
-    }
+    };
     let input = u64::from(signals.expected_input_tokens);
     let output = u64::from(signals.expected_output_tokens);
-    input * profile.pricing.actual_input_micros + output * profile.pricing.actual_output_micros
+    ((input as f64 * pricing.input_cost_per_million
+        + output as f64 * pricing.output_cost_per_million)
+        * 1_000.0) as u64
+}
+
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn pricing_resolution_for_profile(profile: &ModelProfile) -> runtime::PricingResolution {
+    let explicit = profile
+        .pricing
+        .actual_cost_known
+        .then_some(runtime::ModelPricing {
+            input_cost_per_million: profile.pricing.actual_input_micros as f64 / 1_000_000.0,
+            output_cost_per_million: profile.pricing.actual_output_micros as f64 / 1_000_000.0,
+            cache_creation_cost_per_million: 0.0,
+            cache_read_cost_per_million: 0.0,
+        });
+    let reference = match (
+        profile.pricing.reference_input_micros,
+        profile.pricing.reference_output_micros,
+    ) {
+        (Some(input), Some(output)) => Some(runtime::ModelPricing {
+            input_cost_per_million: input as f64 / 1_000_000.0,
+            output_cost_per_million: output as f64 / 1_000_000.0,
+            cache_creation_cost_per_million: 0.0,
+            cache_read_cost_per_million: 0.0,
+        }),
+        _ => None,
+    };
+    runtime::resolve_pricing(
+        &profile.provider,
+        profile.endpoint.as_deref(),
+        &profile.model,
+        explicit,
+        reference,
+    )
+}
+
+#[must_use]
+pub fn actual_pricing_for_profile(profile: &ModelProfile) -> Option<runtime::ModelPricing> {
+    pricing_resolution_for_profile(profile).actual
 }
 
 #[cfg(test)]
@@ -1133,6 +1178,51 @@ mod tests {
             user_preference: 0,
             enabled: true,
         }
+    }
+
+    #[test]
+    fn profile_price_is_authoritative_over_provider_catalog() {
+        let mut profile = profile("gpt-5.4-mini", PrivacyClass::Remote, 90, 999);
+        profile.provider = "openai".to_string();
+        let resolution = pricing_resolution_for_profile(&profile);
+        assert_eq!(resolution.source, runtime::PricingSource::ExplicitProfile);
+        assert!((resolution.actual.unwrap().input_cost_per_million - 0.000_999).abs() < 1e-12);
+    }
+
+    #[test]
+    fn unknown_local_profile_has_unknown_actual_cost() {
+        let mut profile = ModelProfile::unknown("qwen-local", "ollama", "qwen");
+        profile.privacy = PrivacyClass::Local;
+        let resolution = pricing_resolution_for_profile(&profile);
+        assert_eq!(resolution.source, runtime::PricingSource::Unknown);
+        assert!(resolution.actual.is_none());
+    }
+
+    #[test]
+    fn reference_price_does_not_become_actual_cost() {
+        let mut profile = ModelProfile::unknown("qwen-reference", "ollama", "qwen");
+        profile.pricing.reference_input_micros = Some(100);
+        profile.pricing.reference_output_micros = Some(200);
+        let resolution = pricing_resolution_for_profile(&profile);
+        assert_eq!(resolution.source, runtime::PricingSource::ReferenceEstimate);
+        assert!(resolution.actual.is_none());
+        assert!(resolution.reference.is_some());
+    }
+
+    #[test]
+    fn provider_identity_prevents_open_model_price_collisions() {
+        let mut together = ModelProfile::unknown("together-qwen", "together", "qwen");
+        together.pricing.actual_cost_known = true;
+        together.pricing.actual_input_micros = 1_000;
+        together.pricing.actual_output_micros = 2_000;
+        let mut fireworks = together.clone();
+        fireworks.id = "fireworks-qwen".to_string();
+        fireworks.provider = "fireworks".to_string();
+        fireworks.pricing.actual_input_micros = 3_000;
+        assert_ne!(
+            actual_pricing_for_profile(&together),
+            actual_pricing_for_profile(&fireworks)
+        );
     }
 
     fn signals() -> TaskSignals {

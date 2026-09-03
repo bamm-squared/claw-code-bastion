@@ -10,6 +10,7 @@ pub struct Snapshot {
     pub schema_version: u32,
     pub run_id: String,
     pub provider_calls: u64,
+    pub provider_request_ids: Vec<String>,
     pub model_turns: u64,
     pub tool_bearing_turns: u64,
     pub tool_calls: BTreeMap<String, u64>,
@@ -101,6 +102,21 @@ fn with_state(f: impl FnOnce(&mut State)) {
 
 pub fn provider_call() {
     with_state(|s| s.snapshot.provider_calls += 1);
+}
+
+pub fn provider_request_id(request_id: &str) {
+    with_state(|s| {
+        if !request_id.is_empty()
+            && !s
+                .snapshot
+                .provider_request_ids
+                .iter()
+                .any(|id| id == request_id)
+            && s.snapshot.provider_request_ids.len() < 64
+        {
+            s.snapshot.provider_request_ids.push(request_id.to_string());
+        }
+    });
 }
 pub fn model_turn() {
     with_state(|s| s.snapshot.model_turns += 1);

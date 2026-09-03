@@ -31,6 +31,9 @@ pub struct MessageRequest {
     /// Silently ignored by backends that do not support it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Host-side diagnostic identity; never serialized to a provider.
+    #[serde(skip)]
+    pub provider_call_id: Option<String>,
 }
 
 impl MessageRequest {
@@ -200,12 +203,9 @@ impl Usage {
     }
 
     #[must_use]
-    pub fn estimated_cost_usd(&self, model: &str) -> UsageCostEstimate {
+    pub fn estimated_cost_usd(&self, model: &str) -> Option<UsageCostEstimate> {
         let usage = self.token_usage();
-        pricing_for_model(model).map_or_else(
-            || usage.estimate_cost_usd(),
-            |pricing| usage.estimate_cost_usd_with_pricing(pricing),
-        )
+        pricing_for_model(model).map(|pricing| usage.estimate_cost_usd_with_pricing(pricing))
     }
 }
 
@@ -308,7 +308,7 @@ mod tests {
         };
 
         let cost = response.usage.estimated_cost_usd(&response.model);
-        assert_eq!(format_usd(cost.total_cost_usd()), "$54.6750");
+        assert_eq!(format_usd(cost.unwrap().total_cost_usd()), "$54.6750");
         assert_eq!(response.total_tokens(), 1_800_000);
     }
 }

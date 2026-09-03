@@ -270,6 +270,10 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 64_000,
             context_window_tokens: 131_072,
         }),
+        "gpt-4o-mini" => Some(ModelTokenLimit {
+            max_output_tokens: 16_384,
+            context_window_tokens: 128_000,
+        }),
         _ => None,
     }
 }
@@ -673,6 +677,11 @@ mod tests {
             }
             other => panic!("expected context-window preflight failure, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn gpt4o_mini_uses_provider_output_limit() {
+        assert_eq!(max_tokens_for_model("gpt-4o-mini"), 16_384);
     }
 
     #[test]
