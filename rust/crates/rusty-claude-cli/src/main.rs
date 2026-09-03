@@ -1772,6 +1772,27 @@ fn resolve_model_alias_with_config(model: &str) -> String {
     resolve_model_alias(trimmed).to_string()
 }
 
+fn explicit_profile_for_model(
+    pool: &model_router::ModelPool,
+    requested: &str,
+) -> Result<Option<model_router::ModelProfile>, Box<dyn std::error::Error>> {
+    let matches = pool
+        .profiles
+        .iter()
+        .filter(|profile| profile.id == requested || profile.model == requested)
+        .cloned()
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [profile] => Ok(Some(profile.clone())),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("model {requested:?} matches multiple execution profiles; select a profile id"),
+        )
+        .into()),
+    }
+}
+
 fn config_alias_for_current_dir(alias: &str) -> Option<String> {
     if alias.is_empty() {
         return None;
@@ -4045,6 +4066,7 @@ struct LiveCli {
     model_pool: model_router::ModelPool,
     calibration: model_router::CalibrationStore,
     routing_policy: model_router::RoutingPolicy,
+    explicit_writer_profile: Option<model_router::ModelProfile>,
     last_routing_explanation: Option<String>,
     selected_writer_profile: Option<model_router::ModelProfile>,
     selected_evaluator_profile: Option<model_router::ModelProfile>,
@@ -4859,6 +4881,7 @@ impl LiveCli {
         let cwd = env::current_dir()?;
         let config = ConfigLoader::default_for(&cwd).load()?;
         let model_pool = model_router::ModelPool::from_runtime_config(&config, &model);
+        let explicit_writer_profile = explicit_profile_for_model(&model_pool, &model)?;
         let calibration_path = (!is_private_mode()).then(calibration_store_path);
         let calibration = if is_private_mode() {
             model_router::CalibrationStore::new()
@@ -4883,7 +4906,7 @@ impl LiveCli {
         } else {
             session_state.with_persistence_path(session.path.clone())
         };
-        let runtime = build_runtime(
+        let runtime = build_runtime_with_backend_profile(
             session_state,
             &session.id,
             model.clone(),
@@ -4893,6 +4916,8 @@ impl LiveCli {
             allowed_tools.clone(),
             permission_mode,
             None,
+            None,
+            explicit_writer_profile.as_ref(),
         )?;
         let cli = Self {
             model,
@@ -4911,6 +4936,7 @@ impl LiveCli {
             model_pool,
             calibration,
             routing_policy,
+            explicit_writer_profile,
             last_routing_explanation: None,
             selected_writer_profile: None,
             selected_evaluator_profile: None,
@@ -4934,11 +4960,25 @@ impl LiveCli {
     }
 
     fn route_writer_for_current_task(&mut self) {
-        if self.routing_policy.disable_automatic {
+        if self.routing_policy.disable_automatic
+            && self.explicit_writer_profile.is_none()
+            && !self.escalation_requested
+        {
             self.last_routing_explanation =
                 Some("Automatic routing disabled by user policy.".to_string());
             return;
         }
+        let routing_policy = if self.escalation_requested {
+            self.routing_policy.clone()
+        } else {
+            self.explicit_writer_profile.as_ref().map_or_else(
+                || self.routing_policy.clone(),
+                |profile| model_router::RoutingPolicy {
+                    forced_profile: Some(profile.id.clone()),
+                    ..self.routing_policy.clone()
+                },
+            )
+        };
         let signals = routing_signals(&self.task_plan);
         let decision = if self.escalation_requested {
             let current_id = self.selected_writer_profile.as_ref().map(|p| p.id.as_str());
@@ -4956,7 +4996,7 @@ impl LiveCli {
                 &self.calibration,
                 model_router::ModelRole::Writer,
                 signals,
-                self.routing_policy.clone(),
+                routing_policy,
             )
         } else {
             model_router::ModelRouter::route_with_calibration(
@@ -4964,7 +5004,7 @@ impl LiveCli {
                 &self.calibration,
                 model_router::ModelRole::Writer,
                 signals,
-                &self.routing_policy,
+                &routing_policy,
             )
         };
         self.last_routing_explanation = Some(decision.reason.clone());
@@ -11456,6 +11496,8 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 
 #[cfg(test)]
 mod tests {
+    use super::{explicit_profile_for_model, model_router};
+
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         classify_error_kind, collect_session_prompt_history, create_managed_session_handle,
@@ -13466,6 +13508,31 @@ mod tests {
         let resolved = resolve_repl_model(user_model);
 
         assert_eq!(resolved, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn explicit_model_binds_one_matching_execution_profile() {
+        let profile = model_router::ModelProfile::unknown("mini-profile", "openai", "gpt-mini");
+        let pool = model_router::ModelPool::one(profile.clone());
+
+        let selected = explicit_profile_for_model(&pool, "gpt-mini")
+            .expect("unique model match should resolve")
+            .expect("matching profile should be selected");
+        assert_eq!(selected.id, profile.id);
+    }
+
+    #[test]
+    fn explicit_model_rejects_ambiguous_execution_profiles() {
+        let first = model_router::ModelProfile::unknown("provider-a", "provider-a", "shared-model");
+        let second =
+            model_router::ModelProfile::unknown("provider-b", "provider-b", "shared-model");
+        let pool = model_router::ModelPool {
+            profiles: vec![first, second],
+        };
+
+        let error = explicit_profile_for_model(&pool, "shared-model")
+            .expect_err("ambiguous model must fail explicitly");
+        assert!(error.to_string().contains("multiple execution profiles"));
     }
 
     #[test]
