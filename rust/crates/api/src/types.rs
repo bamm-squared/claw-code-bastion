@@ -2,6 +2,44 @@ use runtime::{pricing_for_model, TokenUsage, UsageCostEstimate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Protocol and feature capabilities declared by an execution endpoint.
+/// Provider defaults may be used when this is absent, but an explicit profile
+/// declaration is authoritative for custom endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)]
+pub struct EndpointCapabilities {
+    #[serde(default = "default_true")]
+    pub chat_completions: bool,
+    #[serde(default)]
+    pub responses: bool,
+    #[serde(default = "default_true")]
+    pub function_tools: bool,
+    #[serde(default)]
+    pub reasoning: bool,
+    #[serde(default = "default_true")]
+    pub streaming: bool,
+    #[serde(default = "default_true")]
+    pub typed_images: bool,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+impl Default for EndpointCapabilities {
+    fn default() -> Self {
+        Self {
+            chat_completions: true,
+            responses: false,
+            function_tools: true,
+            reasoning: false,
+            streaming: true,
+            typed_images: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct MessageRequest {
     pub model: String,

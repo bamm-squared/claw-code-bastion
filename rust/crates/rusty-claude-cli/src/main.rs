@@ -1390,7 +1390,7 @@ fn execute_calibration_case(
     let result = (|| -> Result<bool, String> {
         let resolved_model = api::resolve_model_alias(&profile.model);
         enforce_private_provider(&resolved_model).map_err(|error| error.to_string())?;
-        let client = ApiProviderClient::from_model_with_profile(
+        let client = ApiProviderClient::from_model_with_profile_and_capabilities(
             &resolved_model,
             Some(&profile.provider),
             (profile.provider.eq_ignore_ascii_case("anthropic"))
@@ -1398,6 +1398,7 @@ fn execute_calibration_case(
                 .transpose()
                 .map_err(|error| error.to_string())?,
             profile.endpoint.as_deref(),
+            profile.protocol_capabilities,
         )
         .map_err(|error| error.to_string())?;
         let system = match case.role {
@@ -9389,6 +9390,7 @@ fn build_runtime_with_plugin_state_profile(
             progress_reporter,
             profile.map(|value| value.provider.as_str()),
             profile.and_then(|value| value.endpoint.as_deref()),
+            profile.and_then(|value| value.protocol_capabilities),
         )?,
         CliToolExecutor::new(
             allowed_tools.clone(),
@@ -9540,6 +9542,7 @@ impl AnthropicRuntimeClient {
         progress_reporter: Option<InternalPromptProgressReporter>,
         provider: Option<&str>,
         endpoint: Option<&str>,
+        protocol_capabilities: Option<api::EndpointCapabilities>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Dispatch to the correct provider at construction time.
         // `ApiProviderClient` (exposed by the api crate as
@@ -9601,11 +9604,12 @@ impl AnthropicRuntimeClient {
                 // OpenRouter, xAI, DashScope, Ollama, and any other
                 // OpenAI-compat endpoint users configure via
                 // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
-                let client = ApiProviderClient::from_model_with_profile(
+                let client = ApiProviderClient::from_model_with_profile_and_capabilities(
                     &resolved_model,
                     provider,
                     None,
                     endpoint,
+                    protocol_capabilities,
                 )?;
                 provider_trace(format!(
                     "provider_selected kind={:?} model={} effective_endpoint={} api_client={}",
@@ -9654,7 +9658,7 @@ fn execute_evaluator_profile(
 ) -> Result<String, String> {
     let resolved_model = api::resolve_model_alias(&profile.model);
     enforce_private_provider(&resolved_model).map_err(|error| error.to_string())?;
-    let client = ApiProviderClient::from_model_with_profile(
+    let client = ApiProviderClient::from_model_with_profile_and_capabilities(
         &resolved_model,
         Some(&profile.provider),
         (profile.provider.eq_ignore_ascii_case("anthropic"))
@@ -9662,6 +9666,7 @@ fn execute_evaluator_profile(
             .transpose()
             .map_err(|error| error.to_string())?,
         profile.endpoint.as_deref(),
+        profile.protocol_capabilities,
     )
     .map_err(|error| error.to_string())?;
     let request_text = requirement_evaluator::RequirementEvaluator::render_request(request);
@@ -9710,7 +9715,7 @@ fn execute_explorer_profile(
 ) -> Result<Vec<exploration::ExplorerFinding>, String> {
     let resolved_model = api::resolve_model_alias(&profile.model);
     enforce_private_provider(&resolved_model).map_err(|error| error.to_string())?;
-    let client = ApiProviderClient::from_model_with_profile(
+    let client = ApiProviderClient::from_model_with_profile_and_capabilities(
         &resolved_model,
         Some(&profile.provider),
         (profile.provider.eq_ignore_ascii_case("anthropic"))
@@ -9718,6 +9723,7 @@ fn execute_explorer_profile(
             .transpose()
             .map_err(|error| error.to_string())?,
         profile.endpoint.as_deref(),
+        profile.protocol_capabilities,
     )
     .map_err(|error| error.to_string())?;
     let request_text = format!(

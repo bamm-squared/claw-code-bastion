@@ -2,8 +2,9 @@ use crate::error::ApiError;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use crate::providers::anthropic::{self, AnthropicClient, AuthSource};
 use crate::providers::openai_compat::{self, OpenAiCompatClient, OpenAiCompatConfig};
+use crate::providers::responses::ResponsesClient;
 use crate::providers::{self, ProviderKind};
-use crate::types::{MessageRequest, MessageResponse, StreamEvent};
+use crate::types::{EndpointCapabilities, MessageRequest, MessageResponse, StreamEvent};
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
@@ -11,6 +12,7 @@ pub enum ProviderClient {
     Anthropic(AnthropicClient),
     Xai(OpenAiCompatClient),
     OpenAi(OpenAiCompatClient),
+    OpenAiResponses(ResponsesClient),
 }
 
 impl ProviderClient {
@@ -30,6 +32,22 @@ impl ProviderClient {
         provider_hint: Option<&str>,
         anthropic_auth: Option<AuthSource>,
         endpoint: Option<&str>,
+    ) -> Result<Self, ApiError> {
+        Self::from_model_with_profile_and_capabilities(
+            model,
+            provider_hint,
+            anthropic_auth,
+            endpoint,
+            None,
+        )
+    }
+
+    pub fn from_model_with_profile_and_capabilities(
+        model: &str,
+        provider_hint: Option<&str>,
+        anthropic_auth: Option<AuthSource>,
+        endpoint: Option<&str>,
+        capabilities: Option<EndpointCapabilities>,
     ) -> Result<Self, ApiError> {
         let resolved_model = providers::resolve_model_alias(model);
         let provider = provider_hint.map(str::to_ascii_lowercase);
@@ -63,6 +81,13 @@ impl ProviderClient {
                     || (std::env::var_os("OLLAMA_HOST").is_some()
                         && providers::metadata_for_model(&resolved_model).is_none())
                 {
+                    let capabilities = capabilities.unwrap_or_default();
+                    if capabilities.responses {
+                        let client = ResponsesClient::new("ollama", OpenAiCompatConfig::ollama());
+                        return Ok(Self::OpenAiResponses(
+                            endpoint.map_or(client.clone(), |url| client.with_base_url(url)),
+                        ));
+                    }
                     let client = OpenAiCompatClient::from_ollama_env();
                     return Ok(Self::OpenAi(
                         endpoint.map_or(client.clone(), |url| client.with_base_url(url)),
@@ -75,9 +100,37 @@ impl ProviderClient {
                     _ => OpenAiCompatConfig::openai(),
                 };
                 let client = OpenAiCompatClient::from_env(config)?;
-                Ok(Self::OpenAi(
-                    endpoint.map_or(client.clone(), |url| client.with_base_url(url)),
-                ))
+                let client = endpoint.map_or(client.clone(), |url| client.with_base_url(url));
+                let capabilities = capabilities.unwrap_or_else(|| {
+                    if provider.as_deref() == Some("openai") && endpoint.is_none() {
+                        EndpointCapabilities {
+                            responses: true,
+                            reasoning: true,
+                            ..EndpointCapabilities::default()
+                        }
+                    } else {
+                        EndpointCapabilities::default()
+                    }
+                });
+                if !capabilities.chat_completions && !capabilities.responses {
+                    return Err(ApiError::Api {
+                        status: reqwest::StatusCode::BAD_REQUEST,
+                        error_type: Some("incompatible_endpoint".to_string()),
+                        message: Some(
+                            "configured endpoint declares no supported protocol".to_string(),
+                        ),
+                        request_id: None,
+                        body: String::new(),
+                        retryable: false,
+                    });
+                }
+                if capabilities.responses {
+                    let responses = ResponsesClient::from_env(config)?;
+                    let responses =
+                        endpoint.map_or(responses.clone(), |url| responses.with_base_url(url));
+                    return Ok(Self::OpenAiResponses(responses));
+                }
+                Ok(Self::OpenAi(client))
             }
         }
     }
@@ -87,7 +140,7 @@ impl ProviderClient {
         match self {
             Self::Anthropic(_) => ProviderKind::Anthropic,
             Self::Xai(_) => ProviderKind::Xai,
-            Self::OpenAi(_) => ProviderKind::OpenAi,
+            Self::OpenAi(_) | Self::OpenAiResponses(_) => ProviderKind::OpenAi,
         }
     }
 
@@ -103,7 +156,7 @@ impl ProviderClient {
     pub fn prompt_cache_stats(&self) -> Option<PromptCacheStats> {
         match self {
             Self::Anthropic(client) => client.prompt_cache_stats(),
-            Self::Xai(_) | Self::OpenAi(_) => None,
+            Self::Xai(_) | Self::OpenAi(_) | Self::OpenAiResponses(_) => None,
         }
     }
 
@@ -111,7 +164,7 @@ impl ProviderClient {
     pub fn take_last_prompt_cache_record(&self) -> Option<PromptCacheRecord> {
         match self {
             Self::Anthropic(client) => client.take_last_prompt_cache_record(),
-            Self::Xai(_) | Self::OpenAi(_) => None,
+            Self::Xai(_) | Self::OpenAi(_) | Self::OpenAiResponses(_) => None,
         }
     }
 
@@ -122,6 +175,7 @@ impl ProviderClient {
         match self {
             Self::Anthropic(client) => client.send_message(request).await,
             Self::Xai(client) | Self::OpenAi(client) => client.send_message(request).await,
+            Self::OpenAiResponses(client) => client.send_message(request).await,
         }
     }
 
@@ -138,6 +192,10 @@ impl ProviderClient {
                 .stream_message(request)
                 .await
                 .map(MessageStream::OpenAiCompat),
+            Self::OpenAiResponses(client) => client
+                .stream_message(request)
+                .await
+                .map(MessageStream::Responses),
         }
     }
 }
@@ -146,6 +204,7 @@ impl ProviderClient {
 pub enum MessageStream {
     Anthropic(anthropic::MessageStream),
     OpenAiCompat(openai_compat::MessageStream),
+    Responses(crate::providers::responses::ResponsesStream),
 }
 
 impl MessageStream {
@@ -154,6 +213,7 @@ impl MessageStream {
         match self {
             Self::Anthropic(stream) => stream.request_id(),
             Self::OpenAiCompat(stream) => stream.request_id(),
+            Self::Responses(stream) => stream.request_id(),
         }
     }
 
@@ -161,6 +221,7 @@ impl MessageStream {
         match self {
             Self::Anthropic(stream) => stream.next_event().await,
             Self::OpenAiCompat(stream) => stream.next_event().await,
+            Self::Responses(stream) => stream.next_event().await,
         }
     }
 }
@@ -184,6 +245,7 @@ mod tests {
 
     use super::ProviderClient;
     use crate::providers::{detect_provider_kind, resolve_model_alias, ProviderKind};
+    use crate::EndpointCapabilities;
 
     /// Serializes every test in this module that mutates process-wide
     /// environment variables so concurrent test threads cannot observe
@@ -285,5 +347,25 @@ mod tests {
             }
             other => panic!("expected OpenAI-compatible Ollama client, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn explicit_responses_capability_selects_responses_transport() {
+        let _lock = env_lock();
+        let _openai = EnvVarGuard::set("OPENAI_API_KEY", Some("test-openai-key"));
+        let capabilities = EndpointCapabilities {
+            responses: true,
+            reasoning: true,
+            ..EndpointCapabilities::default()
+        };
+        let client = ProviderClient::from_model_with_profile_and_capabilities(
+            "custom-model",
+            Some("openai"),
+            None,
+            Some("http://127.0.0.1:1/v1"),
+            Some(capabilities),
+        )
+        .expect("configured responses endpoint should construct");
+        assert!(matches!(client, ProviderClient::OpenAiResponses(_)));
     }
 }

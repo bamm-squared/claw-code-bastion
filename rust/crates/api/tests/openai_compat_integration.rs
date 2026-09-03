@@ -6,9 +6,9 @@ use std::sync::{Mutex as StdMutex, OnceLock};
 
 use api::{
     ApiError, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,
-    ContentBlockStopEvent, InputContentBlock, InputMessage, MessageDeltaEvent, MessageRequest,
-    OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock, ProviderClient, StreamEvent,
-    ToolChoice, ToolDefinition,
+    ContentBlockStopEvent, EndpointCapabilities, InputContentBlock, InputMessage,
+    MessageDeltaEvent, MessageRequest, OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock,
+    ProviderClient, ResponsesClient, StreamEvent, ToolChoice, ToolDefinition,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -65,6 +65,67 @@ async fn send_message_uses_openai_compatible_endpoint_and_auth() {
     assert_eq!(body["model"], json!("grok-3"));
     assert_eq!(body["messages"][0]["role"], json!("system"));
     assert_eq!(body["tools"][0]["type"], json!("function"));
+}
+
+#[tokio::test]
+async fn responses_transport_normalizes_tool_stream_and_uses_responses_endpoint() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = concat!(
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"item_1\",\"call_id\":\"call_1\",\"name\":\"read_file\",\"arguments\":\"\"}}\n\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"item_1\",\"delta\":\"{\\\"path\\\":\\\"x\\\"}\"}\n\n",
+        "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"item_1\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"custom-model\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n"
+    );
+    let Some(server) = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "text/event-stream", sse)],
+    )
+    .await
+    else {
+        return;
+    };
+
+    let client = ResponsesClient::new("responses-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let mut stream = client
+        .stream_message(&sample_request(true))
+        .await
+        .expect("responses request should succeed");
+    let mut events = Vec::new();
+    while let Some(event) = stream.next_event().await.expect("event should parse") {
+        events.push(event);
+    }
+    assert!(events.iter().any(|event| matches!(
+        event,
+        StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+            content_block: OutputContentBlock::ToolUse { id, name, .. },
+            ..
+        }) if id == "call_1" && name == "read_file"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        StreamEvent::MessageDelta(MessageDeltaEvent { usage, .. })
+            if usage.input_tokens == 3 && usage.output_tokens == 2
+    )));
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("server should capture request");
+    assert_eq!(request.path, "/responses");
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["model"], "grok-3");
+    assert_eq!(body["tools"][0]["type"], "function");
+    assert_eq!(body["max_output_tokens"], 64);
+}
+
+#[test]
+fn explicit_profile_capabilities_are_protocol_not_provider_identity() {
+    let capabilities = EndpointCapabilities {
+        chat_completions: false,
+        responses: true,
+        ..EndpointCapabilities::default()
+    };
+    assert!(capabilities.responses);
+    assert!(!capabilities.chat_completions);
 }
 
 #[tokio::test]

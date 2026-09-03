@@ -20,6 +20,7 @@ pub use prompt_cache::{
 };
 pub use providers::anthropic::{AnthropicClient, AnthropicClient as ApiClient, AuthSource};
 pub use providers::openai_compat::{read_ollama_base_url, OpenAiCompatClient, OpenAiCompatConfig};
+pub use providers::responses::{ResponsesClient, ResponsesStream};
 pub use providers::{
     detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,
     resolve_model_alias, ProviderKind,
@@ -27,9 +28,9 @@ pub use providers::{
 pub use sse::{parse_frame, SseParser};
 pub use types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
-    InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
-    MessageResponse, MessageStartEvent, MessageStopEvent, OutputContentBlock, StreamEvent,
-    ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
+    EndpointCapabilities, InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent,
+    MessageRequest, MessageResponse, MessageStartEvent, MessageStopEvent, OutputContentBlock,
+    StreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
 
 pub use telemetry::{

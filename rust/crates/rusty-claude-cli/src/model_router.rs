@@ -63,6 +63,8 @@ pub struct ModelProfile {
     pub provider: String,
     pub model: String,
     pub endpoint: Option<String>,
+    #[serde(default)]
+    pub protocol_capabilities: Option<api::EndpointCapabilities>,
     pub reasoning_profile: Option<String>,
     pub privacy: PrivacyClass,
     pub capability: Capability,
@@ -85,6 +87,7 @@ impl ModelProfile {
             provider: provider.into(),
             model: model.into(),
             endpoint: None,
+            protocol_capabilities: None,
             reasoning_profile: None,
             privacy: PrivacyClass::Remote,
             capability: Capability {
@@ -110,6 +113,7 @@ impl ModelProfile {
             provider: "configured".to_string(),
             model,
             endpoint: None,
+            protocol_capabilities: None,
             reasoning_profile: None,
             privacy: if local {
                 PrivacyClass::Local
@@ -997,6 +1001,9 @@ fn parse_profile(value: &Value) -> Option<ModelProfile> {
             .get("endpoint")
             .and_then(Value::as_str)
             .map(str::to_string),
+        protocol_capabilities: object
+            .get("protocolCapabilities")
+            .and_then(|value| serde_json::from_value(value.clone()).ok()),
         reasoning_profile: object
             .get("reasoningProfile")
             .and_then(Value::as_str)
@@ -1160,6 +1167,7 @@ mod tests {
             provider: "test".to_string(),
             model: id.to_string(),
             endpoint: None,
+            protocol_capabilities: None,
             reasoning_profile: Some("default".to_string()),
             privacy,
             capability: Capability {
