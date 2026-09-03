@@ -160,19 +160,33 @@ impl ModelPool {
     pub fn from_runtime_config(config: &runtime::RuntimeConfig, legacy_model: &str) -> Self {
         let json = config.as_json().render();
         let value = serde_json::from_str::<Value>(&json).ok();
-        let profiles = value
+        let configured_resources = value
             .as_ref()
             .and_then(|root| root.get("modelResources"))
-            .and_then(Value::as_array)
+            .and_then(Value::as_array);
+        let has_configured_resources = configured_resources.is_some();
+        let profiles = configured_resources
             .into_iter()
             .flatten()
             .filter_map(parse_profile)
             .collect::<Vec<_>>();
-        if profiles.is_empty() {
+        if profiles.is_empty() && !has_configured_resources {
             Self::one(ModelProfile::legacy(legacy_model))
         } else {
             Self { profiles }
         }
+    }
+
+    /// Returns whether modern resource configuration is present, even when
+    /// one or more entries are malformed. A present pool must not silently
+    /// become the legacy built-in profile.
+    #[must_use]
+    pub fn has_configured_resources(config: &runtime::RuntimeConfig) -> bool {
+        serde_json::from_str::<Value>(&config.as_json().render())
+            .ok()
+            .and_then(|root| root.get("modelResources").cloned())
+            .and_then(|value| value.as_array().map(|resources| !resources.is_empty()))
+            .unwrap_or(false)
     }
 
     /// Returns a pool whose capabilities include only the supplied evidence.
@@ -1200,6 +1214,7 @@ pub fn actual_pricing_for_profile(profile: &ModelProfile) -> Option<runtime::Mod
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn profile(id: &str, privacy: PrivacyClass, capability: u8, cost: u64) -> ModelProfile {
         ModelProfile {
@@ -1257,6 +1272,32 @@ mod tests {
         }
         .estimate_cost_usd_with_pricing(pricing);
         assert!((one_thousand_input.input_cost_usd - 0.00075).abs() < 1e-12);
+    }
+
+    #[test]
+    fn modern_pool_without_legacy_model_does_not_create_legacy_profile() {
+        let root = std::env::temp_dir().join(format!("claw-modern-pool-{}", std::process::id()));
+        let workspace = root.join("workspace");
+        let config_home = root.join("config-home");
+        fs::create_dir_all(workspace.join(".claw")).unwrap();
+        fs::create_dir_all(&config_home).unwrap();
+        fs::write(
+            workspace.join(".claw/settings.json"),
+            r#"{"modelResources":[{"id":"qwen-local","provider":"local","model":"qwen-x","privacy":"local","enabled":true}]}"#,
+        )
+        .unwrap();
+
+        let config = runtime::ConfigLoader::new(&workspace, &config_home)
+            .with_project_trust(true)
+            .load()
+            .unwrap();
+        let pool = ModelPool::from_runtime_config(&config, "claude-opus-4-6");
+
+        assert!(ModelPool::has_configured_resources(&config));
+        assert_eq!(pool.profiles.len(), 1);
+        assert_eq!(pool.profiles[0].id, "qwen-local");
+        assert_ne!(pool.profiles[0].id, "legacy-default");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -1892,7 +1892,14 @@ fn resolve_repl_model(cli_model: String) -> String {
         return resolve_model_alias_with_config(&env_model);
     }
     if let Some(config_model) = config_model_for_current_dir() {
-        return resolve_model_alias_with_config(&config_model);
+        if let Some(config) = env::current_dir()
+            .ok()
+            .and_then(|cwd| ConfigLoader::default_for(cwd).load().ok())
+        {
+            if !model_router::ModelPool::has_configured_resources(&config) {
+                return resolve_model_alias_with_config(&config_model);
+            }
+        }
     }
     cli_model
 }
@@ -4875,6 +4882,7 @@ impl HookAbortMonitor {
 }
 
 impl LiveCli {
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
     fn new(
         model: String,
         enable_tools: bool,
@@ -4901,6 +4909,36 @@ impl LiveCli {
             routing_policy.local_only = true;
             routing_policy.allow_remote = false;
         }
+        // A modern resource pool is authoritative when no explicit model was
+        // supplied. Select a policy-eligible bootstrap resource before any
+        // provider client is constructed; never let the legacy default model
+        // stand in for a configured pool.
+        let bootstrap_profile = if explicit_writer_profile.is_none()
+            && model == DEFAULT_MODEL
+            && model_router::ModelPool::has_configured_resources(&config)
+        {
+            let decision = model_router::ModelRouter::route_with_calibration(
+                &model_pool,
+                &calibration,
+                model_router::ModelRole::Other,
+                model_router::TaskSignals::default(),
+                &routing_policy,
+            );
+            Some(decision.selected.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "modern modelResources pool has no eligible bootstrap profile: {}",
+                        decision.reason
+                    ),
+                )
+            })?)
+        } else {
+            None
+        };
+        let effective_model = bootstrap_profile
+            .as_ref()
+            .map_or_else(|| model.clone(), |profile| profile.model.clone());
         let session_state = new_cli_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
         let checkpoint_store =
@@ -4910,13 +4948,16 @@ impl LiveCli {
         } else {
             session_state.with_persistence_path(session.path.clone())
         };
-        if let Some(profile) = explicit_writer_profile.as_ref() {
+        if let Some(profile) = bootstrap_profile
+            .as_ref()
+            .or(explicit_writer_profile.as_ref())
+        {
             set_provider_telemetry_context("startup", profile);
         }
         let runtime = build_runtime_with_backend_profile(
             session_state,
             &session.id,
-            model.clone(),
+            effective_model.clone(),
             system_prompt.clone(),
             enable_tools,
             true,
@@ -4927,7 +4968,7 @@ impl LiveCli {
             explicit_writer_profile.as_ref(),
         )?;
         let cli = Self {
-            model,
+            model: effective_model,
             allowed_tools,
             permission_mode,
             system_prompt,

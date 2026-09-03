@@ -219,6 +219,10 @@ pub struct BenchmarkRecord {
     pub category: String,
     pub language: String,
     pub model_alias: String,
+    #[serde(default)]
+    pub requested_profile: Option<String>,
+    #[serde(default)]
+    pub executed_profile: Option<String>,
     pub provider: String,
     pub model: String,
     pub reasoning: String,
@@ -520,6 +524,7 @@ pub fn run_production(
                 Err(error) => records.push(production_failure_record(
                     task,
                     &profile,
+                    model_alias,
                     repetition,
                     &runtime_image,
                     &validator_image,
@@ -721,6 +726,9 @@ fn run_production_one(
     let production_telemetry = fs::read_to_string(&telemetry)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let executed_profile = production_telemetry
+        .as_ref()
+        .and_then(first_telemetry_profile);
     let candidate = candidate_metrics(&root, task);
     Ok(BenchmarkRecord {
         benchmark_schema_version: BENCHMARK_SCHEMA_VERSION,
@@ -728,10 +736,18 @@ fn run_production_one(
         task_id: task.id.clone(),
         category: task.category.clone(),
         language: task.language.clone(),
-        model_alias: profile.alias.clone(),
-        provider: profile.provider_profile.clone(),
-        model: profile.model.clone(),
-        reasoning: profile.reasoning.clone(),
+        model_alias: executed_profile
+            .clone()
+            .or_else(|| model_alias.map(str::to_string))
+            .unwrap_or_else(|| "routed".to_string()),
+        requested_profile: model_alias.map(str::to_string),
+        executed_profile,
+        provider: model_alias.map_or_else(
+            || "routed".to_string(),
+            |_| profile.provider_profile.clone(),
+        ),
+        model: model_alias.map_or_else(|| "routed".to_string(), |_| profile.model.clone()),
+        reasoning: model_alias.map_or_else(|| "routed".to_string(), |_| profile.reasoning.clone()),
         repetition,
         started_at_ms: started_at,
         finished_at_ms: epoch_ms(),
@@ -768,6 +784,7 @@ fn run_production_one(
 fn production_failure_record(
     task: &BenchmarkTask,
     profile: &ModelProfile,
+    requested_profile: Option<&str>,
     repetition: u32,
     runtime_image: &str,
     validator_image: &str,
@@ -785,10 +802,17 @@ fn production_failure_record(
         task_id: task.id.clone(),
         category: task.category.clone(),
         language: task.language.clone(),
-        model_alias: profile.alias.clone(),
-        provider: profile.provider_profile.clone(),
-        model: profile.model.clone(),
-        reasoning: profile.reasoning.clone(),
+        model_alias: requested_profile.unwrap_or("routed").to_string(),
+        requested_profile: requested_profile.map(str::to_string),
+        executed_profile: None,
+        provider: requested_profile.map_or_else(
+            || "unselected".to_string(),
+            |_| profile.provider_profile.clone(),
+        ),
+        model: requested_profile
+            .map_or_else(|| "unselected".to_string(), |_| profile.model.clone()),
+        reasoning: requested_profile
+            .map_or_else(|| "unselected".to_string(), |_| profile.reasoning.clone()),
         repetition,
         started_at_ms: epoch_ms(),
         finished_at_ms: epoch_ms(),
@@ -822,6 +846,21 @@ fn with_partial_telemetry(message: &str, path: &Path) -> String {
         return message.to_string();
     };
     format!("{message}{PARTIAL_TELEMETRY_MARKER}{value}")
+}
+
+fn first_telemetry_profile(telemetry: &Value) -> Option<String> {
+    telemetry
+        .get("provider_call_records")
+        .and_then(Value::as_array)
+        .and_then(|records| {
+            records.iter().find_map(|record| {
+                record
+                    .get("profile")
+                    .and_then(Value::as_str)
+                    .filter(|profile| !profile.is_empty())
+                    .map(str::to_string)
+            })
+        })
 }
 
 fn split_partial_telemetry(error: &str) -> (String, Option<Value>) {
@@ -947,6 +986,8 @@ fn run_one(
         category: task.category.clone(),
         language: task.language.clone(),
         model_alias: profile.alias.clone(),
+        requested_profile: Some(profile.alias.clone()),
+        executed_profile: Some(profile.alias.clone()),
         provider: profile.provider_profile.clone(),
         model: profile.model.clone(),
         reasoning: profile.reasoning.clone(),
@@ -1364,6 +1405,18 @@ mod tests {
         assert_eq!(settings["modelResources"][0]["id"], "profile-b");
         assert_eq!(settings["modelResources"][0]["endpoint"], "http://b");
         assert_eq!(settings["routing"]["allowRemote"], true);
+    }
+
+    #[test]
+    fn routed_attribution_does_not_claim_the_authorization_seed_executed() {
+        let telemetry = json!({
+            "provider_call_records": [{"profile": "gpt-5.4-mini"}]
+        });
+        assert_eq!(
+            first_telemetry_profile(&telemetry).as_deref(),
+            Some("gpt-5.4-mini")
+        );
+        assert_eq!(first_telemetry_profile(&json!({})), None);
     }
 
     #[test]
