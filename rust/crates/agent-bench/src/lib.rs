@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as FmtWrite;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -458,6 +458,7 @@ pub fn run_production(
     task_timeout: Option<u64>,
     exploration_timeout: Option<u64>,
     dry_run: bool,
+    interactive: bool,
 ) -> Result<Vec<BenchmarkRecord>, String> {
     let profile = select_production_profile(config, model_alias)?.clone();
     let binary = binary
@@ -525,6 +526,7 @@ pub fn run_production(
                 &settings,
                 task_timeout,
                 exploration_timeout,
+                interactive,
             ) {
                 Ok(record) => records.push(record),
                 Err(error) => records.push(production_failure_record(
@@ -600,6 +602,7 @@ fn run_production_one(
     settings: &Value,
     task_timeout: Option<u64>,
     exploration_timeout: Option<u64>,
+    interactive: bool,
 ) -> Result<BenchmarkRecord, String> {
     let started_at = epoch_ms();
     let wall = Instant::now();
@@ -650,16 +653,28 @@ fn run_production_one(
     if model_alias.is_some_and(|alias| alias != "local-mock") {
         cli_args.splice(0..0, ["--model", &profile.model]);
     }
-    #[cfg(unix)]
-    let mut command = {
-        // `setsid` makes the CLI the process-group leader; descendants such
-        // as Podman workers can then be terminated as one acceptance job.
-        let mut command = Command::new("setsid");
-        command.arg(binary);
-        command
+    let mut command = if interactive {
+        Command::new("script")
+    } else {
+        #[cfg(unix)]
+        {
+            // `setsid` makes the CLI the process-group leader; descendants such
+            // as Podman workers can then be terminated as one acceptance job.
+            let mut command = Command::new("setsid");
+            command.arg(binary);
+            command
+        }
+        #[cfg(not(unix))]
+        Command::new(binary)
     };
-    #[cfg(not(unix))]
-    let mut command = Command::new(binary);
+    if interactive {
+        let command_line = std::iter::once(binary.to_string_lossy().into_owned())
+            .chain(cli_args.iter().map(|arg| (*arg).to_string()))
+            .map(|arg| shell_quote(&arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        command.args(["-qefc", &command_line, "/dev/null"]);
+    }
     let effective_task_timeout = task_timeout.unwrap_or(task.timeout_seconds);
     let effective_exploration_timeout =
         exploration_timeout.unwrap_or_else(|| (effective_task_timeout / 3).max(1));
@@ -687,13 +702,28 @@ fn run_production_one(
                 .saturating_mul(1_000)
                 .to_string(),
         )
-        .stdin(Stdio::null())
+        .stdin(if interactive {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("production CLI failed to start: {error}"))?;
+    let mut interactive_input = child.stdin.take();
+    let mut apply_sent = false;
     let deadline = Instant::now() + Duration::from_secs(effective_task_timeout);
     let output = loop {
+        if interactive && !apply_sent && telemetry_has_event(&telemetry, "review_ready") {
+            if let Some(input) = interactive_input.as_mut() {
+                input
+                    .write_all(b"a\n")
+                    .and_then(|()| input.flush())
+                    .map_err(|error| format!("failed to send Review Apply decision: {error}"))?;
+                apply_sent = true;
+            }
+        }
         if let Some(status) = child
             .try_wait()
             .map_err(|error| format!("production CLI wait failed: {error}"))?
@@ -812,6 +842,19 @@ fn run_production_one(
         error_message: None,
         production_telemetry,
     })
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn telemetry_has_event(path: &Path, event: &str) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| value.get("lifecycle_events").cloned())
+        .and_then(|events| events.as_array().cloned())
+        .is_some_and(|events| events.iter().any(|value| value.as_str() == Some(event)))
 }
 
 fn production_failure_record(

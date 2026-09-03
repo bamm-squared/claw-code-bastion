@@ -7,7 +7,7 @@ use agent_bench::{
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  agent-bench run --tasks PATH --output PATH [--task ID] [--models PATH] [--settings PATH] [--model ALIAS] [--repetitions N] [--execution mock|production] [--binary PATH] [--runtime-image REF] [--validator-image REF] [--task-timeout SECONDS] [--exploration-timeout SECONDS]\n  agent-bench compare BASELINE.jsonl CURRENT.jsonl"
+        "usage:\n  agent-bench run --tasks PATH --output PATH [--task ID] [--models PATH] [--settings PATH] [--model ALIAS] [--repetitions N] [--execution mock|production] [--binary PATH] [--runtime-image REF] [--validator-image REF] [--task-timeout SECONDS] [--exploration-timeout SECONDS] [--interactive]\n  agent-bench compare BASELINE.jsonl CURRENT.jsonl"
     );
     std::process::exit(2);
 }
@@ -39,6 +39,7 @@ fn main() {
             let exploration_timeout =
                 value(&args, "--exploration-timeout").and_then(|value| value.parse().ok());
             let dry_run = args.iter().any(|arg| arg == "--dry-run");
+            let interactive = args.iter().any(|arg| arg == "--interactive");
             if repetitions == 0 {
                 eprintln!("--repetitions must be positive");
                 std::process::exit(2);
@@ -73,6 +74,7 @@ fn main() {
                     task_timeout,
                     exploration_timeout,
                     dry_run,
+                    interactive,
                 ),
                 other => {
                     eprintln!("--execution must be mock or production, got {other:?}");

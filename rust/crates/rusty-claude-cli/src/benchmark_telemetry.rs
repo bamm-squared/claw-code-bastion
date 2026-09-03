@@ -51,6 +51,7 @@ pub struct Snapshot {
     pub started_at_ms: u128,
     pub elapsed_ms: u128,
     pub terminal_status: String,
+    pub lifecycle_events: Vec<String>,
     pub provider_call_records: Vec<ProviderCallRecord>,
 }
 
@@ -290,6 +291,16 @@ fn add_usage(slot: &mut Option<u64>, value: u64) {
 }
 pub fn candidate_mutation() {
     with_state(record_candidate_mutation);
+    lifecycle_event("candidate_mutated");
+}
+
+pub fn lifecycle_event(event: &str) {
+    with_state(|state| {
+        if state.snapshot.lifecycle_events.len() < 64 {
+            state.snapshot.lifecycle_events.push(event.to_string());
+        }
+    });
+    persist_snapshot();
 }
 
 fn record_tool_event(state: &mut State, name: &str, input: Option<&str>) {
@@ -361,6 +372,7 @@ pub fn validation(result: &str) {
         s.snapshot.validation_attempts += 1;
         s.snapshot.validation_result = Some(result.into());
     });
+    persist_snapshot();
 }
 
 pub fn flush(status: &str) {

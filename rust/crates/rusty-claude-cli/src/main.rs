@@ -5731,8 +5731,10 @@ impl LiveCli {
             return Ok(false);
         }
 
+        benchmark_telemetry::lifecycle_event("validation_started");
         let validation = runtime.validate_candidate(&changes)?;
         benchmark_telemetry::validation("completed");
+        benchmark_telemetry::lifecycle_event("validation_completed");
         if validation.has_infrastructure_failure() {
             benchmark_telemetry::validation("blocked_infrastructure");
             self.candidate_state = CandidateLifecycleState::ValidationBlocked;
@@ -5752,6 +5754,7 @@ impl LiveCli {
             return Ok(false);
         }
         self.candidate_state = CandidateLifecycleState::ReviewReady;
+        benchmark_telemetry::lifecycle_event("review_ready");
         let policy = runtime::ValidationPolicy::default();
         let normal_apply_allowed = validation.allows_apply(changes.id, policy, false);
         let blocked_apply_allowed = validation.allows_apply(changes.id, policy, true);
@@ -5903,7 +5906,9 @@ impl LiveCli {
 
         match action {
             CandidateReviewAction::Apply => {
+                benchmark_telemetry::lifecycle_event("apply_started");
                 runtime.apply_candidate_changes(&changes, &validation, false)?;
+                benchmark_telemetry::lifecycle_event("apply_completed");
                 runtime.discard_candidate()?;
                 self.checkpoint_store.clear();
                 self.candidate_state = CandidateLifecycleState::Applied;
@@ -5923,6 +5928,7 @@ impl LiveCli {
                     return Ok(false);
                 }
                 runtime.apply_candidate_changes(&changes, &validation, true)?;
+                benchmark_telemetry::lifecycle_event("apply_completed");
                 runtime.discard_candidate()?;
                 self.checkpoint_store.clear();
                 self.candidate_state = CandidateLifecycleState::Applied;
