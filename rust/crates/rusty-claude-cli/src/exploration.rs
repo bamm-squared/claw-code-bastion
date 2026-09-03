@@ -121,14 +121,37 @@ where
         + Send
         + Sync,
 {
+    run_parallel_with_budget(jobs, evidence, max_concurrent, None, executor)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+pub fn run_parallel_with_budget<F>(
+    jobs: Vec<(ExplorerQuestion, ModelProfile)>,
+    evidence: String,
+    max_concurrent: usize,
+    budget: Option<std::time::Duration>,
+    executor: F,
+) -> ExplorationSynthesis
+where
+    F: Fn(&ExplorerQuestion, &ModelProfile, &str) -> Result<Vec<ExplorerFinding>, String>
+        + Send
+        + Sync,
+{
     let launched = jobs.len();
     if jobs.is_empty() {
         return ExplorationSynthesis::default();
     }
     let limit = max_concurrent.clamp(1, MAX_EXPLORERS).min(jobs.len());
     let executor = Arc::new(executor);
+    let started = Instant::now();
     let mut results = Vec::with_capacity(jobs.len());
+    let mut launched = 0;
     for group in jobs.chunks(limit) {
+        if budget.is_some_and(|limit| started.elapsed() >= limit) {
+            break;
+        }
+        let group = if limit == 1 { &group[..1] } else { group };
+        launched += group.len();
         let group_results = thread::scope(|scope| {
             let handles = group
                 .iter()
@@ -270,5 +293,31 @@ mod tests {
         );
         assert_eq!(synthesis.context.matches("inspect caller").count(), 1);
         assert!(synthesis.context.len() < MAX_CONTEXT_BYTES);
+    }
+
+    #[test]
+    fn advisory_budget_keeps_completed_findings_and_skips_remaining_jobs() {
+        let profile = ModelProfile::legacy("local-model");
+        let jobs = questions_for(signals())
+            .into_iter()
+            .map(|question| (question, profile.clone()))
+            .collect::<Vec<_>>();
+        let synthesis = run_parallel_with_budget(
+            jobs,
+            "facts".to_string(),
+            1,
+            Some(Duration::from_millis(1)),
+            |_, _, _| {
+                std::thread::sleep(Duration::from_millis(5));
+                Ok(vec![ExplorerFinding {
+                    subject: "src/a.rs".to_string(),
+                    claim: "completed finding".to_string(),
+                    ..ExplorerFinding::default()
+                }])
+            },
+        );
+        assert_eq!(synthesis.launched, 1);
+        assert_eq!(synthesis.results.len(), 1);
+        assert!(synthesis.context.contains("completed finding"));
     }
 }

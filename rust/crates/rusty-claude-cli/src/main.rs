@@ -5365,10 +5365,16 @@ impl LiveCli {
             .unwrap_or(3);
         let max_concurrent = if same_endpoint { 1 } else { configured_limit };
         let evidence = format!("Requirement: {}\n{}", input, repository_context.text);
-        let synthesis = exploration::run_parallel(
+        let exploration_budget = env::var("CLAW_EXPLORATION_BUDGET_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .map(std::time::Duration::from_millis);
+        let synthesis = exploration::run_parallel_with_budget(
             jobs,
             evidence,
             max_concurrent,
+            exploration_budget,
             |question, profile, evidence| execute_explorer_profile(profile, question, evidence),
         );
         if synthesis.launched > 0 {

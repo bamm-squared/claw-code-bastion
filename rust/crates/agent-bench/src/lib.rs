@@ -455,6 +455,8 @@ pub fn run_production(
     runtime_image: Option<&str>,
     settings_path: Option<&Path>,
     validator_image: Option<&str>,
+    task_timeout: Option<u64>,
+    exploration_timeout: Option<u64>,
     dry_run: bool,
 ) -> Result<Vec<BenchmarkRecord>, String> {
     let profile = select_production_profile(config, model_alias)?.clone();
@@ -492,7 +494,7 @@ pub fn run_production(
         ));
     }
     eprintln!(
-        "production preflight: tasks={} task_ids={} profile_mode={} worker_image={} validator_image={} settings_model_resources={}",
+        "production preflight: tasks={} task_ids={} profile_mode={} worker_image={} validator_image={} settings_model_resources={} task_timeout={} exploration_budget={}",
         tasks.len(),
         tasks.iter().map(|task| task.id.as_str()).collect::<Vec<_>>().join(","),
         model_alias.unwrap_or("routed"),
@@ -502,6 +504,8 @@ pub fn run_production(
             .get("modelResources")
             .and_then(Value::as_array)
             .map_or(0, Vec::len),
+        task_timeout.map_or_else(|| "task-default".to_string(), |value| format!("{value}s")),
+        exploration_timeout.map_or_else(|| "task-derived".to_string(), |value| format!("{value}s")),
     );
     if dry_run {
         eprintln!("production preflight: dry-run; no child process launched");
@@ -519,6 +523,8 @@ pub fn run_production(
                 &runtime_image,
                 &validator_image,
                 &settings,
+                task_timeout,
+                exploration_timeout,
             ) {
                 Ok(record) => records.push(record),
                 Err(error) => records.push(production_failure_record(
@@ -592,6 +598,8 @@ fn run_production_one(
     runtime_image: &str,
     validator_image: &str,
     settings: &Value,
+    task_timeout: Option<u64>,
+    exploration_timeout: Option<u64>,
 ) -> Result<BenchmarkRecord, String> {
     let started_at = epoch_ms();
     let wall = Instant::now();
@@ -642,7 +650,20 @@ fn run_production_one(
     if model_alias.is_some_and(|alias| alias != "local-mock") {
         cli_args.splice(0..0, ["--model", &profile.model]);
     }
-    let mut child = Command::new(binary)
+    #[cfg(unix)]
+    let mut command = {
+        // `setsid` makes the CLI the process-group leader; descendants such
+        // as Podman workers can then be terminated as one acceptance job.
+        let mut command = Command::new("setsid");
+        command.arg(binary);
+        command
+    };
+    #[cfg(not(unix))]
+    let mut command = Command::new(binary);
+    let effective_task_timeout = task_timeout.unwrap_or(task.timeout_seconds);
+    let effective_exploration_timeout =
+        exploration_timeout.unwrap_or_else(|| (effective_task_timeout / 3).max(1));
+    let mut child = command
         .current_dir(&root)
         .args(cli_args)
         .env("HOME", &home)
@@ -660,12 +681,18 @@ fn run_production_one(
         .env("XDG_DATA_HOME", podman_data_home)
         .env("CLAW_WORKER_IMAGE", runtime_image)
         .env("CLAW_VALIDATOR_IMAGE", validator_image)
+        .env(
+            "CLAW_EXPLORATION_BUDGET_MS",
+            effective_exploration_timeout
+                .saturating_mul(1_000)
+                .to_string(),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("production CLI failed to start: {error}"))?;
-    let deadline = Instant::now() + Duration::from_secs(task.timeout_seconds);
+    let deadline = Instant::now() + Duration::from_secs(effective_task_timeout);
     let output = loop {
         if let Some(status) = child
             .try_wait()
@@ -696,12 +723,18 @@ fn run_production_one(
             };
         }
         if Instant::now() >= deadline {
+            #[cfg(unix)]
+            {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &format!("-{}", child.id())])
+                    .status();
+            }
             let _ = child.kill();
             let _ = child.wait();
-            return Err(with_partial_telemetry(
+            return Err(with_timeout_telemetry(
                 &format!(
                     "production task {} timed out after {} seconds",
-                    task.id, task.timeout_seconds
+                    task.id, effective_task_timeout
                 ),
                 &telemetry,
             ));
@@ -845,6 +878,23 @@ fn with_partial_telemetry(message: &str, path: &Path) -> String {
     let Ok(value) = serde_json::from_str::<Value>(&text) else {
         return message.to_string();
     };
+    format!("{message}{PARTIAL_TELEMETRY_MARKER}{value}")
+}
+
+fn with_timeout_telemetry(message: &str, path: &Path) -> String {
+    let Some(text) = fs::read_to_string(path).ok() else {
+        return message.to_string();
+    };
+    let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
+        return with_partial_telemetry(message, path);
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "terminal_status".to_string(),
+            Value::String("timeout".to_string()),
+        );
+        let _ = fs::write(path, serde_json::to_vec(&value).unwrap_or_default());
+    }
     format!("{message}{PARTIAL_TELEMETRY_MARKER}{value}")
 }
 
@@ -1511,5 +1561,21 @@ mod tests {
         let (message, telemetry) = split_partial_telemetry(&encoded);
         assert_eq!(message, "failure");
         assert_eq!(telemetry, Some(value));
+    }
+
+    #[test]
+    fn timeout_finalizes_partial_telemetry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("telemetry.json");
+        fs::write(
+            &path,
+            r#"{"terminal_status":"in_progress","provider_calls":1}"#,
+        )
+        .unwrap();
+        let error = with_timeout_telemetry("timed out", &path);
+        let (_, telemetry) = split_partial_telemetry(&error);
+        assert_eq!(telemetry.unwrap()["terminal_status"], "timeout");
+        let persisted = fs::read_to_string(path).unwrap();
+        assert!(persisted.contains(r#""terminal_status":"timeout""#));
     }
 }

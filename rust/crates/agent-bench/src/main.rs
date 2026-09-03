@@ -7,7 +7,7 @@ use agent_bench::{
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  agent-bench run --tasks PATH --output PATH [--task ID] [--models PATH] [--settings PATH] [--model ALIAS] [--repetitions N] [--execution mock|production] [--binary PATH] [--runtime-image REF] [--validator-image REF]\n  agent-bench compare BASELINE.jsonl CURRENT.jsonl"
+        "usage:\n  agent-bench run --tasks PATH --output PATH [--task ID] [--models PATH] [--settings PATH] [--model ALIAS] [--repetitions N] [--execution mock|production] [--binary PATH] [--runtime-image REF] [--validator-image REF] [--task-timeout SECONDS] [--exploration-timeout SECONDS]\n  agent-bench compare BASELINE.jsonl CURRENT.jsonl"
     );
     std::process::exit(2);
 }
@@ -35,6 +35,9 @@ fn main() {
             let binary = value(&args, "--binary").map(PathBuf::from);
             let runtime_image = value(&args, "--runtime-image");
             let validator_image = value(&args, "--validator-image");
+            let task_timeout = value(&args, "--task-timeout").and_then(|value| value.parse().ok());
+            let exploration_timeout =
+                value(&args, "--exploration-timeout").and_then(|value| value.parse().ok());
             let dry_run = args.iter().any(|arg| arg == "--dry-run");
             if repetitions == 0 {
                 eprintln!("--repetitions must be positive");
@@ -67,6 +70,8 @@ fn main() {
                     runtime_image.as_deref(),
                     settings_path.as_deref(),
                     validator_image.as_deref(),
+                    task_timeout,
+                    exploration_timeout,
                     dry_run,
                 ),
                 other => {
