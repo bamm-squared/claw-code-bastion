@@ -179,6 +179,14 @@ where
         });
         results.extend(group_results);
     }
+    for (question, profile) in jobs.iter().skip(launched) {
+        results.push(ExplorerResult {
+            kind: question.kind,
+            profile_id: profile.id.clone(),
+            error: Some("advisory exploration budget exhausted before launch".to_string()),
+            ..ExplorerResult::default()
+        });
+    }
     results.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.profile_id.cmp(&b.profile_id)));
     let context = render_context(&results);
     ExplorationSynthesis {
@@ -317,7 +325,15 @@ mod tests {
             },
         );
         assert_eq!(synthesis.launched, 1);
-        assert_eq!(synthesis.results.len(), 1);
+        assert_eq!(synthesis.results.len(), 3);
+        assert_eq!(
+            synthesis
+                .results
+                .iter()
+                .filter(|result| result.error.is_some())
+                .count(),
+            2
+        );
         assert!(synthesis.context.contains("completed finding"));
     }
 }
