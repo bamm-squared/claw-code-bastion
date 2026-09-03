@@ -108,6 +108,19 @@ pub struct ValidationResult {
     pub duration: Duration,
 }
 
+impl ValidationResult {
+    /// Infrastructure could not produce trustworthy candidate evidence.
+    #[must_use]
+    pub fn has_infrastructure_failure(&self) -> bool {
+        self.checks.iter().any(|check| {
+            matches!(
+                check.status,
+                ValidationStatus::Blocked | ValidationStatus::Error | ValidationStatus::Timeout
+            )
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValidationPolicy {
     pub require_validation: bool,
@@ -266,6 +279,9 @@ impl Drop for ValidationSnapshot {
 
 pub trait ValidatorBackend: Send + Sync + std::fmt::Debug {
     fn backend_id(&self) -> &'static str;
+    fn identity(&self) -> String {
+        self.backend_id().to_string()
+    }
     fn validate(
         &self,
         candidate: &ValidatedCandidateInput,
@@ -311,6 +327,8 @@ impl PodmanValidatorBackend {
             String::from("/tmp:rw,nosuid,nodev"),
             String::from("--tmpfs"),
             String::from("/home/validator:rw,nosuid,nodev"),
+            String::from("--env"),
+            String::from("CARGO_TARGET_DIR=/tmp/claw-cargo-target"),
             String::from("--mount"),
             format!(
                 "type=bind,src={},dst=/workspace/project,rw",
@@ -321,15 +339,24 @@ impl PodmanValidatorBackend {
             String::from("--entrypoint"),
             self.shell.clone(),
             self.image.clone(),
-            String::from("-lc"),
+            String::from("-c"),
             check.command.clone(),
         ]
+    }
+
+    #[must_use]
+    pub fn identity(&self) -> String {
+        format!("{}:{}", self.backend_id(), self.image)
     }
 }
 
 impl ValidatorBackend for PodmanValidatorBackend {
     fn backend_id(&self) -> &'static str {
-        "podman-validator-v1"
+        "podman-validator-v2"
+    }
+
+    fn identity(&self) -> String {
+        self.identity()
     }
 
     fn validate(
@@ -344,7 +371,7 @@ impl ValidatorBackend for PodmanValidatorBackend {
             ));
         }
         let started = Instant::now();
-        let validation_identity = plan.identity(self.backend_id());
+        let validation_identity = plan.identity(&self.identity());
         let mut results = Vec::with_capacity(plan.checks.len());
         for check in &plan.checks {
             results.push(run_check(&self.command(candidate, check), check)?);
@@ -417,6 +444,8 @@ fn run_check(command: &[String], check: &ValidationCheck) -> io::Result<Validati
             .ok_or_else(|| io::Error::other("validator process state unavailable"))?;
         if exit.success() {
             ValidationStatus::Pass
+        } else if validator_startup_failure(exit.code(), &stderr) {
+            ValidationStatus::Blocked
         } else {
             ValidationStatus::Fail
         }
@@ -431,6 +460,20 @@ fn run_check(command: &[String], check: &ValidationCheck) -> io::Result<Validati
         stderr,
         truncated,
     })
+}
+
+fn validator_startup_failure(exit_code: Option<i32>, stderr: &str) -> bool {
+    exit_code == Some(127)
+        || exit_code == Some(125)
+        || [
+            "command not found",
+            "cargo: not found",
+            "rustc: not found",
+            "unable to find image",
+            "no such image",
+        ]
+        .iter()
+        .any(|marker| stderr.to_ascii_lowercase().contains(marker))
 }
 
 fn wait_with_deadline(child: &mut Child, deadline: Instant) -> io::Result<bool> {
@@ -634,6 +677,32 @@ mod tests {
         ] {
             assert!(!command.contains(forbidden), "forbidden {forbidden}");
         }
+    }
+
+    #[test]
+    fn missing_validator_tool_is_infrastructure_blocked() {
+        assert!(validator_startup_failure(
+            Some(127),
+            "/bin/sh: cargo: not found"
+        ));
+        assert!(!validator_startup_failure(Some(1), "test assertion failed"));
+    }
+
+    #[test]
+    fn validation_identity_includes_validator_image() {
+        let plan = ValidationPlan::new(Vec::new());
+        let first = PodmanValidatorBackend {
+            image: "validator:a".into(),
+            ..Default::default()
+        };
+        let second = PodmanValidatorBackend {
+            image: "validator:b".into(),
+            ..Default::default()
+        };
+        assert_ne!(
+            plan.identity(&first.identity()),
+            plan.identity(&second.identity())
+        );
     }
 
     #[test]

@@ -13,7 +13,6 @@ use api::{
 };
 use plugins::PluginTool;
 use reqwest::blocking::Client;
-use runtime::validator::ValidatorBackend;
 use runtime::{
     check_freshness, dedupe_superseded_commit_events, execute_bash, load_system_prompt,
     lsp_client::LspRegistry,
@@ -445,7 +444,7 @@ impl ExecutionBackend for IsolatedExecutionBackend {
             Err(error) => Ok(runtime::validator::ValidationResult::blocked(
                 changes.id,
                 &plan,
-                backend.backend_id(),
+                &backend.identity(),
                 format!("secure validator unavailable: {error}"),
             )),
         }

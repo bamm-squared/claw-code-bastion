@@ -130,3 +130,22 @@ cargo run -p rusty-claude-cli -- prompt "summarize /repo"
 - The `:Z` suffix in the Podman examples is for SELinux relabeling; keep it on Fedora/RHEL-class hosts.
 - Running with `CARGO_TARGET_DIR=/tmp/claw-target` avoids leaving container-owned `target/` artifacts in your bind-mounted checkout.
 - For non-container local development, keep using [`../USAGE.md`](../USAGE.md) and [`../rust/README.md`](../rust/README.md).
+
+## Contained validation toolchains
+
+The isolated candidate worker image is intentionally minimal and is not a
+compiler environment. Validation images are selected separately with
+`CLAW_VALIDATOR_IMAGE` so project-controlled build and test code remains
+contained without bloating the worker image.
+
+The checked-in [`../Containerfile.validator`](../Containerfile.validator)
+provides the Rust toolchain used by the disposable Rust acceptance fixture:
+
+```bash
+podman build --pull=never -t claw-bastion-validator-rust:0.1.0-rc.2 -f Containerfile.validator .
+CLAW_VALIDATOR_IMAGE=claw-bastion-validator-rust:0.1.0-rc.2
+```
+
+The validator continues to use rootless Podman, a fresh candidate snapshot,
+`--network=none`, dropped capabilities, private PID/IPC namespaces,
+`no-new-privileges`, and no credential or canonical-workspace mounts.

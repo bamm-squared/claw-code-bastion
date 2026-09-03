@@ -1,0 +1,13 @@
+FROM docker.io/library/rust:bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CARGO_TERM_COLOR=always \
+    CARGO_NET_OFFLINE=true \
+    PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+RUN cargo --version && rustc --version
+WORKDIR /workspace/project
+
+ENTRYPOINT ["/bin/sh"]

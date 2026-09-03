@@ -51,6 +51,34 @@ pub struct Snapshot {
     pub started_at_ms: u128,
     pub elapsed_ms: u128,
     pub terminal_status: String,
+    pub provider_call_records: Vec<ProviderCallRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Default)]
+pub struct ProviderCallRecord {
+    pub sequence: u64,
+    pub role: Option<String>,
+    pub profile: Option<String>,
+    pub provider: Option<String>,
+    pub protocol: Option<String>,
+    pub request_ids: Vec<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub estimated_cost_usd: Option<f64>,
+    pub price_source: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProviderContext {
+    role: Option<String>,
+    profile: Option<String>,
+    provider: Option<String>,
+    protocol: Option<String>,
+    input_rate: Option<f64>,
+    output_rate: Option<f64>,
+    price_source: Option<String>,
 }
 
 struct State {
@@ -60,6 +88,8 @@ struct State {
     read_identities: HashSet<u64>,
     first_tool_at: Option<Instant>,
     first_mutation_recorded: bool,
+    provider_context: ProviderContext,
+    active_provider_record: Option<usize>,
 }
 
 static STATE: OnceLock<Mutex<Option<State>>> = OnceLock::new();
@@ -81,6 +111,8 @@ pub fn init() {
         read_identities: HashSet::new(),
         first_tool_at: None,
         first_mutation_recorded: false,
+        provider_context: ProviderContext::default(),
+        active_provider_record: None,
     })));
 }
 
@@ -101,7 +133,43 @@ fn with_state(f: impl FnOnce(&mut State)) {
 }
 
 pub fn provider_call() {
-    with_state(|s| s.snapshot.provider_calls += 1);
+    with_state(|s| {
+        s.snapshot.provider_calls += 1;
+        let context = &s.provider_context;
+        let sequence = s.snapshot.provider_calls;
+        s.snapshot.provider_call_records.push(ProviderCallRecord {
+            sequence,
+            role: context.role.clone(),
+            profile: context.profile.clone(),
+            provider: context.provider.clone(),
+            protocol: context.protocol.clone(),
+            price_source: context.price_source.clone(),
+            ..ProviderCallRecord::default()
+        });
+        s.active_provider_record = Some(s.snapshot.provider_call_records.len() - 1);
+    });
+}
+
+pub fn set_provider_context(
+    role: &str,
+    profile: Option<&str>,
+    provider: Option<&str>,
+    protocol: Option<&str>,
+    input_rate: Option<f64>,
+    output_rate: Option<f64>,
+    price_source: Option<&str>,
+) {
+    with_state(|s| {
+        s.provider_context = ProviderContext {
+            role: Some(role.to_string()),
+            profile: profile.map(str::to_string),
+            provider: provider.map(str::to_string),
+            protocol: protocol.map(str::to_string),
+            input_rate,
+            output_rate,
+            price_source: price_source.map(str::to_string),
+        };
+    });
 }
 
 pub fn provider_request_id(request_id: &str) {
@@ -115,6 +183,12 @@ pub fn provider_request_id(request_id: &str) {
             && s.snapshot.provider_request_ids.len() < 64
         {
             s.snapshot.provider_request_ids.push(request_id.to_string());
+        }
+        if let Some(index) = s.active_provider_record {
+            let record = &mut s.snapshot.provider_call_records[index];
+            if !request_id.is_empty() && !record.request_ids.iter().any(|id| id == request_id) {
+                record.request_ids.push(request_id.to_string());
+            }
         }
     });
 }
@@ -136,12 +210,30 @@ pub fn thinking() {
 pub fn content() {
     with_state(|s| s.snapshot.content_present = true);
 }
+#[allow(clippy::cast_precision_loss)]
 pub fn usage(input: u64, output: u64, cache_read: u64, cache_write: u64) {
     with_state(|s| {
         add_usage(&mut s.snapshot.input_tokens, input);
         add_usage(&mut s.snapshot.output_tokens, output);
         add_usage(&mut s.snapshot.cache_read_tokens, cache_read);
         add_usage(&mut s.snapshot.cache_write_tokens, cache_write);
+        if let Some(index) = s.active_provider_record {
+            let record = &mut s.snapshot.provider_call_records[index];
+            record.input_tokens = record.input_tokens.saturating_add(input);
+            record.output_tokens = record.output_tokens.saturating_add(output);
+            record.cache_read_tokens = record.cache_read_tokens.saturating_add(cache_read);
+            record.cache_write_tokens = record.cache_write_tokens.saturating_add(cache_write);
+            if let (Some(input_rate), Some(output_rate)) = (
+                s.provider_context.input_rate,
+                s.provider_context.output_rate,
+            ) {
+                record.estimated_cost_usd = Some(
+                    (record.input_tokens as f64 * input_rate
+                        + record.output_tokens as f64 * output_rate)
+                        / 1_000_000.0,
+                );
+            }
+        }
     });
 }
 
@@ -321,6 +413,8 @@ mod tests {
             read_identities: HashSet::new(),
             first_tool_at: None,
             first_mutation_recorded: false,
+            provider_context: ProviderContext::default(),
+            active_provider_record: None,
         }
     }
 
@@ -336,6 +430,47 @@ mod tests {
         assert_eq!(state.snapshot.output_tokens, Some(7));
         assert_eq!(state.snapshot.cache_read_tokens, None);
         assert_eq!(state.snapshot.model_request_bytes, 150);
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn provider_record_uses_profile_rates_for_authoritative_usage() {
+        let mut state = state();
+        state.provider_context = ProviderContext {
+            role: Some("writer".into()),
+            profile: Some("gpt-5.4-mini".into()),
+            provider: Some("openai".into()),
+            protocol: Some("responses".into()),
+            input_rate: Some(0.75),
+            output_rate: Some(4.50),
+            price_source: Some("explicit_profile".into()),
+        };
+        state.snapshot.provider_calls = 1;
+        state
+            .snapshot
+            .provider_call_records
+            .push(ProviderCallRecord {
+                sequence: 1,
+                role: state.provider_context.role.clone(),
+                profile: state.provider_context.profile.clone(),
+                provider: state.provider_context.provider.clone(),
+                protocol: state.provider_context.protocol.clone(),
+                price_source: state.provider_context.price_source.clone(),
+                ..ProviderCallRecord::default()
+            });
+        state.active_provider_record = Some(0);
+        let input_rate = state.provider_context.input_rate.unwrap();
+        let output_rate = state.provider_context.output_rate.unwrap();
+        let record = &mut state.snapshot.provider_call_records[0];
+        record.input_tokens = 1_000_000;
+        record.output_tokens = 1_000_000;
+        record.estimated_cost_usd = Some(
+            (record.input_tokens as f64 * input_rate + record.output_tokens as f64 * output_rate)
+                / 1_000_000.0,
+        );
+        assert_eq!(record.profile.as_deref(), Some("gpt-5.4-mini"));
+        assert_eq!(record.price_source.as_deref(), Some("explicit_profile"));
+        assert_eq!(record.estimated_cost_usd, Some(5.25));
     }
 
     #[test]

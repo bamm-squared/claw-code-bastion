@@ -4089,6 +4089,7 @@ struct ContextTrayItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CandidateLifecycleState {
     Editing,
+    ValidationBlocked,
     ReviewReady,
     Applied,
     Discarded,
@@ -4096,7 +4097,10 @@ enum CandidateLifecycleState {
 
 impl CandidateLifecycleState {
     fn reuses_candidate(self) -> bool {
-        matches!(self, Self::Editing | Self::ReviewReady)
+        matches!(
+            self,
+            Self::Editing | Self::ValidationBlocked | Self::ReviewReady
+        )
     }
 }
 
@@ -4906,6 +4910,9 @@ impl LiveCli {
         } else {
             session_state.with_persistence_path(session.path.clone())
         };
+        if let Some(profile) = explicit_writer_profile.as_ref() {
+            set_provider_telemetry_context("startup", profile);
+        }
         let runtime = build_runtime_with_backend_profile(
             session_state,
             &session.id,
@@ -5369,6 +5376,9 @@ impl LiveCli {
                     render_escalation_package(package)
                 )
             });
+        if let Some(profile) = self.selected_writer_profile.as_ref() {
+            set_provider_telemetry_context("writer", profile);
+        }
         let runtime = build_runtime_with_backend_profile(
             self.runtime.session().clone(),
             &self.session.id,
@@ -5653,6 +5663,24 @@ impl LiveCli {
 
         let validation = runtime.validate_candidate(&changes)?;
         benchmark_telemetry::validation("completed");
+        if validation.has_infrastructure_failure() {
+            benchmark_telemetry::validation("blocked_infrastructure");
+            self.candidate_state = CandidateLifecycleState::ValidationBlocked;
+            println!(
+                "Validation blocked by infrastructure; candidate retained and no evaluator or rework was started."
+            );
+            for check in &validation.checks {
+                if matches!(
+                    check.status,
+                    runtime::ValidationStatus::Blocked
+                        | runtime::ValidationStatus::Error
+                        | runtime::ValidationStatus::Timeout
+                ) {
+                    println!("  {}: {}", check.name, check.stderr);
+                }
+            }
+            return Ok(false);
+        }
         self.candidate_state = CandidateLifecycleState::ReviewReady;
         let policy = runtime::ValidationPolicy::default();
         let normal_apply_allowed = validation.allows_apply(changes.id, policy, false);
@@ -7079,6 +7107,27 @@ impl LiveCli {
     }
 }
 
+fn set_provider_telemetry_context(role: &str, profile: &model_router::ModelProfile) {
+    let pricing = model_router::actual_pricing_for_profile(profile);
+    benchmark_telemetry::set_provider_context(
+        role,
+        Some(&profile.id),
+        Some(&profile.provider),
+        Some(if profile.protocol_capabilities.is_some() {
+            "configured"
+        } else {
+            "default"
+        }),
+        pricing.as_ref().map(|value| value.input_cost_per_million),
+        pricing.as_ref().map(|value| value.output_cost_per_million),
+        Some(if profile.pricing.actual_cost_known {
+            "explicit_profile"
+        } else {
+            "resolved"
+        }),
+    );
+}
+
 fn routing_signals(plan: &task_plan::TaskPlan) -> model_router::TaskSignals {
     let request = plan.original_request.to_ascii_lowercase();
     model_router::TaskSignals {
@@ -7553,6 +7602,7 @@ fn trusted_hud_line(
     };
     let candidate = match candidate_state {
         CandidateLifecycleState::Editing => "editing",
+        CandidateLifecycleState::ValidationBlocked => "validation-blocked",
         CandidateLifecycleState::ReviewReady => "review-ready",
         CandidateLifecycleState::Applied => "applied",
         CandidateLifecycleState::Discarded => "discarded",
@@ -8130,6 +8180,7 @@ fn render_task_inspector(
 fn candidate_state_label(state: CandidateLifecycleState) -> &'static str {
     match state {
         CandidateLifecycleState::Editing => "editing",
+        CandidateLifecycleState::ValidationBlocked => "validation-blocked",
         CandidateLifecycleState::ReviewReady => "review-ready",
         CandidateLifecycleState::Applied => "applied",
         CandidateLifecycleState::Discarded => "discarded",
@@ -9706,6 +9757,7 @@ fn execute_evaluator_profile(
     profile: &model_router::ModelProfile,
     request: &requirement_evaluator::EvaluationRequest,
 ) -> Result<String, String> {
+    set_provider_telemetry_context("evaluator", profile);
     let resolved_model = api::resolve_model_alias(&profile.model);
     enforce_private_provider(&resolved_model).map_err(|error| error.to_string())?;
     let client = ApiProviderClient::from_model_with_profile_and_capabilities(
@@ -9741,6 +9793,16 @@ fn execute_evaluator_profile(
     let response = runtime
         .block_on(client.send_message(&message_request))
         .map_err(|error| error.to_string())?;
+    if let Some(request_id) = response.request_id.as_deref() {
+        benchmark_telemetry::provider_request_id(request_id);
+    }
+    let usage = response.usage.token_usage();
+    benchmark_telemetry::usage(
+        u64::from(usage.input_tokens),
+        u64::from(usage.output_tokens),
+        u64::from(usage.cache_read_input_tokens),
+        u64::from(usage.cache_creation_input_tokens),
+    );
     let text = response
         .content
         .into_iter()
@@ -9763,6 +9825,7 @@ fn execute_explorer_profile(
     question: &exploration::ExplorerQuestion,
     evidence: &str,
 ) -> Result<Vec<exploration::ExplorerFinding>, String> {
+    set_provider_telemetry_context("explorer", profile);
     let resolved_model = api::resolve_model_alias(&profile.model);
     enforce_private_provider(&resolved_model).map_err(|error| error.to_string())?;
     let client = ApiProviderClient::from_model_with_profile_and_capabilities(
@@ -9798,6 +9861,16 @@ fn execute_explorer_profile(
     let response = runtime
         .block_on(client.send_message(&message_request))
         .map_err(|error| error.to_string())?;
+    if let Some(request_id) = response.request_id.as_deref() {
+        benchmark_telemetry::provider_request_id(request_id);
+    }
+    let usage = response.usage.token_usage();
+    benchmark_telemetry::usage(
+        u64::from(usage.input_tokens),
+        u64::from(usage.output_tokens),
+        u64::from(usage.cache_read_input_tokens),
+        u64::from(usage.cache_creation_input_tokens),
+    );
     let text = response
         .content
         .into_iter()
@@ -11610,6 +11683,7 @@ mod tests {
     #[test]
     fn candidate_lifecycle_reuses_only_non_terminal_candidates() {
         assert!(CandidateLifecycleState::Editing.reuses_candidate());
+        assert!(CandidateLifecycleState::ValidationBlocked.reuses_candidate());
         assert!(CandidateLifecycleState::ReviewReady.reuses_candidate());
         assert!(!CandidateLifecycleState::Applied.reuses_candidate());
         assert!(!CandidateLifecycleState::Discarded.reuses_candidate());
