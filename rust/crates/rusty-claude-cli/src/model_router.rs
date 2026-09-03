@@ -45,11 +45,14 @@ pub struct Capability {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[allow(clippy::struct_field_names)]
 pub struct Pricing {
-    /// Actual price in microdollars per million tokens.
+    /// Stored as thousandths of a dollar per 1,000,000 tokens.
+    ///
+    /// For example, `750` means `$0.75` per million input tokens.
     pub actual_cost_known: bool,
     pub actual_input_micros: u64,
     pub actual_output_micros: u64,
-    /// Optional comparison-only price, never used as actual spend.
+    /// Optional comparison-only price in the same stored units; never used as
+    /// actual spend.
     pub reference_input_micros: Option<u64>,
     pub reference_output_micros: Option<u64>,
 }
@@ -1116,8 +1119,8 @@ pub fn pricing_resolution_for_profile(profile: &ModelProfile) -> runtime::Pricin
         .pricing
         .actual_cost_known
         .then_some(runtime::ModelPricing {
-            input_cost_per_million: profile.pricing.actual_input_micros as f64 / 1_000_000.0,
-            output_cost_per_million: profile.pricing.actual_output_micros as f64 / 1_000_000.0,
+            input_cost_per_million: profile.pricing.actual_input_micros as f64 / 1_000.0,
+            output_cost_per_million: profile.pricing.actual_output_micros as f64 / 1_000.0,
             cache_creation_cost_per_million: 0.0,
             cache_read_cost_per_million: 0.0,
         });
@@ -1126,8 +1129,8 @@ pub fn pricing_resolution_for_profile(profile: &ModelProfile) -> runtime::Pricin
         profile.pricing.reference_output_micros,
     ) {
         (Some(input), Some(output)) => Some(runtime::ModelPricing {
-            input_cost_per_million: input as f64 / 1_000_000.0,
-            output_cost_per_million: output as f64 / 1_000_000.0,
+            input_cost_per_million: input as f64 / 1_000.0,
+            output_cost_per_million: output as f64 / 1_000.0,
             cache_creation_cost_per_million: 0.0,
             cache_read_cost_per_million: 0.0,
         }),
@@ -1182,11 +1185,30 @@ mod tests {
 
     #[test]
     fn profile_price_is_authoritative_over_provider_catalog() {
-        let mut profile = profile("gpt-5.4-mini", PrivacyClass::Remote, 90, 999);
+        let mut profile = profile("gpt-5.4-mini", PrivacyClass::Remote, 90, 750);
         profile.provider = "openai".to_string();
+        profile.pricing.actual_output_micros = 4_500;
         let resolution = pricing_resolution_for_profile(&profile);
         assert_eq!(resolution.source, runtime::PricingSource::ExplicitProfile);
-        assert!((resolution.actual.unwrap().input_cost_per_million - 0.000_999).abs() < 1e-12);
+        let pricing = resolution.actual.unwrap();
+        assert!((pricing.input_cost_per_million - 0.75).abs() < 1e-12);
+        assert!((pricing.output_cost_per_million - 4.5).abs() < 1e-12);
+
+        let one_million_each = runtime::TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..runtime::TokenUsage::default()
+        }
+        .estimate_cost_usd_with_pricing(pricing);
+        assert!((one_million_each.input_cost_usd - 0.75).abs() < 1e-12);
+        assert!((one_million_each.output_cost_usd - 4.5).abs() < 1e-12);
+
+        let one_thousand_input = runtime::TokenUsage {
+            input_tokens: 1_000,
+            ..runtime::TokenUsage::default()
+        }
+        .estimate_cost_usd_with_pricing(pricing);
+        assert!((one_thousand_input.input_cost_usd - 0.00075).abs() < 1e-12);
     }
 
     #[test]
