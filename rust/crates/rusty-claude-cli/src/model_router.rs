@@ -164,7 +164,8 @@ impl ModelPool {
             .as_ref()
             .and_then(|root| root.get("modelResources"))
             .and_then(Value::as_array);
-        let has_configured_resources = configured_resources.is_some();
+        let has_configured_resources =
+            configured_resources.is_some_and(|resources| !resources.is_empty());
         let profiles = configured_resources
             .into_iter()
             .flatten()
