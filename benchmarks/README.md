@@ -45,17 +45,23 @@ the configured worker and validator images:
 cargo run -p agent-bench -- run \
   --execution production \
   --tasks benchmarks/tasks.v1.json \
+  --task config-threading \
   --models /path/to/authorized-models.json \
-  --model PROFILE_ALIAS \
+  --settings /path/to/.claw/settings.json \
   --binary /path/to/claw \
   --runtime-image localhost/claw-bastion-runtime:gate-REVISION \
+  --validator-image localhost/claw-bastion-validator-rust:gate-REVISION \
   --repetitions 1 \
   --output /tmp/bastion-production-benchmark.jsonl
 ```
 
 Production execution requires an operator-authored profile with
 `authorized: true`; the deterministic `local-mock` profile is never accepted
-as a production baseline. The adapter does not print or store provider
-credentials. It records provider usage/activity as unavailable when the
-production CLI does not expose structured telemetry rather than fabricating
-values.
+as a production baseline. `--model ALIAS` pins one profile; omitting it keeps
+the complete settings `modelResources` pool available for normal routing.
+`--task ID` selects one existing task without rebuilding its definition.
+Production requires complete Claw settings through `--settings` or
+`CLAW_BENCH_SETTINGS`; the adapter never reduces them to a model string.
+Worker and validator images are independent and both must be supplied for
+production execution. `--dry-run` performs the same task/profile/settings
+preflight without launching the child process.

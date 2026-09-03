@@ -2,12 +2,12 @@ use std::env;
 use std::path::PathBuf;
 
 use agent_bench::{
-    compare_files, load_tasks, run_mock, run_production, write_jsonl, BenchmarkConfig,
+    compare_files, load_tasks, run_mock, run_production, select_tasks, write_jsonl, BenchmarkConfig,
 };
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  agent-bench run --tasks PATH --output PATH [--models PATH] [--model ALIAS] [--repetitions N] [--execution mock|production] [--binary PATH] [--runtime-image REF]\n  agent-bench compare BASELINE.jsonl CURRENT.jsonl"
+        "usage:\n  agent-bench run --tasks PATH --output PATH [--task ID] [--models PATH] [--settings PATH] [--model ALIAS] [--repetitions N] [--execution mock|production] [--binary PATH] [--runtime-image REF] [--validator-image REF]\n  agent-bench compare BASELINE.jsonl CURRENT.jsonl"
     );
     std::process::exit(2);
 }
@@ -24,36 +24,50 @@ fn main() {
         Some("run") => {
             let tasks_path = value(&args, "--tasks").map_or_else(|| usage(), PathBuf::from);
             let output_path = value(&args, "--output").map_or_else(|| usage(), PathBuf::from);
+            let task_id = value(&args, "--task");
             let model_path = value(&args, "--models").map(PathBuf::from);
-            let model_alias = value(&args, "--model").unwrap_or_else(|| "local-mock".to_string());
+            let model_alias = value(&args, "--model");
+            let settings_path = value(&args, "--settings").map(PathBuf::from);
             let repetitions = value(&args, "--repetitions")
                 .and_then(|value| value.parse::<u32>().ok())
                 .unwrap_or(1);
             let execution = value(&args, "--execution").unwrap_or_else(|| "mock".to_string());
             let binary = value(&args, "--binary").map(PathBuf::from);
             let runtime_image = value(&args, "--runtime-image");
+            let validator_image = value(&args, "--validator-image");
+            let dry_run = args.iter().any(|arg| arg == "--dry-run");
             if repetitions == 0 {
                 eprintln!("--repetitions must be positive");
                 std::process::exit(2);
             }
-            let tasks = load_tasks(&tasks_path).unwrap_or_else(|error| {
-                eprintln!("failed to load tasks: {error}");
-                std::process::exit(1);
-            });
+            let tasks = load_tasks(&tasks_path)
+                .and_then(|tasks| select_tasks(&tasks, task_id.as_deref()))
+                .unwrap_or_else(|error| {
+                    eprintln!("failed to load tasks: {error}");
+                    std::process::exit(1);
+                });
             let config =
                 BenchmarkConfig::from_path(model_path.as_deref()).unwrap_or_else(|error| {
                     eprintln!("failed to load model profiles: {error}");
                     std::process::exit(1);
                 });
             let records = match execution.as_str() {
-                "mock" => run_mock(&tasks, &config, &model_alias, repetitions),
+                "mock" => run_mock(
+                    &tasks,
+                    &config,
+                    model_alias.as_deref().unwrap_or("local-mock"),
+                    repetitions,
+                ),
                 "production" => run_production(
                     &tasks,
                     &config,
-                    (!model_alias.is_empty()).then_some(model_alias.as_str()),
+                    model_alias.as_deref(),
                     repetitions,
                     binary.as_deref(),
                     runtime_image.as_deref(),
+                    settings_path.as_deref(),
+                    validator_image.as_deref(),
+                    dry_run,
                 ),
                 other => {
                     eprintln!("--execution must be mock or production, got {other:?}");

@@ -242,6 +242,8 @@ pub struct BenchmarkRecord {
     #[serde(default)]
     pub runtime_image: Option<String>,
     #[serde(default)]
+    pub validator_image: Option<String>,
+    #[serde(default)]
     pub isolated_execution: Option<bool>,
     #[serde(default)]
     pub error_class: Option<String>,
@@ -390,7 +392,28 @@ pub fn load_tasks(path: &Path) -> Result<Vec<BenchmarkTask>, String> {
     if tasks.is_empty() {
         return Err("task corpus is empty".to_string());
     }
+    let mut ids = BTreeSet::new();
+    for task in &tasks {
+        if !ids.insert(task.id.as_str()) {
+            return Err(format!("duplicate task id {:?}", task.id));
+        }
+    }
     Ok(tasks)
+}
+
+pub fn select_tasks(
+    tasks: &[BenchmarkTask],
+    task_id: Option<&str>,
+) -> Result<Vec<BenchmarkTask>, String> {
+    match task_id {
+        None => Ok(tasks.to_vec()),
+        Some(task_id) => tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .cloned()
+            .map(|task| vec![task])
+            .ok_or_else(|| format!("task {task_id:?} is not present in the corpus")),
+    }
 }
 
 pub fn run_mock(
@@ -418,6 +441,7 @@ pub fn run_mock(
 /// execution path. This adapter is intentionally opt-in and refuses the
 /// deterministic mock profile so mock records cannot be mistaken for a
 /// production baseline.
+#[allow(clippy::too_many_arguments)]
 pub fn run_production(
     tasks: &[BenchmarkTask],
     config: &BenchmarkConfig,
@@ -425,6 +449,9 @@ pub fn run_production(
     repetitions: u32,
     binary: Option<&Path>,
     runtime_image: Option<&str>,
+    settings_path: Option<&Path>,
+    validator_image: Option<&str>,
+    dry_run: bool,
 ) -> Result<Vec<BenchmarkRecord>, String> {
     let profile = select_production_profile(config, model_alias)?.clone();
     let binary = binary
@@ -441,28 +468,87 @@ pub fn run_production(
         .ok_or_else(|| {
             "production execution requires --runtime-image REF or CLAW_WORKER_IMAGE".to_string()
         })?;
+    let validator_image = validator_image
+        .map(str::to_string)
+        .or_else(|| std::env::var("CLAW_VALIDATOR_IMAGE").ok())
+        .ok_or_else(|| {
+            "production execution requires --validator-image REF or CLAW_VALIDATOR_IMAGE; refusing to use the worker image for validation".to_string()
+        })?;
+    let settings_path = settings_path
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("CLAW_BENCH_SETTINGS").map(PathBuf::from))
+        .ok_or_else(|| {
+            "production execution requires --settings PATH or CLAW_BENCH_SETTINGS".to_string()
+        })?;
+    let settings = load_child_settings(&settings_path)?;
     if !profile.authorized {
         return Err(format!(
             "model profile {:?} is not benchmark-authorized; set authorized: true only after explicit operator approval",
             profile.alias
         ));
     }
+    eprintln!(
+        "production preflight: tasks={} task_ids={} profile_mode={} worker_image={} validator_image={} settings_model_resources={}",
+        tasks.len(),
+        tasks.iter().map(|task| task.id.as_str()).collect::<Vec<_>>().join(","),
+        model_alias.unwrap_or("routed"),
+        runtime_image,
+        validator_image,
+        settings
+            .get("modelResources")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
+    );
+    if dry_run {
+        eprintln!("production preflight: dry-run; no child process launched");
+        return Ok(Vec::new());
+    }
     let mut records = Vec::new();
     for repetition in 1..=repetitions {
         for task in tasks {
-            match run_production_one(task, &profile, repetition, &binary, &runtime_image) {
+            match run_production_one(
+                task,
+                &profile,
+                model_alias,
+                repetition,
+                &binary,
+                &runtime_image,
+                &validator_image,
+                &settings,
+            ) {
                 Ok(record) => records.push(record),
                 Err(error) => records.push(production_failure_record(
                     task,
                     &profile,
                     repetition,
                     &runtime_image,
+                    &validator_image,
                     &error,
                 )),
             }
         }
     }
     Ok(records)
+}
+
+fn load_child_settings(path: &Path) -> Result<Value, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read Claw settings {}: {error}", path.display()))?;
+    let settings = serde_json::from_str::<Value>(&text)
+        .map_err(|error| format!("failed to parse Claw settings {}: {error}", path.display()))?;
+    if !settings.is_object() {
+        return Err("Claw settings must be a JSON object".to_string());
+    }
+    let resources = settings
+        .get("modelResources")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            "Claw settings must contain modelResources for production acceptance".to_string()
+        })?;
+    if resources.is_empty() {
+        return Err("Claw settings modelResources must not be empty".to_string());
+    }
+    Ok(settings)
 }
 
 fn select_production_profile<'a>(
@@ -491,13 +577,16 @@ fn select_production_profile<'a>(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_production_one(
     task: &BenchmarkTask,
     profile: &ModelProfile,
+    model_alias: Option<&str>,
     repetition: u32,
     binary: &Path,
     runtime_image: &str,
+    validator_image: &str,
+    settings: &Value,
 ) -> Result<BenchmarkRecord, String> {
     let started_at = epoch_ms();
     let wall = Instant::now();
@@ -535,20 +624,22 @@ fn run_production_one(
     }
     fs::write(
         config.join("settings.json"),
-        serde_json::to_vec(&json!({"model": profile.model})).map_err(|error| error.to_string())?,
+        serde_json::to_vec(settings).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
+    let mut cli_args = vec![
+        "--permission-mode",
+        "workspace-write",
+        "--print",
+        "-p",
+        &task.prompt,
+    ];
+    if model_alias.is_some_and(|alias| alias != "local-mock") {
+        cli_args.splice(0..0, ["--model", &profile.model]);
+    }
     let mut child = Command::new(binary)
         .current_dir(&root)
-        .args([
-            "--model",
-            &profile.model,
-            "--permission-mode",
-            "workspace-write",
-            "--print",
-            "-p",
-            &task.prompt,
-        ])
+        .args(cli_args)
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", &config)
         .env("XDG_CACHE_HOME", &cache)
@@ -563,7 +654,7 @@ fn run_production_one(
         // image resolves locally instead of triggering a registry pull.
         .env("XDG_DATA_HOME", podman_data_home)
         .env("CLAW_WORKER_IMAGE", runtime_image)
-        .env("CLAW_VALIDATOR_IMAGE", runtime_image)
+        .env("CLAW_VALIDATOR_IMAGE", validator_image)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -666,6 +757,7 @@ fn run_production_one(
         mock_execution: false,
         execution: "production_cli".to_string(),
         runtime_image: Some(runtime_image.to_string()),
+        validator_image: Some(validator_image.to_string()),
         isolated_execution: Some(true),
         error_class: None,
         error_message: None,
@@ -678,6 +770,7 @@ fn production_failure_record(
     profile: &ModelProfile,
     repetition: u32,
     runtime_image: &str,
+    validator_image: &str,
     error: &str,
 ) -> BenchmarkRecord {
     let (error_message, production_telemetry) = split_partial_telemetry(error);
@@ -713,6 +806,7 @@ fn production_failure_record(
         mock_execution: false,
         execution: "production_cli".to_string(),
         runtime_image: Some(runtime_image.to_string()),
+        validator_image: Some(validator_image.to_string()),
         isolated_execution: Some(true),
         error_class: Some(class.to_string()),
         error_message: Some(error_message),
@@ -883,6 +977,7 @@ fn run_one(
         mock_execution: true,
         execution: "mock_runtime".to_string(),
         runtime_image: None,
+        validator_image: None,
         isolated_execution: Some(false),
         error_class: None,
         error_message: None,
@@ -1219,6 +1314,57 @@ fn epoch_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn task(id: &str) -> BenchmarkTask {
+        BenchmarkTask {
+            id: id.into(),
+            version: 1,
+            category: "test".into(),
+            language: "text".into(),
+            prompt: "test".into(),
+            fixture: Fixture {
+                files: BTreeMap::new(),
+                mock_actions: Vec::new(),
+            },
+            visible_validation: None,
+            hidden_oracle: HiddenOracle {
+                expected_files: BTreeMap::new(),
+                forbidden_paths: Vec::new(),
+            },
+            expected_change_scope: Vec::new(),
+            forbidden_changes: Vec::new(),
+            timeout_seconds: 1,
+            max_agent_turns: 1,
+        }
+    }
+
+    #[test]
+    fn explicit_task_selection_preserves_the_complete_task() {
+        let tasks = vec![task("first"), task("config-threading"), task("last")];
+        let selected = select_tasks(&tasks, Some("config-threading")).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, "config-threading");
+        assert_eq!(
+            select_tasks(&tasks, Some("missing")).unwrap_err(),
+            "task \"missing\" is not present in the corpus"
+        );
+        assert_eq!(select_tasks(&tasks, None).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn child_settings_require_and_preserve_model_resources() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"modelResources":[{"id":"profile-b","provider":"provider-b","model":"shared-model","endpoint":"http://b","protocolCapabilities":{"responses":false,"chatCompletions":true}}],"routing":{"allowRemote":true}}"#,
+        )
+        .unwrap();
+        let settings = load_child_settings(&path).unwrap();
+        assert_eq!(settings["modelResources"][0]["id"], "profile-b");
+        assert_eq!(settings["modelResources"][0]["endpoint"], "http://b");
+        assert_eq!(settings["routing"]["allowRemote"], true);
+    }
 
     #[test]
     fn local_profile_cost_is_zero() {
