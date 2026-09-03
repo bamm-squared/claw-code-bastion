@@ -125,6 +125,7 @@ where
 }
 
 #[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_lines)]
 pub fn run_parallel_with_budget<F>(
     jobs: Vec<(ExplorerQuestion, ModelProfile)>,
     evidence: String,
@@ -137,6 +138,12 @@ where
         + Send
         + Sync,
 {
+    if std::env::var("CLAW_ORCHESTRATION_TRACE").as_deref() == Ok("1") {
+        eprintln!(
+            "[orchestration-trace] exploration_collection_started jobs={}",
+            jobs.len()
+        );
+    }
     let launched = jobs.len();
     if jobs.is_empty() {
         return ExplorationSynthesis::default();
@@ -146,40 +153,81 @@ where
     let started = Instant::now();
     let mut results = Vec::with_capacity(jobs.len());
     let mut launched = 0;
-    for group in jobs.chunks(limit) {
-        if budget.is_some_and(|limit| started.elapsed() >= limit) {
-            break;
+    if limit == 1 {
+        for (question, profile) in &jobs {
+            if budget.is_some_and(|limit| started.elapsed() >= limit) {
+                break;
+            }
+            launched += 1;
+            if std::env::var("CLAW_ORCHESTRATION_TRACE").as_deref() == Ok("1") {
+                eprintln!(
+                    "[orchestration-trace] explorer_job_started kind={} profile={}",
+                    question.kind.label(),
+                    profile.id
+                );
+            }
+            let job_started = Instant::now();
+            let outcome = executor(question, profile, &evidence);
+            let result = ExplorerResult {
+                kind: question.kind,
+                profile_id: profile.id.clone(),
+                findings: outcome.clone().unwrap_or_default(),
+                error: outcome.err(),
+                elapsed_ms: u64::try_from(job_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            };
+            if std::env::var("CLAW_ORCHESTRATION_TRACE").as_deref() == Ok("1") {
+                eprintln!(
+                    "[orchestration-trace] explorer_job_completed kind={} profile={} success={}",
+                    result.kind.label(),
+                    result.profile_id,
+                    result.error.is_none()
+                );
+            }
+            results.push(result);
         }
-        let group = if limit == 1 { &group[..1] } else { group };
-        launched += group.len();
-        let group_results = thread::scope(|scope| {
-            let handles = group
-                .iter()
-                .map(|(question, profile)| {
-                    let executor = Arc::clone(&executor);
-                    let evidence = evidence.clone();
-                    scope.spawn(move || {
-                        let started = Instant::now();
-                        let outcome = executor(question, profile, &evidence);
-                        ExplorerResult {
-                            kind: question.kind,
-                            profile_id: profile.id.clone(),
-                            findings: outcome.clone().unwrap_or_default(),
-                            error: outcome.err(),
-                            elapsed_ms: u64::try_from(started.elapsed().as_millis())
-                                .unwrap_or(u64::MAX),
-                        }
+    } else {
+        for group in jobs.chunks(limit) {
+            if budget.is_some_and(|limit| started.elapsed() >= limit) {
+                break;
+            }
+            let group = if limit == 1 { &group[..1] } else { group };
+            launched += group.len();
+            let group_results = thread::scope(|scope| {
+                let handles = group
+                    .iter()
+                    .map(|(question, profile)| {
+                        let executor = Arc::clone(&executor);
+                        let evidence = evidence.clone();
+                        scope.spawn(move || {
+                            let started = Instant::now();
+                            let outcome = executor(question, profile, &evidence);
+                            ExplorerResult {
+                                kind: question.kind,
+                                profile_id: profile.id.clone(),
+                                findings: outcome.clone().unwrap_or_default(),
+                                error: outcome.err(),
+                                elapsed_ms: u64::try_from(started.elapsed().as_millis())
+                                    .unwrap_or(u64::MAX),
+                            }
+                        })
                     })
-                })
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .map(|handle| handle.join().unwrap())
-                .collect::<Vec<_>>()
-        });
-        results.extend(group_results);
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            results.extend(group_results);
+        }
     }
     for (question, profile) in jobs.iter().skip(launched) {
+        if std::env::var("CLAW_ORCHESTRATION_TRACE").as_deref() == Ok("1") {
+            eprintln!(
+                "[orchestration-trace] explorer_job_skipped kind={} profile={} reason=budget",
+                question.kind.label(),
+                profile.id
+            );
+        }
         results.push(ExplorerResult {
             kind: question.kind,
             profile_id: profile.id.clone(),
@@ -189,6 +237,9 @@ where
     }
     results.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.profile_id.cmp(&b.profile_id)));
     let context = render_context(&results);
+    if std::env::var("CLAW_ORCHESTRATION_TRACE").as_deref() == Ok("1") {
+        eprintln!("[orchestration-trace] exploration_merge_completed");
+    }
     ExplorationSynthesis {
         launched,
         results,

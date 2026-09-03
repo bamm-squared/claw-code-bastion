@@ -230,6 +230,12 @@ fn provider_trace(message: impl AsRef<str>) {
     }
 }
 
+fn orchestration_trace(message: impl AsRef<str>) {
+    if env::var("CLAW_ORCHESTRATION_TRACE").as_deref() == Ok("1") {
+        eprintln!("[orchestration-trace] {}", message.as_ref());
+    }
+}
+
 fn endpoint_host(endpoint: &str) -> Option<&str> {
     let authority = endpoint.split_once("://")?.1.split('/').next()?;
     let authority = authority.rsplit('@').next().unwrap_or(authority);
@@ -5008,6 +5014,7 @@ impl LiveCli {
     }
 
     fn route_writer_for_current_task(&mut self) {
+        orchestration_trace("writer_routing_started");
         if self.routing_policy.disable_automatic
             && self.explicit_writer_profile.is_none()
             && !self.escalation_requested
@@ -5076,6 +5083,12 @@ impl LiveCli {
         if let Some(profile) = decision.selected {
             self.model.clone_from(&profile.model);
             self.selected_writer_profile = Some(profile);
+            orchestration_trace(format!(
+                "writer_profile_selected profile={}",
+                self.selected_writer_profile
+                    .as_ref()
+                    .map_or("unknown", |profile| profile.id.as_str())
+            ));
             self.escalation_requested = false;
         }
     }
@@ -5322,6 +5335,7 @@ impl LiveCli {
     }
 
     fn prepare_exploration(&mut self, input: &str) {
+        orchestration_trace("exploration_started");
         if self.exploration_input.as_deref() == Some(input) || self.pending_rework.is_some() {
             return;
         }
@@ -5336,6 +5350,7 @@ impl LiveCli {
         self.task_plan.update(input, Some(&repository_context.text));
         let signals = routing_signals(&self.task_plan);
         let questions = exploration::questions_for(signals);
+        orchestration_trace(format!("exploration_decision jobs={}", questions.len()));
         self.exploration_input = Some(input.to_string());
         if questions.is_empty() || self.routing_policy.disable_automatic {
             return;
@@ -5377,6 +5392,11 @@ impl LiveCli {
             exploration_budget,
             |question, profile, evidence| execute_explorer_profile(profile, question, evidence),
         );
+        orchestration_trace(format!(
+            "exploration_stage_completed launched={} results={}",
+            synthesis.launched,
+            synthesis.results.len()
+        ));
         if synthesis.launched > 0 {
             self.exploration_context = Some(synthesis.context);
         }
@@ -5387,6 +5407,7 @@ impl LiveCli {
         emit_output: bool,
         task_input: &str,
     ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
+        orchestration_trace("writer_runtime_construction_started");
         let retained_backend = if self.candidate_state.reuses_candidate() {
             self.runtime.execution_backend()
         } else {
@@ -5439,6 +5460,7 @@ impl LiveCli {
             retained_backend,
             self.selected_writer_profile.as_ref(),
         )?;
+        orchestration_trace("writer_runtime_constructed");
         let mut runtime = runtime;
         if let Some(profile) = &self.selected_writer_profile {
             if let Some(inner) = runtime.runtime.as_mut() {
@@ -5628,6 +5650,7 @@ impl LiveCli {
             return Err(reason.into());
         }
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false, input)?;
+        orchestration_trace("writer_turn_started");
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
