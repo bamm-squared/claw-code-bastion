@@ -4998,6 +4998,14 @@ impl LiveCli {
                 signals,
                 routing_policy,
             )
+        } else if let Some(profile) = &self.explicit_writer_profile {
+            model_router::ModelRouter::select_explicit(
+                &self.model_pool,
+                &profile.id,
+                model_router::ModelRole::Writer,
+                signals,
+                &self.routing_policy,
+            )
         } else {
             model_router::ModelRouter::route_with_calibration(
                 &self.model_pool,
@@ -5008,11 +5016,13 @@ impl LiveCli {
             )
         };
         self.last_routing_explanation = Some(decision.reason.clone());
-        if self.escalation_requested && decision.selected.is_none() {
-            self.rework_blocked = Some(
+        if decision.selected.is_none() {
+            self.rework_blocked = Some(if self.escalation_requested {
                 "REWORK REQUIRES STRONGER MODEL; NO ELIGIBLE CONFIGURED PROFILE AVAILABLE"
-                    .to_string(),
-            );
+                    .to_string()
+            } else {
+                decision.reason.clone()
+            });
             return;
         }
         if let Some(profile) = decision.selected {

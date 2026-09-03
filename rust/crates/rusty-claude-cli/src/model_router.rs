@@ -906,6 +906,46 @@ impl ModelRouter {
         }
     }
 
+    /// Binds an explicitly selected execution profile. Explicit selection is
+    /// still subject to enablement and privacy policy, but does not silently
+    /// turn into automatic capability-based selection or a model-only
+    /// fallback when the requested profile is below the estimated threshold.
+    #[must_use]
+    pub fn select_explicit(
+        pool: &ModelPool,
+        profile_id: &str,
+        role: ModelRole,
+        signals: TaskSignals,
+        policy: &RoutingPolicy,
+    ) -> RouteDecision {
+        let estimate = Self::estimate(role, signals, policy);
+        let mut rejections = Vec::new();
+        let selected = pool.profiles.iter().find_map(|profile| {
+            if profile.id != profile_id {
+                return None;
+            }
+            if !profile.enabled {
+                rejections.push(reject(profile, "disabled by user configuration"));
+                return None;
+            }
+            if !policy_allows(profile, policy) {
+                rejections.push(reject(profile, "ineligible under privacy policy"));
+                return None;
+            }
+            Some(profile.clone())
+        });
+        let reason = selected.as_ref().map_or_else(
+            || format!("Explicit execution profile {profile_id:?} is unavailable or ineligible."),
+            |profile| format!("Explicit execution profile selected: {}.", profile.id),
+        );
+        RouteDecision {
+            selected,
+            reason,
+            rejections,
+            estimate,
+        }
+    }
+
     #[must_use]
     pub fn route_with_calibration(
         pool: &ModelPool,
@@ -1362,6 +1402,39 @@ mod tests {
         );
         assert!(decision.selected.is_none());
         assert!(decision.reason.contains("No enabled"));
+    }
+
+    #[test]
+    fn explicit_profile_binding_preserves_low_capability_resource() {
+        let profile = profile("nano", PrivacyClass::Remote, 10, 1);
+        let decision = ModelRouter::select_explicit(
+            &ModelPool::one(profile),
+            "nano",
+            ModelRole::Writer,
+            signals(),
+            &RoutingPolicy::default(),
+        );
+        assert_eq!(
+            decision.selected.expect("explicit profile binds").id,
+            "nano"
+        );
+    }
+
+    #[test]
+    fn explicit_profile_binding_rejects_policy_ineligible_resource() {
+        let profile = profile("remote", PrivacyClass::Remote, 100, 1);
+        let decision = ModelRouter::select_explicit(
+            &ModelPool::one(profile),
+            "remote",
+            ModelRole::Writer,
+            signals(),
+            &RoutingPolicy {
+                allow_remote: false,
+                ..RoutingPolicy::default()
+            },
+        );
+        assert!(decision.selected.is_none());
+        assert!(decision.reason.contains("unavailable or ineligible"));
     }
 
     #[test]
