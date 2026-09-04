@@ -155,3 +155,9 @@ zero-base, client-integration, and preservation behavior. The fixture is
 deliberately separate from the canonical `config-threading` acceptance so the
 small lifecycle gate and the multi-file capability probe remain reproducible
 and independently selectable.
+
+It also contains the `event-ledger` fixture, which tests stateful behavior and
+atomic error handling. The task requires idempotent event IDs, duplicate-event
+no-ops, and retryable failed withdrawals across the event, ledger, and test
+surfaces. Its hidden oracle independently checks those behaviors without
+exposing its implementation to the model.

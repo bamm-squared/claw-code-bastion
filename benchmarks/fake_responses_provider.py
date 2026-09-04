@@ -149,6 +149,114 @@ fn client_uses_configured_retry_delays() {
 }
 """
 
+EVENT_LEDGER = """use std::collections::BTreeSet;
+
+use crate::event::Event;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum LedgerError {
+    InsufficientFunds { requested: u64, available: u64 },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    Applied,
+    Duplicate,
+}
+
+#[derive(Debug, Default)]
+pub struct Ledger {
+    balance: u64,
+    applied_ids: BTreeSet<u64>,
+}
+
+impl Ledger {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn balance(&self) -> u64 {
+        self.balance
+    }
+
+    pub fn apply(&mut self, event: Event) -> Result<ApplyOutcome, LedgerError> {
+        let event_id = event.id();
+        if self.applied_ids.contains(&event_id) {
+            return Ok(ApplyOutcome::Duplicate);
+        }
+
+        match event {
+            Event::Deposit { amount, .. } => {
+                self.balance += amount;
+            }
+            Event::Withdraw { amount, .. } => {
+                if amount > self.balance {
+                    return Err(LedgerError::InsufficientFunds {
+                        requested: amount,
+                        available: self.balance,
+                    });
+                }
+                self.balance -= amount;
+            }
+        }
+        self.applied_ids.insert(event_id);
+        Ok(ApplyOutcome::Applied)
+    }
+}
+"""
+
+EVENT_LEDGER_TESTS = """use claw_event_ledger_fixture::{
+    event::Event,
+    ledger::{ApplyOutcome, Ledger, LedgerError},
+};
+
+#[test]
+fn deposits_and_withdrawals_update_balance() {
+    let mut ledger = Ledger::new();
+    assert_eq!(
+        ledger.apply(Event::Deposit { id: 1, amount: 100 }),
+        Ok(ApplyOutcome::Applied)
+    );
+    assert_eq!(
+        ledger.apply(Event::Withdraw { id: 2, amount: 40 }),
+        Ok(ApplyOutcome::Applied)
+    );
+    assert_eq!(ledger.balance(), 60);
+}
+
+#[test]
+fn duplicate_event_does_not_change_balance() {
+    let mut ledger = Ledger::new();
+    ledger.apply(Event::Deposit { id: 1, amount: 100 }).unwrap();
+    assert_eq!(
+        ledger.apply(Event::Deposit { id: 1, amount: 100 }),
+        Ok(ApplyOutcome::Duplicate)
+    );
+    assert_eq!(ledger.balance(), 100);
+}
+
+#[test]
+fn failed_withdrawal_is_not_recorded() {
+    let mut ledger = Ledger::new();
+    let error = ledger
+        .apply(Event::Withdraw { id: 3, amount: 10 })
+        .unwrap_err();
+    assert_eq!(
+        error,
+        LedgerError::InsufficientFunds {
+            requested: 10,
+            available: 0,
+        }
+    );
+    ledger.apply(Event::Deposit { id: 4, amount: 10 }).unwrap();
+    assert_eq!(
+        ledger.apply(Event::Withdraw { id: 3, amount: 10 }),
+        Ok(ApplyOutcome::Applied)
+    );
+    assert_eq!(ledger.balance(), 0);
+}
+"""
+
 
 def actions_for(
     task,
@@ -184,6 +292,15 @@ def actions_for(
                     else RETRY_CLIENT_TESTS,
                 },
             ),
+        ]
+    if task == "event-ledger":
+        return [
+            ("read_file", {"path": "Cargo.toml"}),
+            ("read_file", {"path": "src/event.rs"}),
+            ("read_file", {"path": "src/ledger.rs"}),
+            ("read_file", {"path": "tests/ledger.rs"}),
+            ("write_file", {"path": "src/ledger.rs", "content": EVENT_LEDGER}),
+            ("write_file", {"path": "tests/ledger.rs", "content": EVENT_LEDGER_TESTS}),
         ]
     return [
         ("read_file", {"path": "src/config.rs"}),
@@ -435,7 +552,7 @@ def main():
     parser.add_argument("--port-file", type=Path)
     parser.add_argument("--ready-file", type=Path)
     parser.add_argument(
-        "--task", choices=["config-threading", "retry-policy"], default="config-threading"
+        "--task", choices=["config-threading", "retry-policy", "event-ledger"], default="config-threading"
     )
     parser.add_argument(
         "--rework-test",

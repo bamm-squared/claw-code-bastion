@@ -30,5 +30,33 @@
     "expected_change_scope": ["src/config.rs", "src/retry.rs", "tests/retry.rs", "tests/client.rs"],
     "timeout_seconds": 120,
     "max_agent_turns": 24
+  },
+  {
+    "id": "event-ledger",
+    "version": 1,
+    "category": "stateful-behavior",
+    "language": "rust",
+    "prompt": "Make Ledger event application idempotent and atomic. Track event IDs across successful applications. Applying an event ID more than once must return a Duplicate outcome without changing the balance. A withdrawal that fails for insufficient funds must preserve the existing error and must not record its event ID, so the same event can succeed later after a deposit. Successful deposits and withdrawals must record their IDs exactly once. Preserve existing balance and error behavior and update the visible tests.",
+    "fixture": {
+      "files": {
+        "Cargo.toml": "[package]\nname = \"claw_event_ledger_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+        "src/lib.rs": "pub mod event;\npub mod ledger;\n",
+        "src/event.rs": "#[derive(Clone, Debug, PartialEq, Eq)]\npub enum Event {\n    Deposit { id: u64, amount: u64 },\n    Withdraw { id: u64, amount: u64 },\n}\n\nimpl Event {\n    pub fn id(&self) -> u64 {\n        match self {\n            Self::Deposit { id, .. } | Self::Withdraw { id, .. } => *id,\n        }\n    }\n}\n",
+        "src/ledger.rs": "use crate::event::Event;\n\n#[derive(Debug, PartialEq, Eq)]\npub enum LedgerError {\n    InsufficientFunds { requested: u64, available: u64 },\n}\n\n#[derive(Debug, Default)]\npub struct Ledger {\n    balance: u64,\n}\n\nimpl Ledger {\n    pub fn new() -> Self {\n        Self::default()\n    }\n\n    pub fn balance(&self) -> u64 {\n        self.balance\n    }\n\n    pub fn apply(&mut self, event: Event) -> Result<(), LedgerError> {\n        match event {\n            Event::Deposit { amount, .. } => {\n                self.balance += amount;\n                Ok(())\n            }\n            Event::Withdraw { amount, .. } => {\n                if amount > self.balance {\n                    return Err(LedgerError::InsufficientFunds {\n                        requested: amount,\n                        available: self.balance,\n                    });\n                }\n                self.balance -= amount;\n                Ok(())\n            }\n        }\n    }\n}\n",
+        "tests/ledger.rs": "use claw_event_ledger_fixture::{\n    event::Event,\n    ledger::{Ledger, LedgerError},\n};\n\n#[test]\nfn deposits_and_withdrawals_update_balance() {\n    let mut ledger = Ledger::new();\n    ledger.apply(Event::Deposit { id: 1, amount: 100 }).unwrap();\n    ledger\n        .apply(Event::Withdraw { id: 2, amount: 40 })\n        .unwrap();\n    assert_eq!(ledger.balance(), 60);\n}\n\n#[test]\nfn insufficient_funds_preserves_error_and_balance() {\n    let mut ledger = Ledger::new();\n    let error = ledger\n        .apply(Event::Withdraw { id: 3, amount: 10 })\n        .unwrap_err();\n    assert_eq!(\n        error,\n        LedgerError::InsufficientFunds {\n            requested: 10,\n            available: 0,\n        }\n    );\n    assert_eq!(ledger.balance(), 0);\n}\n"
+      },
+      "mock_actions": [
+        {"kind": "write", "path": "src/ledger.rs", "content": "use std::collections::BTreeSet;\n\nuse crate::event::Event;\n\n#[derive(Debug, PartialEq, Eq)]\npub enum LedgerError {\n    InsufficientFunds { requested: u64, available: u64 },\n}\n\n#[derive(Debug, PartialEq, Eq)]\npub enum ApplyOutcome {\n    Applied,\n    Duplicate,\n}\n\n#[derive(Debug, Default)]\npub struct Ledger {\n    balance: u64,\n    applied_ids: BTreeSet<u64>,\n}\n\nimpl Ledger {\n    pub fn new() -> Self {\n        Self::default()\n    }\n\n    pub fn balance(&self) -> u64 {\n        self.balance\n    }\n\n    pub fn apply(&mut self, event: Event) -> Result<ApplyOutcome, LedgerError> {\n        let event_id = event.id();\n        if self.applied_ids.contains(&event_id) {\n            return Ok(ApplyOutcome::Duplicate);\n        }\n\n        match event {\n            Event::Deposit { amount, .. } => {\n                self.balance += amount;\n            }\n            Event::Withdraw { amount, .. } => {\n                if amount > self.balance {\n                    return Err(LedgerError::InsufficientFunds {\n                        requested: amount,\n                        available: self.balance,\n                    });\n                }\n                self.balance -= amount;\n            }\n        }\n        self.applied_ids.insert(event_id);\n        Ok(ApplyOutcome::Applied)\n    }\n}\n"},
+        {"kind": "write", "path": "tests/ledger.rs", "content": "use claw_event_ledger_fixture::{\n    event::Event,\n    ledger::{ApplyOutcome, Ledger, LedgerError},\n};\n\n#[test]\nfn deposits_and_withdrawals_update_balance() {\n    let mut ledger = Ledger::new();\n    assert_eq!(\n        ledger.apply(Event::Deposit { id: 1, amount: 100 }),\n        Ok(ApplyOutcome::Applied)\n    );\n    assert_eq!(\n        ledger.apply(Event::Withdraw { id: 2, amount: 40 }),\n        Ok(ApplyOutcome::Applied)\n    );\n    assert_eq!(ledger.balance(), 60);\n}\n\n#[test]\nfn duplicate_event_does_not_change_balance() {\n    let mut ledger = Ledger::new();\n    ledger.apply(Event::Deposit { id: 1, amount: 100 }).unwrap();\n    assert_eq!(\n        ledger.apply(Event::Deposit { id: 1, amount: 100 }),\n        Ok(ApplyOutcome::Duplicate)\n    );\n    assert_eq!(ledger.balance(), 100);\n}\n\n#[test]\nfn failed_withdrawal_is_not_recorded() {\n    let mut ledger = Ledger::new();\n    let error = ledger\n        .apply(Event::Withdraw { id: 3, amount: 10 })\n        .unwrap_err();\n    assert_eq!(\n        error,\n        LedgerError::InsufficientFunds {\n            requested: 10,\n            available: 0,\n        }\n    );\n    ledger.apply(Event::Deposit { id: 4, amount: 10 }).unwrap();\n    assert_eq!(\n        ledger.apply(Event::Withdraw { id: 3, amount: 10 }),\n        Ok(ApplyOutcome::Applied)\n    );\n    assert_eq!(ledger.balance(), 0);\n}\n"}
+      ]
+    },
+    "hidden_oracle": {
+      "expected_files": {},
+      "forbidden_paths": ["hidden.txt"],
+      "oracle_script": "benchmarks/oracles/idempotent_event.py"
+    },
+    "expected_change_scope": ["src/ledger.rs", "tests/ledger.rs"],
+    "timeout_seconds": 120,
+    "max_agent_turns": 24
   }
 ]
