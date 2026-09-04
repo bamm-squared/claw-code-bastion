@@ -612,7 +612,10 @@ fn run_production_one(
     let config = temp.path().join("config");
     let cache = temp.path().join("cache");
     let state = temp.path().join("state");
-    let telemetry = temp.path().join("production-telemetry.json");
+    let telemetry = std::env::var_os("CLAW_BENCH_TELEMETRY").map_or_else(
+        || temp.path().join("production-telemetry.json"),
+        PathBuf::from,
+    );
     let podman_data_home = std::env::var_os("XDG_DATA_HOME").unwrap_or_else(|| {
         std::env::var_os("HOME")
             .map_or_else(|| PathBuf::from("/home"), PathBuf::from)
@@ -622,6 +625,9 @@ fn run_production_one(
     });
     for directory in [&root, &home, &config, &cache, &state] {
         fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    }
+    if let Some(parent) = telemetry.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     for (path, content) in &task.fixture.files {
         let destination = root.join(path);
@@ -725,8 +731,32 @@ fn run_production_one(
         .map_err(|error| format!("production CLI failed to start: {error}"))?;
     let mut interactive_input = child.stdin.take();
     let mut apply_sent = false;
+    let permission_response = std::env::var("CLAW_BENCH_PERMISSION_RESPONSE")
+        .ok()
+        .and_then(
+            |response| match response.trim().to_ascii_lowercase().as_str() {
+                "allow" | "yes" | "y" => Some("y\n"),
+                "deny" | "no" | "n" => Some("n\n"),
+                _ => None,
+            },
+        );
+    let mut permission_response_sent = false;
     let deadline = Instant::now() + Duration::from_secs(effective_task_timeout);
     let output = loop {
+        if interactive
+            && !permission_response_sent
+            && permission_response.is_some()
+            && telemetry_has_event(&telemetry, "permission_requested")
+        {
+            if let (Some(input), Some(response)) = (interactive_input.as_mut(), permission_response)
+            {
+                input
+                    .write_all(response.as_bytes())
+                    .and_then(|()| input.flush())
+                    .map_err(|error| format!("failed to send permission decision: {error}"))?;
+                permission_response_sent = true;
+            }
+        }
         if interactive && !apply_sent && telemetry_has_event(&telemetry, "review_ready") {
             if let Some(input) = interactive_input.as_mut() {
                 input
@@ -784,6 +814,7 @@ fn run_production_one(
         std::thread::sleep(Duration::from_millis(25));
     };
     if !output.status.success() {
+        finalize_telemetry_status(&telemetry, "failed");
         return Err(with_partial_telemetry(
             &format!(
                 "production task {} exited with {}; stderr: {}",
@@ -927,30 +958,44 @@ fn production_failure_record(
 }
 
 fn with_partial_telemetry(message: &str, path: &Path) -> String {
-    let Some(text) = fs::read_to_string(path).ok() else {
+    let Some(mut value) = read_telemetry(path) else {
         return message.to_string();
     };
-    let Ok(value) = serde_json::from_str::<Value>(&text) else {
-        return message.to_string();
-    };
+    finalize_value_status(&mut value, "failed");
+    let _ = fs::write(path, serde_json::to_vec(&value).unwrap_or_default());
     format!("{message}{PARTIAL_TELEMETRY_MARKER}{value}")
 }
 
 fn with_timeout_telemetry(message: &str, path: &Path) -> String {
-    let Some(text) = fs::read_to_string(path).ok() else {
-        return message.to_string();
-    };
-    let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
+    let Some(mut value) = read_telemetry(path) else {
         return with_partial_telemetry(message, path);
     };
+    finalize_value_status(&mut value, "timeout");
+    let _ = fs::write(path, serde_json::to_vec(&value).unwrap_or_default());
+    format!("{message}{PARTIAL_TELEMETRY_MARKER}{value}")
+}
+
+fn read_telemetry(path: &Path) -> Option<Value> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+}
+
+fn finalize_value_status(value: &mut Value, status: &str) {
     if let Some(object) = value.as_object_mut() {
         object.insert(
             "terminal_status".to_string(),
-            Value::String("timeout".to_string()),
+            Value::String(status.to_string()),
         );
-        let _ = fs::write(path, serde_json::to_vec(&value).unwrap_or_default());
     }
-    format!("{message}{PARTIAL_TELEMETRY_MARKER}{value}")
+}
+
+fn finalize_telemetry_status(path: &Path, status: &str) {
+    let Some(mut value) = read_telemetry(path) else {
+        return;
+    };
+    finalize_value_status(&mut value, status);
+    let _ = fs::write(path, serde_json::to_vec(&value).unwrap_or_default());
 }
 
 fn first_telemetry_profile(telemetry: &Value) -> Option<String> {
@@ -1666,5 +1711,21 @@ mod tests {
         assert_eq!(telemetry.unwrap()["terminal_status"], "timeout");
         let persisted = fs::read_to_string(path).unwrap();
         assert!(persisted.contains(r#""terminal_status":"timeout""#));
+    }
+
+    #[test]
+    fn failure_finalizes_partial_telemetry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("telemetry.json");
+        fs::write(
+            &path,
+            r#"{"terminal_status":"in_progress","provider_calls":1}"#,
+        )
+        .unwrap();
+        let error = with_partial_telemetry("failed", &path);
+        let (_, telemetry) = split_partial_telemetry(&error);
+        assert_eq!(telemetry.unwrap()["terminal_status"], "failed");
+        let persisted = fs::read_to_string(path).unwrap();
+        assert!(persisted.contains(r#""terminal_status":"failed""#));
     }
 }

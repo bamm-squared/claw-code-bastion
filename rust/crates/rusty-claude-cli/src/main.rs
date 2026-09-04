@@ -9656,6 +9656,7 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
         &mut self,
         request: &runtime::PermissionRequest,
     ) -> runtime::PermissionPromptDecision {
+        benchmark_telemetry::lifecycle_event("permission_requested");
         println!();
         println!("Permission approval required");
         println!("  Tool             {}", request.tool_name);
@@ -9669,7 +9670,7 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
         let _ = io::stdout().flush();
 
         let mut response = String::new();
-        match io::stdin().read_line(&mut response) {
+        let decision = match io::stdin().read_line(&mut response) {
             Ok(_) => {
                 let normalized = response.trim().to_ascii_lowercase();
                 if matches!(normalized.as_str(), "y" | "yes") {
@@ -9686,7 +9687,11 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
             Err(error) => runtime::PermissionPromptDecision::Deny {
                 reason: format!("permission approval failed: {error}"),
             },
+        };
+        if matches!(decision, runtime::PermissionPromptDecision::Deny { .. }) {
+            benchmark_telemetry::lifecycle_event("permission_denied");
         }
+        decision
     }
 }
 
