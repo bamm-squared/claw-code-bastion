@@ -1,0 +1,34 @@
+[
+  {
+    "id": "retry-policy",
+    "version": 1,
+    "category": "multi-file",
+    "language": "rust",
+    "prompt": "Add a configurable ceiling to exponential retry delays. Introduce max_delay_ms on RetryConfig with a default of 500. Ensure retry calculations clamp each delay to this cap while retaining exponential growth below the cap and zero-base behavior. Ensure Client uses the same capped retry schedule. Update the relevant tests for default, capped, and zero-base behavior. Preserve max_attempts and unrelated files and behavior.",
+    "fixture": {
+      "files": {
+        "Cargo.toml": "[package]\nname = \"claw_retry_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+        "src/lib.rs": "pub mod client;\npub mod config;\npub mod retry;\n",
+        "src/config.rs": "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub struct RetryConfig {\n    pub max_attempts: u32,\n    pub base_delay_ms: u64,\n}\n\nimpl Default for RetryConfig {\n    fn default() -> Self {\n        Self {\n            max_attempts: 3,\n            base_delay_ms: 100,\n        }\n    }\n}\n",
+        "src/retry.rs": "use crate::config::RetryConfig;\n\npub fn backoff_delay_ms(config: &RetryConfig, retry_index: u32) -> u64 {\n    let multiplier = 1u64.checked_shl(retry_index).unwrap_or(u64::MAX);\n    config.base_delay_ms.saturating_mul(multiplier)\n}\n\npub fn retry_delays(config: &RetryConfig, retry_count: u32) -> Vec<u64> {\n    (0..retry_count)\n        .map(|index| backoff_delay_ms(config, index))\n        .collect()\n}\n",
+        "src/client.rs": "use crate::{config::RetryConfig, retry};\n\npub struct Client {\n    config: RetryConfig,\n}\n\nimpl Client {\n    pub fn new(config: RetryConfig) -> Self {\n        Self { config }\n    }\n\n    pub fn retry_delays(&self, retry_count: u32) -> Vec<u64> {\n        retry::retry_delays(&self.config, retry_count)\n    }\n}\n",
+        "tests/retry.rs": "use claw_retry_fixture::{config::RetryConfig, retry};\n\n#[test]\nfn exponential_delays_grow() {\n    let config = RetryConfig::default();\n    assert_eq!(retry::retry_delays(&config, 4), vec![100, 200, 400, 800]);\n}\n\n#[test]\nfn preserves_attempt_limit() {\n    assert_eq!(RetryConfig::default().max_attempts, 3);\n}\n",
+        "tests/client.rs": "use claw_retry_fixture::{client::Client, config::RetryConfig};\n\n#[test]\nfn client_uses_configured_retry_delays() {\n    let client = Client::new(RetryConfig {\n        max_attempts: 4,\n        base_delay_ms: 50,\n    });\n    assert_eq!(client.retry_delays(3), vec![50, 100, 200]);\n}\n"
+      },
+      "mock_actions": [
+        {"kind": "write", "path": "src/config.rs", "content": "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub struct RetryConfig {\n    pub max_attempts: u32,\n    pub base_delay_ms: u64,\n    pub max_delay_ms: u64,\n}\n\nimpl Default for RetryConfig {\n    fn default() -> Self {\n        Self {\n            max_attempts: 3,\n            base_delay_ms: 100,\n            max_delay_ms: 500,\n        }\n    }\n}\n"},
+        {"kind": "write", "path": "src/retry.rs", "content": "use crate::config::RetryConfig;\n\npub fn backoff_delay_ms(config: &RetryConfig, retry_index: u32) -> u64 {\n    let multiplier = 1u64.checked_shl(retry_index).unwrap_or(u64::MAX);\n    config\n        .base_delay_ms\n        .saturating_mul(multiplier)\n        .min(config.max_delay_ms)\n}\n\npub fn retry_delays(config: &RetryConfig, retry_count: u32) -> Vec<u64> {\n    (0..retry_count)\n        .map(|index| backoff_delay_ms(config, index))\n        .collect()\n}\n"},
+        {"kind": "write", "path": "tests/retry.rs", "content": "use claw_retry_fixture::{config::RetryConfig, retry};\n\n#[test]\nfn default_policy_preserves_attempts_and_adds_a_cap() {\n    let config = RetryConfig::default();\n    assert_eq!(config.max_attempts, 3);\n    assert_eq!(config.max_delay_ms, 500);\n    assert_eq!(\n        retry::retry_delays(&config, 5),\n        vec![100, 200, 400, 500, 500]\n    );\n}\n\n#[test]\nfn custom_policy_caps_exponential_growth() {\n    let config = RetryConfig {\n        max_attempts: 5,\n        base_delay_ms: 100,\n        max_delay_ms: 250,\n    };\n    assert_eq!(retry::retry_delays(&config, 4), vec![100, 200, 250, 250]);\n}\n\n#[test]\nfn zero_base_delay_remains_zero() {\n    let config = RetryConfig {\n        max_attempts: 5,\n        base_delay_ms: 0,\n        max_delay_ms: 250,\n    };\n    assert_eq!(retry::retry_delays(&config, 4), vec![0, 0, 0, 0]);\n}\n"},
+        {"kind": "write", "path": "tests/client.rs", "content": "use claw_retry_fixture::{client::Client, config::RetryConfig};\n\n#[test]\nfn client_uses_the_capped_policy() {\n    let client = Client::new(RetryConfig {\n        max_attempts: 5,\n        base_delay_ms: 50,\n        max_delay_ms: 125,\n    });\n    assert_eq!(client.retry_delays(4), vec![50, 100, 125, 125]);\n}\n"}
+      ]
+    },
+    "hidden_oracle": {
+      "expected_files": {},
+      "forbidden_paths": ["hidden.txt"],
+      "oracle_script": "benchmarks/oracles/retry_policy.py"
+    },
+    "expected_change_scope": ["src/config.rs", "src/retry.rs", "tests/retry.rs", "tests/client.rs"],
+    "timeout_seconds": 120,
+    "max_agent_turns": 24
+  }
+]

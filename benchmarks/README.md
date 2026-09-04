@@ -69,9 +69,11 @@ preflight without launching the child process.
 ## Local production-style provider
 
 `fake_responses_provider.py` is a dependency-free deterministic Responses
-server for the `config-threading` task. It returns explorer findings, the
-writer's read/write/bash tool sequence, and a deterministic evaluator result;
-all filesystem changes still occur through the real Claw tool executor.
+server for the repository-owned acceptance fixtures. It returns explorer
+findings, the writer's read/write tool sequence, and a deterministic evaluator
+result; all filesystem changes still occur through the real Claw tool
+executor. Select the maintained multi-file retry-policy fixture with
+`--task retry-policy` when exercising that task directly.
 
 Run it directly for protocol debugging with:
 
@@ -142,3 +144,14 @@ The live command is not called by tests or CI, and its profile manifest,
 credential source, task count, images, and artifact paths are visible in the
 command before execution. Never place credentials in settings, manifests, or
 artifacts.
+
+## Realistic multi-file capability task
+
+`tasks.realistic.v1.json` contains the `retry-policy` fixture, which requires a
+bounded exponential retry policy to be added across configuration, retry
+calculation, client integration, and visible tests. Its hidden oracle runs an
+independent Rust test against the candidate and checks default, custom-cap,
+zero-base, client-integration, and preservation behavior. The fixture is
+deliberately separate from the canonical `config-threading` acceptance so the
+small lifecycle gate and the multi-file capability probe remain reproducible
+and independently selectable.

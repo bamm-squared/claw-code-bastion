@@ -69,9 +69,12 @@ pub enum MockAction {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HiddenOracle {
+    #[serde(default)]
     pub expected_files: BTreeMap<String, String>,
     #[serde(default)]
     pub forbidden_paths: Vec<String>,
+    #[serde(default)]
+    pub oracle_script: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -745,13 +748,12 @@ fn run_production_one(
                 _ => None,
             },
         );
-    let mut permission_response_sent = false;
+    let mut permission_responses_sent = 0;
     let deadline = Instant::now() + Duration::from_secs(effective_task_timeout);
     let output = loop {
         if interactive
-            && !permission_response_sent
             && permission_response.is_some()
-            && telemetry_has_event(&telemetry, "permission_requested")
+            && telemetry_event_count(&telemetry, "permission_requested") > permission_responses_sent
         {
             if let (Some(input), Some(response)) = (interactive_input.as_mut(), permission_response)
             {
@@ -759,7 +761,7 @@ fn run_production_one(
                     .write_all(response.as_bytes())
                     .and_then(|()| input.flush())
                     .map_err(|error| format!("failed to send permission decision: {error}"))?;
-                permission_response_sent = true;
+                permission_responses_sent += 1;
             }
         }
         if interactive && !apply_sent && telemetry_has_event(&telemetry, "review_ready") {
@@ -933,12 +935,21 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn telemetry_has_event(path: &Path, event: &str) -> bool {
+    telemetry_event_count(path, event) > 0
+}
+
+fn telemetry_event_count(path: &Path, event: &str) -> usize {
     fs::read_to_string(path)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .and_then(|value| value.get("lifecycle_events").cloned())
         .and_then(|events| events.as_array().cloned())
-        .is_some_and(|events| events.iter().any(|value| value.as_str() == Some(event)))
+        .map_or(0, |events| {
+            events
+                .iter()
+                .filter(|value| value.as_str() == Some(event))
+                .count()
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1492,9 +1503,48 @@ fn evaluate_oracle(root: &Path, task: &BenchmarkTask) -> Result<bool, String> {
             return Ok(false);
         }
     }
-    let mut actual = BTreeMap::new();
-    collect_files(root, root, &mut actual)?;
-    Ok(actual == task.hidden_oracle.expected_files)
+    if !task.hidden_oracle.expected_files.is_empty() {
+        let mut actual = BTreeMap::new();
+        collect_files(root, root, &mut actual)?;
+        if actual != task.hidden_oracle.expected_files {
+            return Ok(false);
+        }
+    }
+    if let Some(script) = &task.hidden_oracle.oracle_script {
+        let script_path = Path::new(script);
+        if script_path.is_absolute()
+            || script_path
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+            || !script_path.starts_with("benchmarks/oracles")
+        {
+            return Err("hidden oracle script must be a repository benchmark oracle".to_string());
+        }
+        let repository_root = std::env::var_os("CLAW_BENCH_REPO_ROOT")
+            .map(PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or_else(|| "hidden oracle repository root is unavailable".to_string())?;
+        let script_path = repository_root.join(script_path);
+        if !script_path.is_file() {
+            return Err(format!(
+                "hidden oracle script is unavailable: {}",
+                script_path.display()
+            ));
+        }
+        let status = Command::new("python3")
+            .arg(&script_path)
+            .arg(root)
+            .current_dir(&repository_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| format!("hidden oracle failed to start: {error}"))?;
+        if !status.success() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn collect_files(
@@ -1825,6 +1875,7 @@ mod tests {
             hidden_oracle: HiddenOracle {
                 expected_files: BTreeMap::new(),
                 forbidden_paths: Vec::new(),
+                oracle_script: None,
             },
             expected_change_scope: Vec::new(),
             forbidden_changes: Vec::new(),
@@ -1995,6 +2046,7 @@ mod tests {
             hidden_oracle: HiddenOracle {
                 expected_files: BTreeMap::new(),
                 forbidden_paths: vec![],
+                oracle_script: None,
             },
             expected_change_scope: vec![],
             forbidden_changes: vec![],
@@ -2023,6 +2075,7 @@ mod tests {
             hidden_oracle: HiddenOracle {
                 expected_files: BTreeMap::from([(String::from("answer.txt"), String::from("ok"))]),
                 forbidden_paths: vec![],
+                oracle_script: None,
             },
             expected_change_scope: vec![],
             forbidden_changes: vec![],
@@ -2104,6 +2157,19 @@ mod tests {
         assert_eq!(telemetry.unwrap()["terminal_status"], "timeout");
         let persisted = fs::read_to_string(path).unwrap();
         assert!(persisted.contains(r#""terminal_status":"timeout""#));
+    }
+
+    #[test]
+    fn telemetry_counts_repeated_permission_requests() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("telemetry.json");
+        fs::write(
+            &path,
+            r#"{"lifecycle_events":["permission_requested","permission_denied","permission_requested"]}"#,
+        )
+        .unwrap();
+        assert_eq!(telemetry_event_count(&path, "permission_requested"), 2);
+        assert!(telemetry_has_event(&path, "permission_denied"));
     }
 
     #[test]

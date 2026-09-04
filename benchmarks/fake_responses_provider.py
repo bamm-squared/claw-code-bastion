@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic local Responses provider for the config-threading task.
+"""Deterministic local Responses provider for benchmark fixtures.
 
 This server only returns model responses. Candidate and canonical files are
 changed by the normal Claw tool executor, never by this process.
@@ -37,17 +37,118 @@ fn rejects_values_above_limit() {
 """
 
 
-def tool_for(index):
+RETRY_CONFIG = """#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetryConfig {
+    pub max_attempts: u32,
+    pub base_delay_ms: u64,
+    pub max_delay_ms: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            base_delay_ms: 100,
+            max_delay_ms: 500,
+        }
+    }
+}
+"""
+
+RETRY = """use crate::config::RetryConfig;
+
+pub fn backoff_delay_ms(config: &RetryConfig, retry_index: u32) -> u64 {
+    let multiplier = 1u64.checked_shl(retry_index).unwrap_or(u64::MAX);
+    config
+        .base_delay_ms
+        .saturating_mul(multiplier)
+        .min(config.max_delay_ms)
+}
+
+pub fn retry_delays(config: &RetryConfig, retry_count: u32) -> Vec<u64> {
+    (0..retry_count)
+        .map(|index| backoff_delay_ms(config, index))
+        .collect()
+}
+"""
+
+RETRY_TESTS = """use claw_retry_fixture::{config::RetryConfig, retry};
+
+#[test]
+fn default_policy_preserves_attempts_and_adds_a_cap() {
+    let config = RetryConfig::default();
+    assert_eq!(config.max_attempts, 3);
+    assert_eq!(config.max_delay_ms, 500);
+    assert_eq!(
+        retry::retry_delays(&config, 5),
+        vec![100, 200, 400, 500, 500]
+    );
+}
+
+#[test]
+fn custom_policy_caps_exponential_growth() {
+    let config = RetryConfig {
+        max_attempts: 5,
+        base_delay_ms: 100,
+        max_delay_ms: 250,
+    };
+    assert_eq!(retry::retry_delays(&config, 4), vec![100, 200, 250, 250]);
+}
+
+#[test]
+fn zero_base_delay_remains_zero() {
+    let config = RetryConfig {
+        max_attempts: 5,
+        base_delay_ms: 0,
+        max_delay_ms: 250,
+    };
+    assert_eq!(retry::retry_delays(&config, 4), vec![0, 0, 0, 0]);
+}
+"""
+
+RETRY_CLIENT_TESTS = """use claw_retry_fixture::{client::Client, config::RetryConfig};
+
+#[test]
+fn client_uses_the_capped_policy() {
+    let client = Client::new(RetryConfig {
+        max_attempts: 5,
+        base_delay_ms: 50,
+        max_delay_ms: 125,
+    });
+    assert_eq!(client.retry_delays(4), vec![50, 100, 125, 125]);
+}
+"""
+
+
+def actions_for(task):
+    if task == "retry-policy":
+        return [
+            ("read_file", {"path": "Cargo.toml"}),
+            ("read_file", {"path": "src/config.rs"}),
+            ("read_file", {"path": "src/retry.rs"}),
+            ("read_file", {"path": "src/client.rs"}),
+            ("read_file", {"path": "tests/retry.rs"}),
+            ("read_file", {"path": "tests/client.rs"}),
+            ("write_file", {"path": "src/config.rs", "content": RETRY_CONFIG}),
+            ("write_file", {"path": "src/retry.rs", "content": RETRY}),
+            ("write_file", {"path": "tests/retry.rs", "content": RETRY_TESTS}),
+            ("write_file", {"path": "tests/client.rs", "content": RETRY_CLIENT_TESTS}),
+        ]
     return [
         ("read_file", {"path": "src/config.rs"}),
         ("read_file", {"path": "tests/config.rs"}),
         ("write_file", {"path": "src/config.rs", "content": CONFIG}),
         ("write_file", {"path": "tests/config.rs", "content": TESTS}),
         ("bash", {"command": "cargo test"}),
-    ][index]
+        ("bash", {"command": "cargo test"}),
+    ]
 
 
-def response(number, stream):
+def tool_for(index, task):
+    return actions_for(task)[index]
+
+
+def response(number, stream, task):
     response_id = f"local-{number}"
     if number <= 3:
         finding = json.dumps(
@@ -100,8 +201,8 @@ def response(number, stream):
         }
 
     index = number - 4
-    if index < 5:
-        name, arguments = tool_for(index)
+    if index < len(actions_for(task)):
+        name, arguments = tool_for(index, task)
         item_id = f"item-{number}"
         call_id = f"call-{number}"
         encoded = json.dumps(arguments, separators=(",", ":"))
@@ -169,6 +270,7 @@ def response(number, stream):
 
 class ResponsesHandler(BaseHTTPRequestHandler):
     request_number = 0
+    task = "config-threading"
 
     def log_message(self, format_string, *args):
         print(f"fake-responses request={self.request_number} path={self.path}", flush=True)
@@ -178,7 +280,7 @@ class ResponsesHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("content-length", "0"))
         request = json.loads(self.rfile.read(length))
         stream = bool(request.get("stream", True))
-        payload = response(ResponsesHandler.request_number, stream)
+        payload = response(ResponsesHandler.request_number, stream, ResponsesHandler.task)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream" if stream else "application/json")
         self.send_header("x-request-id", f"local-req-{ResponsesHandler.request_number}")
@@ -200,7 +302,11 @@ def main():
     parser.add_argument("--port", type=int, default=18766)
     parser.add_argument("--port-file", type=Path)
     parser.add_argument("--ready-file", type=Path)
+    parser.add_argument(
+        "--task", choices=["config-threading", "retry-policy"], default="config-threading"
+    )
     args = parser.parse_args()
+    ResponsesHandler.task = args.task
     server = HTTPServer((args.host, args.port), ResponsesHandler)
     if args.port_file:
         args.port_file.write_text(str(server.server_address[1]) + "\n")
