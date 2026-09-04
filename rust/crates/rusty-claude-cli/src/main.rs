@@ -5144,6 +5144,7 @@ impl LiveCli {
             )
         };
         self.last_routing_explanation = Some(decision.reason.clone());
+        record_writer_routing(&decision);
         if decision.selected.is_none() {
             self.rework_blocked = Some(if self.escalation_requested {
                 "REWORK REQUIRES STRONGER MODEL; NO ELIGIBLE CONFIGURED PROFILE AVAILABLE"
@@ -5425,6 +5426,11 @@ impl LiveCli {
             return;
         };
         self.task_plan.update(input, Some(&repository_context.text));
+        self.task_plan.set_repository_scope(
+            &repository_context.selected_files,
+            &repository_context.seed_files,
+            &repository_context.surface_guidance,
+        );
         let signals = routing_signals(&self.task_plan);
         let questions = exploration::questions_for(signals);
         orchestration_trace(format!("exploration_decision jobs={}", questions.len()));
@@ -5510,6 +5516,13 @@ impl LiveCli {
             .map(|selection| selection.text.as_str());
         if !is_rework {
             self.task_plan.update(task_input, repository_text);
+            if let Some(selection) = &repository_context {
+                self.task_plan.set_repository_scope(
+                    &selection.selected_files,
+                    &selection.seed_files,
+                    &selection.surface_guidance,
+                );
+            }
         }
         let plan_text = self.task_plan.render();
         let pending_rework = self.pending_rework.take();
@@ -7398,22 +7411,60 @@ fn set_provider_telemetry_context(role: &str, profile: &model_router::ModelProfi
     );
 }
 
+fn record_writer_routing(decision: &model_router::RouteDecision) {
+    benchmark_telemetry::writer_routing(
+        decision
+            .selected
+            .as_ref()
+            .map(|profile| profile.id.as_str()),
+        &decision.reason,
+        decision
+            .rejections
+            .iter()
+            .map(|rejection| benchmark_telemetry::RoutingRejection {
+                profile_id: rejection.profile_id.clone(),
+                reason: rejection.reason.clone(),
+            })
+            .collect(),
+        benchmark_telemetry::RoutingEstimate {
+            coding: decision.estimate.requirement.coding,
+            reasoning: decision.estimate.requirement.reasoning,
+            agent_tool_use: decision.estimate.requirement.agent_tool_use,
+            planning: decision.estimate.requirement.planning,
+            evaluation: decision.estimate.requirement.evaluation,
+            context_window: decision.estimate.requirement.context_window,
+            safety_margin: decision.estimate.safety_margin,
+            ambiguity: decision.estimate.rationale.ambiguity,
+            scope: decision.estimate.rationale.scope,
+            risk: decision.estimate.rationale.risk,
+            unresolved: decision.estimate.rationale.unresolved,
+        },
+    );
+}
+
 fn routing_signals(plan: &task_plan::TaskPlan) -> model_router::TaskSignals {
     let request = plan.original_request.to_ascii_lowercase();
+    let scope_files = if plan.primary_repository_files.is_empty() {
+        &plan.repository_files
+    } else {
+        &plan.primary_repository_files
+    };
+    let impacted_modules = if scope_files.is_empty() {
+        plan.known_impact
+            .iter()
+            .filter(|line| line.starts_with("file:"))
+            .count()
+    } else {
+        routing_scope_count(scope_files)
+    };
     model_router::TaskSignals {
         ambiguity: u8::try_from(plan.open_questions.len().min(u8::MAX as usize))
             .unwrap_or(u8::MAX)
             .saturating_mul(20)
             .min(100),
-        impacted_modules: u8::try_from(plan.known_impact.len().min(u8::MAX as usize))
+        impacted_modules: u8::try_from(impacted_modules.min(u8::MAX as usize)).unwrap_or(u8::MAX),
+        dependency_depth: u8::try_from(impacted_modules.saturating_sub(1).min(u8::MAX as usize))
             .unwrap_or(u8::MAX),
-        dependency_depth: u8::try_from(
-            plan.known_impact
-                .len()
-                .saturating_sub(1)
-                .min(u8::MAX as usize),
-        )
-        .unwrap_or(u8::MAX),
         security_sensitive: ["security", "privacy", "credential", "secret", "permission"]
             .iter()
             .any(|term| request.contains(term)),
@@ -7428,6 +7479,29 @@ fn routing_signals(plan: &task_plan::TaskPlan) -> model_router::TaskSignals {
         context_window: 8_192,
         ..model_router::TaskSignals::default()
     }
+}
+
+fn routing_scope_count(paths: &[String]) -> usize {
+    let roots = paths
+        .iter()
+        .map(|path| {
+            let components = path.split('/').collect::<Vec<_>>();
+            components
+                .iter()
+                .position(|component| *component == "src")
+                .map_or_else(
+                    || components.first().copied().unwrap_or(".").to_string(),
+                    |index| {
+                        if index == 0 {
+                            "src".to_string()
+                        } else {
+                            components[..index].join("/")
+                        }
+                    },
+                )
+        })
+        .collect::<BTreeSet<_>>();
+    roots.len()
 }
 
 fn build_repository_context(
@@ -7458,7 +7532,7 @@ fn build_repository_context(
         selection.seeds.len(),
         !selection.seeds.is_empty(),
     );
-    (!selection.seeds.is_empty()).then_some(selection)
+    (!selection.seeds.is_empty() || !selection.surface_guidance.is_empty()).then_some(selection)
 }
 
 fn attachment_image_block(attachment: &attachments::TaskAttachment) -> Option<ContentBlock> {

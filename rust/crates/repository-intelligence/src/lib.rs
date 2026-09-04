@@ -665,6 +665,9 @@ pub struct RepositoryGraph {
     pub edges: Vec<GraphEdge>,
     pub facts: BTreeMap<String, FileFactPack>,
     pub project_facts: BTreeMap<String, ProjectFact>,
+    /// Bounded guidance extracted from repository-maintained documentation.
+    /// These are advisory signals, not authoritative proof of ownership.
+    pub repository_guidance: Vec<String>,
 }
 
 impl RepositoryGraph {
@@ -1301,6 +1304,57 @@ fn project_facts(root: &Path) -> std::io::Result<Vec<ProjectFact>> {
     Ok(facts)
 }
 
+const GUIDANCE_FILES: &[&str] = &[
+    "README.md",
+    "CLAUDE.md",
+    "CONTRIBUTING.md",
+    "ARCHITECTURE.md",
+];
+const GUIDANCE_TERMS: &[&str] = &[
+    "canonical",
+    "primary",
+    "active",
+    "legacy",
+    "mirror",
+    "reference",
+    "port",
+];
+const MAX_REPOSITORY_GUIDANCE: usize = 8;
+const MAX_GUIDANCE_LINE_BYTES: usize = 240;
+
+fn repository_guidance(root: &Path) -> Vec<String> {
+    let mut guidance = Vec::new();
+    for file in GUIDANCE_FILES {
+        let path = root.join(file);
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_MANIFEST_BYTES || bytes.contains(&0)
+        {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        for line in text.lines() {
+            let trimmed = line.trim();
+            let lower = trimmed.to_ascii_lowercase();
+            if trimmed.is_empty() || !GUIDANCE_TERMS.iter().any(|term| lower.contains(term)) {
+                continue;
+            }
+            let bounded = trimmed
+                .chars()
+                .take(MAX_GUIDANCE_LINE_BYTES)
+                .collect::<String>();
+            guidance.push(format!("{file}: {bounded}"));
+            if guidance.len() == MAX_REPOSITORY_GUIDANCE {
+                return guidance;
+            }
+        }
+    }
+    guidance
+}
+
 fn normalize_project_path(path: &Path) -> String {
     let mut parts = Vec::new();
     for component in path.components() {
@@ -1436,6 +1490,7 @@ impl RepositoryIndex {
         for fact in project_facts(root)? {
             graph.add_project_fact(fact);
         }
+        graph.repository_guidance = repository_guidance(root);
         graph.enrich_semantics();
         graph.finish();
         let (nodes, edges) = graph.statistics();
@@ -1592,10 +1647,86 @@ pub struct ImpactResult {
 pub struct ContextSelection {
     pub text: String,
     pub seeds: Vec<String>,
+    pub seed_files: Vec<String>,
     pub selected_files: Vec<String>,
+    pub surface_guidance: Vec<String>,
     pub selected_nodes: usize,
     pub considered_edges: usize,
     pub elapsed_ms: u128,
+}
+
+fn implementation_surface_guidance(
+    graph: &RepositoryGraph,
+    selected_files: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut guidance = graph
+        .repository_guidance
+        .iter()
+        .map(|line| format!("repository guidance: {line}"))
+        .collect::<Vec<_>>();
+    for fact in graph.project_facts.values() {
+        let relevant = selected_files.iter().any(|path| {
+            path == &fact.manifest_path
+                || path == &fact.package_root
+                || path.starts_with(&format!("{}/", fact.package_root))
+        });
+        if relevant {
+            guidance.push(format!(
+                "manifest-backed project: {} {} package={} root={}",
+                fact.ecosystem, fact.manifest_path, fact.package_name, fact.package_root
+            ));
+        }
+        if guidance.len() == MAX_REPOSITORY_GUIDANCE {
+            break;
+        }
+    }
+    guidance.truncate(MAX_REPOSITORY_GUIDANCE);
+    guidance
+}
+
+#[cfg(test)]
+mod surface_tests {
+    use super::*;
+
+    #[test]
+    fn context_exposes_document_and_manifest_surface_evidence() {
+        let dir = std::env::temp_dir().join(format!("ri-surface-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("rust/src")).unwrap();
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("README.md"),
+            "The canonical implementation lives in rust/.\nThe src/ tree is a legacy reference mirror.\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("rust/Cargo.toml"),
+            "[package]\nname = \"product\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        fs::write(dir.join("rust/src/ask.rs"), "pub fn ask() {}\n").unwrap();
+        fs::write(dir.join("src/ask.py"), "def ask(): pass\n").unwrap();
+
+        let output = RepositoryIndex::build(&dir, None, AnalysisConfig::default(), true).unwrap();
+        let selection = context_for_task(
+            &output.graph,
+            "Implement the Rust ask behavior",
+            48,
+            16 * 1024,
+        );
+
+        assert!(selection
+            .surface_guidance
+            .iter()
+            .any(|line| line.contains("canonical")));
+        assert!(selection
+            .surface_guidance
+            .iter()
+            .any(|line| line.contains("manifest-backed project")));
+        assert!(selection.text.contains("Implementation surface guidance"));
+        assert!(selection.text.contains("rust/src/ask.rs"));
+        let _ = fs::remove_dir_all(dir);
+    }
 }
 
 fn task_tokens(task: &str) -> impl Iterator<Item = &str> {
@@ -1618,14 +1749,24 @@ fn seed_ids(graph: &RepositoryGraph, task: &str) -> BTreeSet<String> {
         if graph.facts.contains_key(token) {
             seeds.insert(format!("file:{token}"));
         }
-        for node in graph.find_symbols_exact(token) {
-            seeds.insert(node.id.clone());
+        if looks_like_symbol_identifier(token) {
+            for node in graph.find_symbols_exact(token) {
+                seeds.insert(node.id.clone());
+            }
         }
     }
     if seeds.is_empty() {
         seeds.extend(inferred_seed_ids(graph, task));
     }
     seeds
+}
+
+fn looks_like_symbol_identifier(token: &str) -> bool {
+    token.contains('_')
+        || token
+            .chars()
+            .skip(1)
+            .any(|character| character.is_ascii_uppercase())
 }
 
 const RELEVANCE_STOP_WORDS: &[&str] = &[
@@ -1819,6 +1960,10 @@ pub fn context_for_task(
     let started = Instant::now();
     let seed_set = seed_ids(graph, task);
     let seeds = seed_set.iter().cloned().collect::<Vec<_>>();
+    let seed_files = seed_set
+        .iter()
+        .filter_map(|seed| file_from_node(graph, seed))
+        .collect::<BTreeSet<_>>();
     let impact = impact_analysis(graph, &seeds, max_nodes);
     let mut files = BTreeSet::new();
     for seed in &seeds {
@@ -1837,7 +1982,17 @@ pub fn context_for_task(
             }
         }
     }
+    let surface_guidance = implementation_surface_guidance(graph, &files);
     let mut text = String::from("[Deterministic repository intelligence]\n");
+    if !surface_guidance.is_empty() {
+        text.push_str("\n[Implementation surface guidance; advisory]\n");
+        for line in &surface_guidance {
+            let _ = std::fmt::Write::write_fmt(&mut text, format_args!("- {line}\n"));
+        }
+        text.push_str(
+            "Confirm this scope against exact source; similarly named or unmanifested surfaces may be legacy, mirror, generated, or supporting code.\n",
+        );
+    }
     if seeds.is_empty() {
         text.push_str("No exact graph seed matched; use source/retrieval tools for discovery.\n");
     }
@@ -1900,7 +2055,9 @@ pub fn context_for_task(
     ContextSelection {
         text,
         seeds,
+        seed_files: seed_files.into_iter().collect(),
         selected_files: files.into_iter().collect(),
+        surface_guidance,
         selected_nodes: impact.considered_nodes,
         considered_edges: impact.items.len(),
         elapsed_ms: started.elapsed().as_millis(),

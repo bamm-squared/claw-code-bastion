@@ -58,6 +58,10 @@ pub struct Snapshot {
     pub evaluator_selected_profile: Option<String>,
     pub evaluator_route_reason: Option<String>,
     pub evaluator_route_rejections: Vec<RoutingRejection>,
+    pub writer_selected_profile: Option<String>,
+    pub writer_route_reason: Option<String>,
+    pub writer_route_rejections: Vec<RoutingRejection>,
+    pub writer_route_estimate: Option<RoutingEstimate>,
     pub evaluation_blocked_reason: Option<String>,
     pub started_at_ms: u128,
     pub elapsed_ms: u128,
@@ -104,6 +108,21 @@ pub struct ValidationAttempt {
 pub struct RoutingRejection {
     pub profile_id: String,
     pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Default)]
+pub struct RoutingEstimate {
+    pub coding: u8,
+    pub reasoning: u8,
+    pub agent_tool_use: u8,
+    pub planning: u8,
+    pub evaluation: u8,
+    pub context_window: u32,
+    pub safety_margin: u8,
+    pub ambiguity: u8,
+    pub scope: u8,
+    pub risk: u8,
+    pub unresolved: u8,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -459,6 +478,21 @@ pub fn evaluator_routing(
         s.snapshot.evaluator_selected_profile = selected_profile.map(str::to_string);
         s.snapshot.evaluator_route_reason = Some(reason.to_string());
         s.snapshot.evaluator_route_rejections = rejections;
+    });
+    persist_snapshot();
+}
+
+pub fn writer_routing(
+    selected_profile: Option<&str>,
+    reason: &str,
+    rejections: Vec<RoutingRejection>,
+    estimate: RoutingEstimate,
+) {
+    with_state(|s| {
+        s.snapshot.writer_selected_profile = selected_profile.map(str::to_string);
+        s.snapshot.writer_route_reason = Some(reason.to_string());
+        s.snapshot.writer_route_rejections = rejections;
+        s.snapshot.writer_route_estimate = Some(estimate);
     });
     persist_snapshot();
 }

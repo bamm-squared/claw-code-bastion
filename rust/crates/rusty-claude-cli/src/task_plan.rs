@@ -11,6 +11,8 @@ const MAX_STATEMENT_BYTES: usize = 240;
 const MAX_ITEMS: usize = 6;
 const MAX_CONTRACTS: usize = 6;
 const MAX_IMPACT_LINES: usize = 4;
+const MAX_SCOPE_FILES: usize = 8;
+const MAX_SCOPE_GUIDANCE: usize = 8;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum PlanItemStatus {
@@ -51,6 +53,12 @@ pub struct TaskPlan {
     pub items: Vec<PlanItem>,
     pub contracts: Vec<ExpectedContract>,
     pub known_impact: Vec<String>,
+    #[serde(default)]
+    pub repository_files: Vec<String>,
+    #[serde(default)]
+    pub primary_repository_files: Vec<String>,
+    #[serde(default)]
+    pub implementation_surface_guidance: Vec<String>,
     pub open_questions: Vec<String>,
 }
 
@@ -175,6 +183,25 @@ impl TaskPlan {
         }
     }
 
+    pub fn set_repository_scope(
+        &mut self,
+        files: &[String],
+        primary_files: &[String],
+        guidance: &[String],
+    ) {
+        self.repository_files = files.iter().take(MAX_SCOPE_FILES).cloned().collect();
+        self.primary_repository_files = primary_files
+            .iter()
+            .take(MAX_SCOPE_FILES)
+            .cloned()
+            .collect();
+        self.implementation_surface_guidance = guidance
+            .iter()
+            .take(MAX_SCOPE_GUIDANCE)
+            .map(|line| truncate(line, MAX_STATEMENT_BYTES))
+            .collect();
+    }
+
     pub fn reopen_for_evaluation(&mut self, item_id: &str, reason: &str) {
         if let Some(item) = self.items.iter_mut().find(|item| item.id == item_id) {
             item.status = PlanItemStatus::NeedsResearch;
@@ -239,6 +266,22 @@ impl TaskPlan {
                 output.push_str(line);
                 output.push('\n');
             }
+        }
+        if !self.repository_files.is_empty() || !self.implementation_surface_guidance.is_empty() {
+            output.push_str("Implementation scope hypothesis:\n");
+            for path in &self.repository_files {
+                output.push_str("- selected repository file: ");
+                output.push_str(path);
+                output.push('\n');
+            }
+            for guidance in &self.implementation_surface_guidance {
+                output.push_str("- surface evidence: ");
+                output.push_str(guidance);
+                output.push('\n');
+            }
+            output.push_str(
+                "Scope is a bounded hypothesis; verify it before changing similarly named alternate surfaces.\n",
+            );
         }
         output.push_str("Open questions:\n");
         for question in &self.open_questions {
@@ -322,6 +365,20 @@ mod tests {
         let rendered = plan.render();
         assert!(rendered.contains("src/provider.rs"));
         assert!(rendered.contains("Known impact evidence"));
+    }
+
+    #[test]
+    fn repository_scope_is_rendered_as_a_hypothesis() {
+        let mut plan = TaskPlan::from_request("Update the implementation", None);
+        plan.set_repository_scope(
+            &["rust/src/lib.rs".to_string()],
+            &["rust/src/lib.rs".to_string()],
+            &["manifest-backed project: Cargo rust/Cargo.toml".to_string()],
+        );
+        let rendered = plan.render();
+        assert!(rendered.contains("Implementation scope hypothesis"));
+        assert!(rendered.contains("rust/src/lib.rs"));
+        assert!(rendered.contains("Scope is a bounded hypothesis"));
     }
 
     #[test]
