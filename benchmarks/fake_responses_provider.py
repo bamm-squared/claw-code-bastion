@@ -257,6 +257,154 @@ fn failed_withdrawal_is_not_recorded() {
 }
 """
 
+API_REQUEST = """#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Request {
+    pub method: String,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequestError {
+    EmptyPath,
+    UnsupportedMethod,
+}
+
+pub fn build_request(method: &str, path: &str) -> Result<Request, RequestError> {
+    if path.is_empty() {
+        return Err(RequestError::EmptyPath);
+    }
+    if !matches!(method, "GET" | "POST") {
+        return Err(RequestError::UnsupportedMethod);
+    }
+    Ok(Request {
+        method: method.to_string(),
+        path: path.to_string(),
+    })
+}
+
+pub struct RequestBuilder {
+    method: String,
+    path: String,
+    query: Vec<(String, String)>,
+}
+
+impl RequestBuilder {
+    pub fn new(method: &str, path: &str) -> Result<Self, RequestError> {
+        let request = build_request(method, path)?;
+        Ok(Self {
+            method: request.method,
+            path: request.path,
+            query: Vec::new(),
+        })
+    }
+
+    pub fn query_param(mut self, key: &str, value: &str) -> Self {
+        self.query.push((key.to_string(), value.to_string()));
+        self
+    }
+
+    pub fn build(self) -> Result<Request, RequestError> {
+        let mut path = self.path;
+        if !self.query.is_empty() {
+            path.push('?');
+            for (index, (key, value)) in self.query.into_iter().enumerate() {
+                if index > 0 {
+                    path.push('&');
+                }
+                path.push_str(&encode_component(&key));
+                path.push('=');
+                path.push_str(&encode_component(&value));
+            }
+        }
+        Ok(Request {
+            method: self.method,
+            path,
+        })
+    }
+}
+
+fn encode_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+"""
+
+API_CLIENT = """use crate::request::{Request, RequestBuilder, RequestError};
+
+#[derive(Default)]
+pub struct Client;
+
+impl Client {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn send(&self, request: Request) -> Result<String, RequestError> {
+        Ok(format!("{} {}", request.method, request.path))
+    }
+
+    pub fn builder(method: &str, path: &str) -> Result<RequestBuilder, RequestError> {
+        RequestBuilder::new(method, path)
+    }
+}
+"""
+
+API_TESTS = """use claw_api_compat_fixture::{
+    client::Client,
+    request::{build_request, RequestError},
+};
+
+#[test]
+fn builds_a_get_request() {
+    let request = build_request("GET", "/health").unwrap();
+    assert_eq!(request.method, "GET");
+    assert_eq!(request.path, "/health");
+}
+
+#[test]
+fn legacy_client_sends_request() {
+    let request = build_request("POST", "/events").unwrap();
+    assert_eq!(
+        Client::new().send(request),
+        Ok(String::from("POST /events"))
+    );
+}
+
+#[test]
+fn preserves_existing_validation_errors() {
+    assert_eq!(build_request("GET", ""), Err(RequestError::EmptyPath));
+    assert_eq!(
+        build_request("TRACE", "/health"),
+        Err(RequestError::UnsupportedMethod)
+    );
+}
+
+#[test]
+fn builder_adds_encoded_query_parameters() {
+    let request = Client::builder("GET", "/search")
+        .unwrap()
+        .query_param("q", "a b")
+        .query_param("next", "x&y=z?")
+        .build()
+        .unwrap();
+    assert_eq!(request.path, "/search?q=a%20b&next=x%26y%3Dz%3F");
+}
+
+#[test]
+fn builder_without_query_matches_legacy_request() {
+    let legacy = build_request("POST", "/events").unwrap();
+    let built = Client::builder("POST", "/events").unwrap().build().unwrap();
+    assert_eq!(built, legacy);
+}
+"""
+
 
 def actions_for(
     task,
@@ -301,6 +449,17 @@ def actions_for(
             ("read_file", {"path": "tests/ledger.rs"}),
             ("write_file", {"path": "src/ledger.rs", "content": EVENT_LEDGER}),
             ("write_file", {"path": "tests/ledger.rs", "content": EVENT_LEDGER_TESTS}),
+        ]
+    if task == "api-compat":
+        return [
+            ("read_file", {"path": "Cargo.toml"}),
+            ("read_file", {"path": "src/lib.rs"}),
+            ("read_file", {"path": "src/request.rs"}),
+            ("read_file", {"path": "src/client.rs"}),
+            ("read_file", {"path": "tests/request.rs"}),
+            ("write_file", {"path": "src/request.rs", "content": API_REQUEST}),
+            ("write_file", {"path": "src/client.rs", "content": API_CLIENT}),
+            ("write_file", {"path": "tests/request.rs", "content": API_TESTS}),
         ]
     return [
         ("read_file", {"path": "src/config.rs"}),
@@ -552,7 +711,7 @@ def main():
     parser.add_argument("--port-file", type=Path)
     parser.add_argument("--ready-file", type=Path)
     parser.add_argument(
-        "--task", choices=["config-threading", "retry-policy", "event-ledger"], default="config-threading"
+        "--task", choices=["config-threading", "retry-policy", "event-ledger", "api-compat"], default="config-threading"
     )
     parser.add_argument(
         "--rework-test",

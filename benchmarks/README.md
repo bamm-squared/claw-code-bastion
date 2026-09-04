@@ -161,3 +161,8 @@ atomic error handling. The task requires idempotent event IDs, duplicate-event
 no-ops, and retryable failed withdrawals across the event, ledger, and test
 surfaces. Its hidden oracle independently checks those behaviors without
 exposing its implementation to the model.
+
+The separate `tasks.compatibility.v1.json` corpus contains `api-compat`, an
+additive request-builder task. Its hidden consumer compiles both the legacy
+request construction and the new query-builder API, checking compatibility,
+defaults, validation errors, ordering, and encoding semantics.

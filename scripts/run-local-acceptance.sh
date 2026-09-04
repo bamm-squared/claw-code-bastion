@@ -29,6 +29,7 @@ while (($#)); do
             case "$TASK_ID" in
                 config-threading) TASKS_PATH="$ROOT/benchmarks/tasks.v1.json" ;;
                 retry-policy|event-ledger) TASKS_PATH="$ROOT/benchmarks/tasks.realistic.v1.json" ;;
+                api-compat) TASKS_PATH="$ROOT/benchmarks/tasks.compatibility.v1.json" ;;
                 *) echo "unsupported task: $TASK_ID" >&2; exit 2 ;;
             esac
             shift 2

@@ -1,0 +1,49 @@
+[
+  {
+    "id": "api-compat",
+    "version": 1,
+    "category": "backward-compatible-api",
+    "language": "rust",
+    "prompt": "Add an additive query-capable request-builder API without breaking existing callers. Keep build_request(method, path), Request's existing public method/path fields, Client::new(), and Client::send(Request) source-compatible and preserve their current validation, defaults, errors, and output. Add RequestBuilder::new(method, path), chainable query_param(key, value), and build(), plus Client::builder(method, path). A built request with no query parameters must match build_request exactly. Multiple query parameters must preserve insertion order and percent-encode non-unreserved UTF-8 bytes (including spaces and '&', '=', '?'). Preserve the existing GET/POST validation and update visible tests without unrelated changes.",
+    "fixture": {
+      "files": {
+        "Cargo.toml": "[package]\nname = \"claw_api_compat_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+        "src/lib.rs": "pub mod client;\npub mod request;\n",
+        "src/request.rs": "#[derive(Clone, Debug, PartialEq, Eq)]\npub struct Request {\n    pub method: String,\n    pub path: String,\n}\n\n#[derive(Clone, Debug, PartialEq, Eq)]\npub enum RequestError {\n    EmptyPath,\n    UnsupportedMethod,\n}\n\npub fn build_request(method: &str, path: &str) -> Result<Request, RequestError> {\n    if path.is_empty() {\n        return Err(RequestError::EmptyPath);\n    }\n    if !matches!(method, \"GET\" | \"POST\") {\n        return Err(RequestError::UnsupportedMethod);\n    }\n    Ok(Request {\n        method: method.to_string(),\n        path: path.to_string(),\n    })\n}\n",
+        "src/client.rs": "use crate::request::{Request, RequestError};\n\n#[derive(Default)]\npub struct Client;\n\nimpl Client {\n    pub fn new() -> Self {\n        Self\n    }\n\n    pub fn send(&self, request: Request) -> Result<String, RequestError> {\n        Ok(format!(\"{} {}\", request.method, request.path))\n    }\n}\n",
+        "tests/request.rs": "use claw_api_compat_fixture::{\n    client::Client,\n    request::{build_request, RequestError},\n};\n\n#[test]\nfn builds_a_get_request() {\n    let request = build_request(\"GET\", \"/health\").unwrap();\n    assert_eq!(request.method, \"GET\");\n    assert_eq!(request.path, \"/health\");\n}\n\n#[test]\nfn legacy_client_sends_request() {\n    let request = build_request(\"POST\", \"/events\").unwrap();\n    assert_eq!(\n        Client::new().send(request),\n        Ok(String::from(\"POST /events\"))\n    );\n}\n\n#[test]\nfn preserves_existing_validation_errors() {\n    assert_eq!(build_request(\"GET\", \"\"), Err(RequestError::EmptyPath));\n    assert_eq!(\n        build_request(\"TRACE\", \"/health\"),\n        Err(RequestError::UnsupportedMethod)\n    );\n}\n"
+      },
+      "mock_actions": [
+        {
+          "kind": "write",
+          "path": "src/request.rs",
+          "content": "#[derive(Clone, Debug, PartialEq, Eq)]\npub struct Request {\n    pub method: String,\n    pub path: String,\n}\n\n#[derive(Clone, Debug, PartialEq, Eq)]\npub enum RequestError {\n    EmptyPath,\n    UnsupportedMethod,\n}\n\npub fn build_request(method: &str, path: &str) -> Result<Request, RequestError> {\n    if path.is_empty() {\n        return Err(RequestError::EmptyPath);\n    }\n    if !matches!(method, \"GET\" | \"POST\") {\n        return Err(RequestError::UnsupportedMethod);\n    }\n    Ok(Request {\n        method: method.to_string(),\n        path: path.to_string(),\n    })\n}\n\npub struct RequestBuilder {\n    method: String,\n    path: String,\n    query: Vec<(String, String)>,\n}\n\nimpl RequestBuilder {\n    pub fn new(method: &str, path: &str) -> Result<Self, RequestError> {\n        let request = build_request(method, path)?;\n        Ok(Self {\n            method: request.method,\n            path: request.path,\n            query: Vec::new(),\n        })\n    }\n\n    pub fn query_param(mut self, key: &str, value: &str) -> Self {\n        self.query.push((key.to_string(), value.to_string()));\n        self\n    }\n\n    pub fn build(self) -> Result<Request, RequestError> {\n        let mut path = self.path;\n        if !self.query.is_empty() {\n            path.push('?');\n            for (index, (key, value)) in self.query.into_iter().enumerate() {\n                if index > 0 {\n                    path.push('&');\n                }\n                path.push_str(&encode_component(&key));\n                path.push('=');\n                path.push_str(&encode_component(&value));\n            }\n        }\n        Ok(Request {\n            method: self.method,\n            path,\n        })\n    }\n}\n\nfn encode_component(value: &str) -> String {\n    let mut encoded = String::new();\n    for byte in value.bytes() {\n        if matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~') {\n            encoded.push(byte as char);\n        } else {\n            encoded.push_str(&format!(\"%{byte:02X}\"));\n        }\n    }\n    encoded\n}\n"
+        },
+        {
+          "kind": "write",
+          "path": "src/client.rs",
+          "content": "use crate::request::{Request, RequestBuilder, RequestError};\n\n#[derive(Default)]\npub struct Client;\n\nimpl Client {\n    pub fn new() -> Self {\n        Self\n    }\n\n    pub fn send(&self, request: Request) -> Result<String, RequestError> {\n        Ok(format!(\"{} {}\", request.method, request.path))\n    }\n\n    pub fn builder(method: &str, path: &str) -> Result<RequestBuilder, RequestError> {\n        RequestBuilder::new(method, path)\n    }\n}\n"
+        },
+        {
+          "kind": "write",
+          "path": "tests/request.rs",
+          "content": "use claw_api_compat_fixture::{\n    client::Client,\n    request::{build_request, RequestError},\n};\n\n#[test]\nfn builds_a_get_request() {\n    let request = build_request(\"GET\", \"/health\").unwrap();\n    assert_eq!(request.method, \"GET\");\n    assert_eq!(request.path, \"/health\");\n}\n\n#[test]\nfn legacy_client_sends_request() {\n    let request = build_request(\"POST\", \"/events\").unwrap();\n    assert_eq!(\n        Client::new().send(request),\n        Ok(String::from(\"POST /events\"))\n    );\n}\n\n#[test]\nfn preserves_existing_validation_errors() {\n    assert_eq!(build_request(\"GET\", \"\"), Err(RequestError::EmptyPath));\n    assert_eq!(\n        build_request(\"TRACE\", \"/health\"),\n        Err(RequestError::UnsupportedMethod)\n    );\n}\n\n#[test]\nfn builder_adds_encoded_query_parameters() {\n    let request = Client::builder(\"GET\", \"/search\")\n        .unwrap()\n        .query_param(\"q\", \"a b\")\n        .query_param(\"next\", \"x&y=z?\")\n        .build()\n        .unwrap();\n    assert_eq!(request.path, \"/search?q=a%20b&next=x%26y%3Dz%3F\");\n}\n\n#[test]\nfn builder_without_query_matches_legacy_request() {\n    let legacy = build_request(\"POST\", \"/events\").unwrap();\n    let built = Client::builder(\"POST\", \"/events\").unwrap().build().unwrap();\n    assert_eq!(built, legacy);\n}\n"
+        }
+      ]
+    },
+    "hidden_oracle": {
+      "expected_files": {},
+      "forbidden_paths": [
+        "hidden.txt"
+      ],
+      "oracle_script": "benchmarks/oracles/api_compat.py"
+    },
+    "expected_change_scope": [
+      "src/request.rs",
+      "src/client.rs",
+      "tests/request.rs"
+    ],
+    "timeout_seconds": 120,
+    "max_agent_turns": 24
+  }
+]
