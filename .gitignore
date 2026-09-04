@@ -11,3 +11,4 @@ archive/
 .clawhip/
 status-help.txt
 .local/benchmark-results/
+/artifacts/acceptance/

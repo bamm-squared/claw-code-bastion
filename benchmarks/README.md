@@ -73,7 +73,7 @@ server for the `config-threading` task. It returns explorer findings, the
 writer's read/write/bash tool sequence, and a deterministic evaluator result;
 all filesystem changes still occur through the real Claw tool executor.
 
-Run it locally with:
+Run it directly for protocol debugging with:
 
 ```bash
 python3 benchmarks/fake_responses_provider.py --port 18766
@@ -83,3 +83,60 @@ Point a zero-provider production run at `http://127.0.0.1:18766/v1` using the
 existing `OPENAI_BASE_URL` test override. This fixture is intentionally not an
 acceptance oracle: the hidden oracle remains in `tasks.v1.json` and is consumed
 outside the candidate workspace by the benchmark parent.
+
+## Canonical deterministic acceptance
+
+The repository-owned local command is:
+
+```bash
+./scripts/run-local-acceptance.sh
+```
+
+It runs exactly one `config-threading` task through the production Claw child,
+real candidate tools, the worker and dedicated Rust validator images, trusted
+validation/evaluation, interactive Review/Apply, and the hidden oracle. The
+provider is a loopback-only deterministic Responses server; the script removes
+proxy variables and uses a dummy local credential, so it makes no external
+model calls. Worker and validator images are required to be distinct.
+
+Each run writes to a unique `artifacts/acceptance/<timestamp>-<pid>/` directory
+by default. The directory contains `result.jsonl`, `telemetry.json`, provider
+and runner logs, build output, and fake-provider readiness metadata. Failed
+runs retain the same directory. Use `--artifacts-dir PATH` to select a stable
+location for CI or local investigation.
+
+This acceptance is intentionally heavier than normal Rust CI because it needs
+rootless Podman, both container images, a PTY, and a disposable project. The
+manual `Deterministic acceptance` workflow runs it on the labeled self-hosted
+rootless-Podman runner. Ordinary pull-request CI continues to run the normal
+format, check, test, clippy, build, and documentation gates.
+
+## Explicit live acceptance
+
+Live provider execution is a separate operator action. It must use an
+authorized model manifest and credential environment, and should remain a
+single-task invocation with an explicit output directory:
+
+```bash
+CLAW_PROVIDER_TRACE=1 \
+CLAW_ORCHESTRATION_TRACE=1 \
+CLAW_BENCH_TELEMETRY="$PWD/artifacts/acceptance/live/telemetry.json" \
+CLAW_VALIDATOR_IMAGE=claw-bastion-validator-rust:0.1.0-rc.2 \
+rust/target/debug/agent-bench run \
+  --execution production --interactive \
+  --tasks benchmarks/tasks.v1.json --task config-threading \
+  --models /absolute/path/to/authorized-models.json \
+  --settings /absolute/path/to/.claw/settings.json \
+  --binary "$PWD/rust/target/debug/claw" \
+  --runtime-image ghcr.io/bamm-squared/claw-bastion-runtime:0.1.0-rc.2 \
+  --validator-image claw-bastion-validator-rust:0.1.0-rc.2 \
+  --task-timeout 180 --exploration-timeout 45 --repetitions 1 \
+  --output "$PWD/artifacts/acceptance/live/result.jsonl"
+```
+
+Do not pass `--model` for routed acceptance; omitting it preserves the full
+configured resource pool. A pinned model is a separate deliberate experiment.
+The live command is not called by tests or CI, and its profile manifest,
+credential source, task count, images, and artifact paths are visible in the
+command before execution. Never place credentials in settings, manifests, or
+artifacts.

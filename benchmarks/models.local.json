@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "models": [
+    {
+      "alias": "gpt-5.6-luna",
+      "provider_profile": "openai",
+      "model": "gpt-5.6-luna",
+      "reasoning": "high",
+      "authorized": true,
+      "local": true,
+      "actual_input_usd_per_million": 0.0,
+      "actual_output_usd_per_million": 0.0,
+      "cached_input_usd_per_million": 0.0,
+      "cache_write_usd_per_million": 0.0
+    },
+    {
+      "alias": "gpt-5.4-mini",
+      "provider_profile": "openai",
+      "model": "gpt-5.4-mini",
+      "reasoning": "medium",
+      "authorized": true,
+      "local": true,
+      "actual_input_usd_per_million": 0.0,
+      "actual_output_usd_per_million": 0.0,
+      "cached_input_usd_per_million": 0.0,
+      "cache_write_usd_per_million": 0.0
+    },
+    {
+      "alias": "gpt-5.4-nano",
+      "provider_profile": "openai",
+      "model": "gpt-5.4-nano",
+      "reasoning": "low",
+      "authorized": true,
+      "local": true,
+      "actual_input_usd_per_million": 0.0,
+      "actual_output_usd_per_million": 0.0,
+      "cached_input_usd_per_million": 0.0,
+      "cache_write_usd_per_million": 0.0
+    },
+    {
+      "alias": "gpt-4o-mini",
+      "provider_profile": "openai",
+      "model": "gpt-4o-mini",
+      "reasoning": "low",
+      "authorized": true,
+      "local": true,
+      "actual_input_usd_per_million": 0.0,
+      "actual_output_usd_per_million": 0.0,
+      "cached_input_usd_per_million": 0.0,
+      "cache_write_usd_per_million": 0.0
+    }
+  ]
+}

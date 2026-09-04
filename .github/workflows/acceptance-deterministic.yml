@@ -1,0 +1,40 @@
+name: Deterministic interactive acceptance
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deterministic-acceptance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  local-production-lifecycle:
+    name: local production lifecycle
+    runs-on: [self-hosted, linux, rootless-podman, claw-security]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Build worker image
+        run: podman build -f Containerfile.worker -t claw-bastion-runtime:acceptance .
+      - name: Build validator image
+        run: podman build -f Containerfile.validator -t claw-bastion-validator-rust:acceptance .
+      - name: Run deterministic acceptance
+        env:
+          CLAW_ACCEPTANCE_WORKER_IMAGE: claw-bastion-runtime:acceptance
+          CLAW_ACCEPTANCE_VALIDATOR_IMAGE: claw-bastion-validator-rust:acceptance
+        run: ./scripts/run-local-acceptance.sh
+      - name: Upload acceptance artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deterministic-acceptance-${{ github.run_id }}
+          path: artifacts/acceptance
+          if-no-files-found: ignore

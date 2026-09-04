@@ -8,6 +8,7 @@ changed by the normal Claw tool executor, never by this process.
 import argparse
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 
 CONFIG = """pub const LIMIT: usize = 8;
@@ -197,8 +198,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18766)
+    parser.add_argument("--port-file", type=Path)
+    parser.add_argument("--ready-file", type=Path)
     args = parser.parse_args()
-    HTTPServer((args.host, args.port), ResponsesHandler).serve_forever()
+    server = HTTPServer((args.host, args.port), ResponsesHandler)
+    if args.port_file:
+        args.port_file.write_text(str(server.server_address[1]) + "\n")
+    if args.ready_file:
+        args.ready_file.touch()
+    server.serve_forever()
 
 
 if __name__ == "__main__":
