@@ -97,7 +97,9 @@ real candidate tools, the worker and dedicated Rust validator images, trusted
 validation/evaluation, interactive Review/Apply, and the hidden oracle. The
 provider is a loopback-only deterministic Responses server; the script removes
 proxy variables and uses a dummy local credential, so it makes no external
-model calls. Worker and validator images are required to be distinct.
+model calls. It uses the secret-free repository-owned
+`benchmarks/settings.local.json` resource pool, and worker and validator images
+are required to be distinct.
 
 Each run writes to a unique `artifacts/acceptance/<timestamp>-<pid>/` directory
 by default. The directory contains `result.jsonl`, `telemetry.json`, provider

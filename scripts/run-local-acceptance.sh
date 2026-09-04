@@ -5,6 +5,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TASK_ID=config-threading
 WORKER_IMAGE=${CLAW_ACCEPTANCE_WORKER_IMAGE:-ghcr.io/bamm-squared/claw-bastion-runtime:0.1.0-rc.2}
 VALIDATOR_IMAGE=${CLAW_ACCEPTANCE_VALIDATOR_IMAGE:-claw-bastion-validator-rust:0.1.0-rc.2}
+SETTINGS_PATH=${CLAW_ACCEPTANCE_SETTINGS_PATH:-"$ROOT/benchmarks/settings.local.json"}
 ARTIFACTS_DIR=${CLAW_ACCEPTANCE_ARTIFACTS_DIR:-"$ROOT/artifacts/acceptance/$(date -u +%Y%m%dT%H%M%SZ)-$$"}
 
 usage() {
@@ -76,7 +77,7 @@ podman image exists "$VALIDATOR_IMAGE" || {
     exit 1
 }
 
-python3 - "$ROOT/.claw/settings.json" <<'PY'
+python3 - "$SETTINGS_PATH" <<'PY'
 import json
 import sys
 
@@ -130,7 +131,7 @@ set +e
         --execution production --interactive \
         --tasks "$ROOT/benchmarks/tasks.v1.json" --task "$TASK_ID" \
         --models "$ROOT/benchmarks/models.local.json" \
-        --settings "$ROOT/.claw/settings.json" \
+        --settings "$SETTINGS_PATH" \
         --binary "$ROOT/rust/target/debug/claw" \
         --runtime-image "$WORKER_IMAGE" \
         --validator-image "$VALIDATOR_IMAGE" \

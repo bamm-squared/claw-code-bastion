@@ -1,0 +1,89 @@
+{
+  "modelResources": [
+    {
+      "id": "gpt-5.6-luna",
+      "provider": "openai",
+      "model": "gpt-5.6-luna",
+      "privacy": "remote",
+      "capability": {
+        "coding": 90,
+        "reasoning": 88,
+        "agentToolUse": 90,
+        "planning": 86,
+        "evaluation": 88,
+        "contextWindow": 1050000
+      },
+      "pricing": {
+        "actualCostKnown": true,
+        "actualInputMicros": 200,
+        "actualOutputMicros": 1200
+      },
+      "enabled": true
+    },
+    {
+      "id": "gpt-5.4-mini",
+      "provider": "openai",
+      "model": "gpt-5.4-mini",
+      "privacy": "remote",
+      "capability": {
+        "coding": 80,
+        "reasoning": 78,
+        "agentToolUse": 80,
+        "planning": 76,
+        "evaluation": 78,
+        "contextWindow": 400000
+      },
+      "pricing": {
+        "actualCostKnown": true,
+        "actualInputMicros": 750,
+        "actualOutputMicros": 4500
+      },
+      "enabled": true
+    },
+    {
+      "id": "gpt-5.4-nano",
+      "provider": "openai",
+      "model": "gpt-5.4-nano",
+      "privacy": "remote",
+      "capability": {
+        "coding": 72,
+        "reasoning": 70,
+        "agentToolUse": 68,
+        "planning": 68,
+        "evaluation": 70,
+        "contextWindow": 400000
+      },
+      "pricing": {
+        "actualCostKnown": true,
+        "actualInputMicros": 200,
+        "actualOutputMicros": 1250
+      },
+      "enabled": true
+    },
+    {
+      "id": "gpt-4o-mini",
+      "provider": "openai",
+      "model": "gpt-4o-mini",
+      "privacy": "remote",
+      "capability": {
+        "coding": 45,
+        "reasoning": 42,
+        "agentToolUse": 38,
+        "planning": 40,
+        "evaluation": 42,
+        "contextWindow": 128000
+      },
+      "pricing": {
+        "actualCostKnown": true,
+        "actualInputMicros": 150,
+        "actualOutputMicros": 600
+      },
+      "enabled": true
+    }
+  ],
+  "routing": {
+    "allowRemote": true,
+    "preferredProvider": "openai",
+    "minimumMargin": 8
+  }
+}
