@@ -199,7 +199,7 @@ pub struct TimingMetrics {
     pub validation_ms: u128,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UsageMetrics {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -226,6 +226,8 @@ pub struct BenchmarkRecord {
     pub provider: String,
     pub model: String,
     pub reasoning: String,
+    #[serde(default)]
+    pub protocol: String,
     pub repetition: u32,
     pub started_at_ms: u128,
     pub finished_at_ms: u128,
@@ -517,6 +519,7 @@ pub fn run_production(
         for task in tasks {
             match run_production_one(
                 task,
+                config,
                 &profile,
                 model_alias,
                 repetition,
@@ -531,6 +534,7 @@ pub fn run_production(
                 Ok(record) => records.push(record),
                 Err(error) => records.push(production_failure_record(
                     task,
+                    config,
                     &profile,
                     model_alias,
                     repetition,
@@ -593,6 +597,7 @@ fn select_production_profile<'a>(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_production_one(
     task: &BenchmarkTask,
+    benchmark_config: &BenchmarkConfig,
     profile: &ModelProfile,
     model_alias: Option<&str>,
     repetition: u32,
@@ -835,7 +840,39 @@ fn run_production_one(
     let executed_profile = production_telemetry
         .as_ref()
         .and_then(first_telemetry_profile);
-    let candidate = candidate_metrics(&root, task);
+    let executed_config = executed_profile
+        .as_deref()
+        .and_then(|alias| {
+            benchmark_config
+                .models
+                .iter()
+                .find(|item| item.alias == alias)
+        })
+        .unwrap_or(profile);
+    let mut candidate = candidate_metrics(&root, task);
+    if let Some(telemetry) = production_telemetry.as_ref() {
+        candidate.mutation_operations =
+            telemetry_u64(telemetry, "candidate_mutations").unwrap_or(0);
+    }
+    let usage = production_telemetry.as_ref().map_or_else(
+        || zero_usage(executed_config),
+        |telemetry| usage_from_production_telemetry(telemetry, benchmark_config, profile),
+    );
+    let activity = production_telemetry
+        .as_ref()
+        .map(activity_from_production_telemetry)
+        .unwrap_or_default();
+    let context = production_telemetry
+        .as_ref()
+        .map(context_from_production_telemetry)
+        .unwrap_or_default();
+    let timing = production_telemetry.as_ref().map_or_else(
+        || TimingMetrics {
+            end_to_end_ms: wall.elapsed().as_millis(),
+            ..TimingMetrics::default()
+        },
+        |telemetry| timing_from_production_telemetry(telemetry, wall.elapsed().as_millis()),
+    );
     Ok(BenchmarkRecord {
         benchmark_schema_version: BENCHMARK_SCHEMA_VERSION,
         task_corpus_version: task.version,
@@ -848,12 +885,16 @@ fn run_production_one(
             .unwrap_or_else(|| "routed".to_string()),
         requested_profile: model_alias.map(str::to_string),
         executed_profile,
-        provider: model_alias.map_or_else(
-            || "routed".to_string(),
-            |_| profile.provider_profile.clone(),
-        ),
-        model: model_alias.map_or_else(|| "routed".to_string(), |_| profile.model.clone()),
-        reasoning: model_alias.map_or_else(|| "routed".to_string(), |_| profile.reasoning.clone()),
+        provider: production_telemetry
+            .as_ref()
+            .and_then(first_telemetry_provider)
+            .unwrap_or_else(|| executed_config.provider_profile.clone()),
+        model: executed_config.model.clone(),
+        reasoning: executed_config.reasoning.clone(),
+        protocol: production_telemetry
+            .as_ref()
+            .and_then(first_telemetry_protocol)
+            .unwrap_or_else(|| "unavailable".to_string()),
         repetition,
         started_at_ms: started_at,
         finished_at_ms: epoch_ms(),
@@ -865,15 +906,15 @@ fn run_production_one(
         .to_string(),
         final_correctness: if oracle_ok { "PASS" } else { "FAIL" }.to_string(),
         rework_cycles: 0,
-        usage: zero_usage(profile),
-        timing: TimingMetrics {
-            end_to_end_ms: wall.elapsed().as_millis(),
-            ..TimingMetrics::default()
-        },
-        activity: ActivityMetrics::default(),
-        context: ContextAttribution::default(),
+        usage,
+        timing,
+        activity,
+        context,
         candidate,
-        validation: "NOT_REPORTED".to_string(),
+        validation: production_telemetry.as_ref().map_or_else(
+            || "NOT_REPORTED".to_string(),
+            validation_from_production_telemetry,
+        ),
         validation_duration_ms: 0,
         hidden_oracle_checked_outside_workspace: true,
         mock_execution: false,
@@ -900,8 +941,10 @@ fn telemetry_has_event(path: &Path, event: &str) -> bool {
         .is_some_and(|events| events.iter().any(|value| value.as_str() == Some(event)))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn production_failure_record(
     task: &BenchmarkTask,
+    benchmark_config: &BenchmarkConfig,
     profile: &ModelProfile,
     requested_profile: Option<&str>,
     repetition: u32,
@@ -910,6 +953,19 @@ fn production_failure_record(
     error: &str,
 ) -> BenchmarkRecord {
     let (error_message, production_telemetry) = split_partial_telemetry(error);
+    let executed_profile = production_telemetry
+        .as_ref()
+        .and_then(first_telemetry_profile);
+    let executed_config = executed_profile
+        .as_deref()
+        .and_then(|alias| {
+            benchmark_config
+                .models
+                .iter()
+                .find(|item| item.alias == alias)
+        })
+        .unwrap_or(profile);
+    let has_execution_identity = executed_profile.is_some();
     let class = if error.contains("timed out") {
         "timeout"
     } else {
@@ -921,29 +977,69 @@ fn production_failure_record(
         task_id: task.id.clone(),
         category: task.category.clone(),
         language: task.language.clone(),
-        model_alias: requested_profile.unwrap_or("routed").to_string(),
+        model_alias: executed_profile
+            .clone()
+            .or_else(|| requested_profile.map(str::to_string))
+            .unwrap_or_else(|| "routed".to_string()),
         requested_profile: requested_profile.map(str::to_string),
-        executed_profile: None,
-        provider: requested_profile.map_or_else(
-            || "unselected".to_string(),
-            |_| profile.provider_profile.clone(),
-        ),
-        model: requested_profile
-            .map_or_else(|| "unselected".to_string(), |_| profile.model.clone()),
-        reasoning: requested_profile
-            .map_or_else(|| "unselected".to_string(), |_| profile.reasoning.clone()),
+        executed_profile,
+        provider: production_telemetry
+            .as_ref()
+            .and_then(first_telemetry_provider)
+            .unwrap_or_else(|| {
+                if has_execution_identity || requested_profile.is_some() {
+                    executed_config.provider_profile.clone()
+                } else {
+                    "unselected".to_string()
+                }
+            }),
+        model: if has_execution_identity || requested_profile.is_some() {
+            executed_config.model.clone()
+        } else {
+            "unselected".to_string()
+        },
+        reasoning: if has_execution_identity || requested_profile.is_some() {
+            executed_config.reasoning.clone()
+        } else {
+            "unselected".to_string()
+        },
+        protocol: production_telemetry
+            .as_ref()
+            .and_then(first_telemetry_protocol)
+            .unwrap_or_else(|| "unavailable".to_string()),
         repetition,
         started_at_ms: epoch_ms(),
         finished_at_ms: epoch_ms(),
         first_pass: "FIRST_PASS_FAIL".to_string(),
         final_correctness: "FAIL".to_string(),
         rework_cycles: 0,
-        usage: zero_usage(profile),
-        timing: TimingMetrics::default(),
-        activity: ActivityMetrics::default(),
-        context: ContextAttribution::default(),
-        candidate: CandidateMetrics::default(),
-        validation: "NOT_RUN".to_string(),
+        usage: production_telemetry.as_ref().map_or_else(
+            || zero_usage(profile),
+            |telemetry| usage_from_production_telemetry(telemetry, benchmark_config, profile),
+        ),
+        timing: production_telemetry
+            .as_ref()
+            .map(|telemetry| timing_from_production_telemetry(telemetry, 0))
+            .unwrap_or_default(),
+        activity: production_telemetry
+            .as_ref()
+            .map(activity_from_production_telemetry)
+            .unwrap_or_default(),
+        context: production_telemetry
+            .as_ref()
+            .map(context_from_production_telemetry)
+            .unwrap_or_default(),
+        candidate: production_telemetry
+            .as_ref()
+            .map(|telemetry| CandidateMetrics {
+                mutation_operations: telemetry_u64(telemetry, "candidate_mutations").unwrap_or(0),
+                ..CandidateMetrics::default()
+            })
+            .unwrap_or_default(),
+        validation: production_telemetry.as_ref().map_or_else(
+            || "NOT_RUN".to_string(),
+            validation_from_production_telemetry,
+        ),
         validation_duration_ms: 0,
         hidden_oracle_checked_outside_workspace: true,
         mock_execution: false,
@@ -1011,6 +1107,204 @@ fn first_telemetry_profile(telemetry: &Value) -> Option<String> {
                     .map(str::to_string)
             })
         })
+}
+
+fn first_telemetry_provider(telemetry: &Value) -> Option<String> {
+    telemetry
+        .get("provider_call_records")
+        .and_then(Value::as_array)
+        .and_then(|records| {
+            records.iter().find_map(|record| {
+                record
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .filter(|provider| !provider.is_empty())
+                    .map(str::to_string)
+            })
+        })
+}
+
+fn first_telemetry_protocol(telemetry: &Value) -> Option<String> {
+    telemetry
+        .get("provider_call_records")
+        .and_then(Value::as_array)
+        .and_then(|records| {
+            records.iter().find_map(|record| {
+                record
+                    .get("protocol")
+                    .and_then(Value::as_str)
+                    .filter(|protocol| !protocol.is_empty() && *protocol != "default")
+                    .map(str::to_string)
+            })
+        })
+}
+
+fn telemetry_u64(telemetry: &Value, key: &str) -> Option<u64> {
+    telemetry.get(key).and_then(Value::as_u64)
+}
+
+fn telemetry_string(telemetry: &Value, key: &str) -> Option<String> {
+    telemetry
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn telemetry_records(telemetry: &Value) -> Vec<&Value> {
+    telemetry
+        .get("provider_call_records")
+        .and_then(Value::as_array)
+        .map(|records| records.iter().collect())
+        .unwrap_or_default()
+}
+
+fn telemetry_sum_records(telemetry: &Value, key: &str) -> u64 {
+    telemetry_records(telemetry)
+        .iter()
+        .filter_map(|record| record.get(key).and_then(Value::as_u64))
+        .sum()
+}
+
+fn telemetry_total(telemetry: &Value, key: &str) -> Option<u64> {
+    telemetry_u64(telemetry, key).or_else(|| {
+        let records = telemetry_records(telemetry);
+        (!records.is_empty()).then(|| telemetry_sum_records(telemetry, key))
+    })
+}
+
+fn production_profile<'a>(
+    config: &'a BenchmarkConfig,
+    profile_alias: Option<&str>,
+    fallback: &'a ModelProfile,
+) -> &'a ModelProfile {
+    profile_alias
+        .and_then(|alias| config.models.iter().find(|profile| profile.alias == alias))
+        .unwrap_or(fallback)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn cost_u64(tokens: u64, dollars_per_million: f64) -> f64 {
+    tokens as f64 / 1_000_000.0 * dollars_per_million
+}
+
+fn usage_from_production_telemetry(
+    telemetry: &Value,
+    config: &BenchmarkConfig,
+    fallback: &ModelProfile,
+) -> UsageMetrics {
+    let mut usage = UsageMetrics::default();
+    let mut reported_total = 0.0;
+    let mut has_reported_total = false;
+
+    for record in telemetry_records(telemetry) {
+        let input = record
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let output = record
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cached = record
+            .get("cache_read_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cache_write = record
+            .get("cache_write_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let profile = production_profile(
+            config,
+            record.get("profile").and_then(Value::as_str),
+            fallback,
+        );
+
+        usage.input_tokens += input;
+        usage.output_tokens += output;
+        usage.cached_input_tokens += cached;
+        usage.cache_write_tokens += cache_write;
+        usage.actual_input_cost_usd += cost_u64(input, profile.actual_input_usd_per_million);
+        usage.actual_output_cost_usd += cost_u64(output, profile.actual_output_usd_per_million);
+        usage.actual_cache_cost_usd += cost_u64(cached, profile.cached_input_usd_per_million)
+            + cost_u64(cache_write, profile.cache_write_usd_per_million);
+
+        if let Some(cost) = record.get("estimated_cost_usd").and_then(Value::as_f64) {
+            reported_total += cost;
+            has_reported_total = true;
+        }
+    }
+
+    usage.actual_total_cost_usd = if has_reported_total {
+        reported_total
+    } else {
+        usage.actual_input_cost_usd + usage.actual_output_cost_usd + usage.actual_cache_cost_usd
+    };
+    usage
+}
+
+fn activity_from_production_telemetry(telemetry: &Value) -> ActivityMetrics {
+    let records = telemetry_records(telemetry);
+    let provider_retries = records
+        .iter()
+        .map(|record| {
+            record
+                .get("request_ids")
+                .and_then(Value::as_array)
+                .map_or(0, |ids| ids.len().saturating_sub(1))
+        })
+        .sum::<usize>() as u64;
+    let tool_calls = telemetry
+        .get("tool_calls")
+        .and_then(Value::as_object)
+        .map(|calls| {
+            calls
+                .iter()
+                .filter_map(|(name, count)| count.as_u64().map(|count| (name.clone(), count)))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    ActivityMetrics {
+        provider_calls: telemetry_u64(telemetry, "provider_calls").unwrap_or(records.len() as u64),
+        model_turns: telemetry_u64(telemetry, "model_turns").unwrap_or(0),
+        tool_bearing_turns: telemetry_u64(telemetry, "tool_bearing_turns").unwrap_or(0),
+        provider_retries,
+        tool_calls,
+        unique_files_read: telemetry_u64(telemetry, "unique_files_read").unwrap_or(0),
+        total_file_reads: telemetry_u64(telemetry, "total_file_reads").unwrap_or(0),
+        repeated_file_reads: telemetry_u64(telemetry, "repeated_file_reads").unwrap_or(0),
+        context_search_calls: telemetry_u64(telemetry, "context_search_calls").unwrap_or(0),
+        time_to_first_candidate_mutation_ms: telemetry_u64(
+            telemetry,
+            "time_to_first_candidate_mutation_ms",
+        )
+        .map(u128::from),
+        ..ActivityMetrics::default()
+    }
+}
+
+fn context_from_production_telemetry(telemetry: &Value) -> ContextAttribution {
+    let input = telemetry_total(telemetry, "input_tokens");
+    let output = telemetry_total(telemetry, "output_tokens");
+    ContextAttribution {
+        retrieval_bytes: telemetry_u64(telemetry, "repository_intelligence_context_bytes")
+            .unwrap_or(0),
+        exact_provider_tokens: input
+            .zip(output)
+            .and_then(|(input, output)| u32::try_from(input.saturating_add(output)).ok()),
+        ..ContextAttribution::default()
+    }
+}
+
+fn timing_from_production_telemetry(telemetry: &Value, fallback_ms: u128) -> TimingMetrics {
+    TimingMetrics {
+        end_to_end_ms: telemetry_u64(telemetry, "elapsed_ms").map_or(fallback_ms, u128::from),
+        ..TimingMetrics::default()
+    }
+}
+
+fn validation_from_production_telemetry(telemetry: &Value) -> String {
+    telemetry_string(telemetry, "validation_result").unwrap_or_else(|| "NOT_REPORTED".to_string())
 }
 
 fn split_partial_telemetry(error: &str) -> (String, Option<Value>) {
@@ -1173,6 +1467,7 @@ fn run_one(
         error_class: None,
         error_message: None,
         production_telemetry: None,
+        protocol: "mock".to_string(),
     })
 }
 
@@ -1252,12 +1547,21 @@ fn candidate_metrics(root: &Path, task: &BenchmarkTask) -> CandidateMetrics {
             }
             (Some(old), Some(new)) if old != new => {
                 metrics.files_modified += 1;
-                metrics.bytes_changed += old.len().abs_diff(new.len()) as u64;
+                metrics.bytes_changed += changed_bytes(old, new);
             }
             _ => {}
         }
     }
     metrics
+}
+
+fn changed_bytes(old: &str, new: &str) -> u64 {
+    old.as_bytes()
+        .iter()
+        .zip(new.as_bytes())
+        .filter(|(old, new)| old != new)
+        .count() as u64
+        + old.len().abs_diff(new.len()) as u64
 }
 
 fn activity_from_events(
@@ -1560,13 +1864,102 @@ mod tests {
     #[test]
     fn routed_attribution_does_not_claim_the_authorization_seed_executed() {
         let telemetry = json!({
-            "provider_call_records": [{"profile": "gpt-5.4-mini"}]
+            "provider_call_records": [{
+                "profile": "gpt-5.4-mini",
+                "protocol": "responses"
+            }]
         });
         assert_eq!(
             first_telemetry_profile(&telemetry).as_deref(),
             Some("gpt-5.4-mini")
         );
+        assert_eq!(
+            first_telemetry_protocol(&telemetry).as_deref(),
+            Some("responses")
+        );
         assert_eq!(first_telemetry_profile(&json!({})), None);
+    }
+
+    #[test]
+    fn production_telemetry_projects_usage_activity_and_validation() {
+        let config = BenchmarkConfig {
+            schema_version: BENCHMARK_SCHEMA_VERSION,
+            models: vec![ModelProfile {
+                alias: "routed".into(),
+                provider_profile: "provider-a".into(),
+                model: "model-a".into(),
+                reasoning: "high".into(),
+                authorized: true,
+                local: false,
+                actual_input_usd_per_million: 1.0,
+                actual_output_usd_per_million: 2.0,
+                cached_input_usd_per_million: 0.1,
+                cache_write_usd_per_million: 0.2,
+            }],
+        };
+        let telemetry = json!({
+            "provider_calls": 2,
+            "model_turns": 2,
+            "tool_bearing_turns": 1,
+            "tool_calls": {"read_file": 2},
+            "validation_result": "completed",
+            "repository_intelligence_context_bytes": 111,
+            "elapsed_ms": 321,
+            "provider_call_records": [
+                {
+                    "profile": "routed",
+                    "provider": "provider-a",
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "cache_read_tokens": 40,
+                    "cache_write_tokens": 5,
+                    "estimated_cost_usd": 0.0002,
+                    "request_ids": ["req-1"]
+                },
+                {
+                    "profile": "routed",
+                    "provider": "provider-a",
+                    "input_tokens": 50,
+                    "output_tokens": 10,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "estimated_cost_usd": 0.0001,
+                    "request_ids": ["req-2", "req-2-retry"]
+                }
+            ]
+        });
+
+        let usage = usage_from_production_telemetry(&telemetry, &config, &config.models[0]);
+        assert_eq!(usage.input_tokens, 150);
+        assert_eq!(usage.output_tokens, 30);
+        assert_eq!(usage.cached_input_tokens, 40);
+        assert_eq!(usage.cache_write_tokens, 5);
+        assert!((usage.actual_total_cost_usd - 0.0003).abs() < f64::EPSILON);
+
+        let activity = activity_from_production_telemetry(&telemetry);
+        assert_eq!(activity.provider_calls, 2);
+        assert_eq!(activity.tool_calls.get("read_file"), Some(&2));
+        assert_eq!(activity.provider_retries, 1);
+        assert_eq!(activity.model_turns, 2);
+
+        let context = context_from_production_telemetry(&telemetry);
+        assert_eq!(context.retrieval_bytes, 111);
+        assert_eq!(context.exact_provider_tokens, Some(180));
+        assert_eq!(
+            validation_from_production_telemetry(&telemetry),
+            "completed"
+        );
+        assert_eq!(
+            timing_from_production_telemetry(&telemetry, 999).end_to_end_ms,
+            321
+        );
+    }
+
+    #[test]
+    fn changed_bytes_counts_same_length_edits() {
+        assert_eq!(changed_bytes("abc", "axc"), 1);
+        assert_eq!(changed_bytes("abc", "abcd"), 1);
+        assert_eq!(changed_bytes("abc", "xyzq"), 4);
     }
 
     #[test]

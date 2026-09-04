@@ -9844,6 +9844,7 @@ impl AnthropicRuntimeClient {
                 client
             }
         };
+        benchmark_telemetry::set_provider_protocol(client.protocol_name());
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,
@@ -9889,6 +9890,7 @@ fn execute_evaluator_profile(
         profile.protocol_capabilities,
     )
     .map_err(|error| error.to_string())?;
+    benchmark_telemetry::set_provider_protocol(client.protocol_name());
     let request_text = requirement_evaluator::RequirementEvaluator::render_request(request);
     let message_request = MessageRequest {
         model: resolved_model,
@@ -9957,6 +9959,7 @@ fn execute_explorer_profile(
         profile.protocol_capabilities,
     )
     .map_err(|error| error.to_string())?;
+    benchmark_telemetry::set_provider_protocol(client.protocol_name());
     let request_text = format!(
         "You are a bounded read-only repository explorer.\nQuestion: {}\nEvidence:\n{}\nReturn only JSON: {{\"findings\":[{{\"subject\":\"...\",\"claim\":\"...\",\"evidence\":\"...\",\"confidence\":0}}]}}. Do not suggest edits or claim certainty beyond evidence.",
         question.prompt, evidence

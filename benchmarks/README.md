@@ -65,3 +65,21 @@ Production requires complete Claw settings through `--settings` or
 Worker and validator images are independent and both must be supplied for
 production execution. `--dry-run` performs the same task/profile/settings
 preflight without launching the child process.
+
+## Local production-style provider
+
+`fake_responses_provider.py` is a dependency-free deterministic Responses
+server for the `config-threading` task. It returns explorer findings, the
+writer's read/write/bash tool sequence, and a deterministic evaluator result;
+all filesystem changes still occur through the real Claw tool executor.
+
+Run it locally with:
+
+```bash
+python3 benchmarks/fake_responses_provider.py --port 18766
+```
+
+Point a zero-provider production run at `http://127.0.0.1:18766/v1` using the
+existing `OPENAI_BASE_URL` test override. This fixture is intentionally not an
+acceptance oracle: the hidden oracle remains in `tasks.v1.json` and is consumed
+outside the candidate workspace by the benchmark parent.

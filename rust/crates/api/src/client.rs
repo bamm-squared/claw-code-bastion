@@ -145,6 +145,15 @@ impl ProviderClient {
     }
 
     #[must_use]
+    pub const fn protocol_name(&self) -> &'static str {
+        match self {
+            Self::Anthropic(_) => "anthropic",
+            Self::Xai(_) | Self::OpenAi(_) => "chat_completions",
+            Self::OpenAiResponses(_) => "responses",
+        }
+    }
+
+    #[must_use]
     pub fn with_prompt_cache(self, prompt_cache: PromptCache) -> Self {
         match self {
             Self::Anthropic(client) => Self::Anthropic(client.with_prompt_cache(prompt_cache)),

@@ -173,6 +173,12 @@ pub fn set_provider_context(
     });
 }
 
+pub fn set_provider_protocol(protocol: &str) {
+    with_state(|s| {
+        s.provider_context.protocol = Some(protocol.to_string());
+    });
+}
+
 pub fn provider_request_id(request_id: &str) {
     with_state(|s| {
         if !request_id.is_empty()
