@@ -643,16 +643,21 @@ fn run_production_one(
         serde_json::to_vec(settings).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
-    let mut cli_args = vec![
-        "--permission-mode",
-        "workspace-write",
-        "--print",
-        "-p",
-        &task.prompt,
-    ];
+    let mut cli_args = vec!["--permission-mode", "workspace-write"];
+    if !interactive {
+        cli_args.push("--print");
+    }
+    cli_args.extend(["-p", &task.prompt]);
     if model_alias.is_some_and(|alias| alias != "local-mock") {
         cli_args.splice(0..0, ["--model", &profile.model]);
     }
+    let interactive_transcript = interactive.then(|| {
+        PathBuf::from(format!(
+            "/tmp/claw-pty-{}-{}.log",
+            std::process::id(),
+            task.id
+        ))
+    });
     let mut command = if interactive {
         Command::new("script")
     } else {
@@ -673,14 +678,20 @@ fn run_production_one(
             .map(|arg| shell_quote(&arg))
             .collect::<Vec<_>>()
             .join(" ");
-        command.args(["-qefc", &command_line, "/dev/null"]);
+        let transcript = interactive_transcript
+            .as_ref()
+            .expect("interactive transcript path exists")
+            .to_string_lossy();
+        command.args(["-qefc", &command_line, &transcript]);
     }
     let effective_task_timeout = task_timeout.unwrap_or(task.timeout_seconds);
     let effective_exploration_timeout =
         exploration_timeout.unwrap_or_else(|| (effective_task_timeout / 3).max(1));
+    command.current_dir(&root);
+    if !interactive {
+        command.args(cli_args);
+    }
     let mut child = command
-        .current_dir(&root)
-        .args(cli_args)
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", &config)
         .env("XDG_CACHE_HOME", &cache)
@@ -696,6 +707,7 @@ fn run_production_one(
         .env("XDG_DATA_HOME", podman_data_home)
         .env("CLAW_WORKER_IMAGE", runtime_image)
         .env("CLAW_VALIDATOR_IMAGE", validator_image)
+        .env("CLAW_EXECUTION_MODE", "isolated")
         .env(
             "CLAW_EXPLORATION_BUDGET_MS",
             effective_exploration_timeout
@@ -1153,7 +1165,7 @@ fn collect_files(
     for entry in fs::read_dir(current).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
         let path = entry.path();
-        if entry.file_name() == ".git" {
+        if matches!(entry.file_name().to_str(), Some(".git" | ".claw")) {
             continue;
         }
         if path.is_dir() {
@@ -1554,6 +1566,40 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         fs::create_dir(&project).unwrap();
+        assert!(evaluate_oracle(&project, &task).unwrap());
+    }
+
+    #[test]
+    fn hidden_oracle_ignores_claw_runtime_state() {
+        let task = BenchmarkTask {
+            id: "t".into(),
+            version: 1,
+            category: "mechanical".into(),
+            language: "text".into(),
+            prompt: "write".into(),
+            fixture: Fixture {
+                files: BTreeMap::new(),
+                mock_actions: Vec::new(),
+            },
+            visible_validation: None,
+            hidden_oracle: HiddenOracle {
+                expected_files: BTreeMap::from([(String::from("answer.txt"), String::from("ok"))]),
+                forbidden_paths: vec![],
+            },
+            expected_change_scope: vec![],
+            forbidden_changes: vec![],
+            timeout_seconds: 1,
+            max_agent_turns: 1,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        fs::create_dir_all(project.join(".claw/sessions")).unwrap();
+        fs::write(project.join("answer.txt"), "ok").unwrap();
+        fs::write(
+            project.join(".claw/sessions/session.jsonl"),
+            "runtime state",
+        )
+        .unwrap();
         assert!(evaluate_oracle(&project, &task).unwrap());
     }
 

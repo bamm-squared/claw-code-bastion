@@ -234,11 +234,13 @@ impl ResponsesStream {
             }
             if let Some(chunk) = self.response.chunk().await? {
                 self.buffer.extend_from_slice(&chunk);
+                let mut parsed_events = Vec::new();
                 while let Some(frame) = take_sse_frame(&mut self.buffer) {
                     if let Some(event) = self.state.ingest(&frame)? {
-                        self.pending.extend(event.into_iter().rev());
+                        parsed_events.extend(event);
                     }
                 }
+                self.pending.extend(parsed_events.into_iter().rev());
             } else {
                 self.done = true;
                 self.pending.extend(self.state.finish().into_iter().rev());

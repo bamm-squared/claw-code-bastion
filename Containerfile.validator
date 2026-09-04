@@ -7,7 +7,11 @@ RUN apt-get update \
 ENV CARGO_TERM_COLOR=always \
     CARGO_NET_OFFLINE=true \
     PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-RUN cargo --version && rustc --version
+RUN rustup component add rustfmt clippy \
+    && cargo --version \
+    && rustc --version \
+    && cargo fmt --version \
+    && cargo clippy --version
 WORKDIR /workspace/project
 
 ENTRYPOINT ["/bin/sh"]

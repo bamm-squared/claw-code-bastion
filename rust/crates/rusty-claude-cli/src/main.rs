@@ -5725,7 +5725,9 @@ impl LiveCli {
             return Ok(false);
         }
 
+        benchmark_telemetry::lifecycle_event("candidate_review_started");
         if !io::stdin().is_terminal() {
+            benchmark_telemetry::lifecycle_event("interactive_review_unavailable");
             runtime.discard_candidate()?;
             self.candidate_state = CandidateLifecycleState::Discarded;
             return Ok(false);
