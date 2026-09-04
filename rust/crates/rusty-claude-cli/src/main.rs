@@ -4083,6 +4083,7 @@ struct LiveCli {
     last_routing_explanation: Option<String>,
     selected_writer_profile: Option<model_router::ModelProfile>,
     selected_evaluator_profile: Option<model_router::ModelProfile>,
+    evaluator_routing_signals: Option<model_router::TaskSignals>,
     calibration_path: Option<PathBuf>,
     pending_rework: Option<model_router::EscalationPackage>,
     rework_profile: Option<model_router::ModelProfile>,
@@ -4104,6 +4105,7 @@ struct ContextTrayItem {
 enum CandidateLifecycleState {
     Editing,
     ValidationBlocked,
+    EvaluationBlocked,
     ReviewReady,
     Applied,
     Discarded,
@@ -4113,7 +4115,7 @@ impl CandidateLifecycleState {
     fn reuses_candidate(self) -> bool {
         matches!(
             self,
-            Self::Editing | Self::ValidationBlocked | Self::ReviewReady
+            Self::Editing | Self::ValidationBlocked | Self::EvaluationBlocked | Self::ReviewReady
         )
     }
 }
@@ -5047,6 +5049,7 @@ impl LiveCli {
             last_routing_explanation: None,
             selected_writer_profile: None,
             selected_evaluator_profile: None,
+            evaluator_routing_signals: None,
             calibration_path,
             pending_rework: None,
             rework_profile: None,
@@ -5400,6 +5403,10 @@ impl LiveCli {
 
     fn prepare_exploration(&mut self, input: &str) {
         orchestration_trace("exploration_started");
+        if self.exploration_input.as_deref() != Some(input) && self.pending_rework.is_none() {
+            self.selected_evaluator_profile = None;
+            self.evaluator_routing_signals = None;
+        }
         if self.exploration_input.as_deref() == Some(input) || self.pending_rework.is_some() {
             return;
         }
@@ -5877,15 +5884,34 @@ impl LiveCli {
                     &validation_diagnostics,
                     &validation_intelligence_evidence.render(),
                 );
+            let evaluator_signals = self
+                .evaluator_routing_signals
+                .unwrap_or_else(|| routing_signals(&self.task_plan));
+            self.evaluator_routing_signals = Some(evaluator_signals);
             let evaluator_route = model_router::ModelRouter::route_with_calibration(
                 &self.model_pool,
                 &self.calibration,
                 model_router::ModelRole::Evaluator,
-                routing_signals(&self.task_plan),
+                evaluator_signals,
                 &self.routing_policy,
             );
             self.selected_evaluator_profile
                 .clone_from(&evaluator_route.selected);
+            benchmark_telemetry::evaluator_routing(
+                evaluator_route
+                    .selected
+                    .as_ref()
+                    .map(|profile| profile.id.as_str()),
+                &evaluator_route.reason,
+                evaluator_route
+                    .rejections
+                    .iter()
+                    .map(|rejection| benchmark_telemetry::RoutingRejection {
+                        profile_id: rejection.profile_id.clone(),
+                        reason: rejection.reason.clone(),
+                    })
+                    .collect(),
+            );
             let evidence = requirement_evaluator::RequirementEvaluator::render_request(&request);
             println!(
                 "Evaluator routing: {}\nEvidence package: {} bytes; writer conversation excluded",
@@ -5926,10 +5952,6 @@ impl LiveCli {
             .clone()
             .unwrap_or_else(|| evaluation.clone());
         println!("\nRequirement evaluation\n{}", active_evaluation.summary());
-        self.record_runtime_calibration(
-            validation.allows_apply(changes.id, policy, false),
-            !active_evaluation.has_rework_finding(),
-        );
 
         if active_evaluation.has_rework_finding() {
             if let Err(error) = self.checkpoint_before_rework(runtime, &changes) {
@@ -5951,6 +5973,24 @@ impl LiveCli {
         }
         if let Some(reason) = &self.rework_blocked {
             println!("Automatic correction unavailable: {reason}");
+        }
+
+        // Do not let an intermediate evaluation/rework outcome change routing
+        // for the same candidate. Record the terminal outcome only after no
+        // further evaluator or repair job will be selected for this state.
+        self.record_runtime_calibration(
+            validation.allows_apply(changes.id, policy, false),
+            &active_evaluation,
+        );
+
+        if !active_evaluation.allows_review() {
+            let reason = active_evaluation.error.as_deref().unwrap_or(
+                "independent semantic evaluation did not establish that all requirements are satisfied",
+            );
+            benchmark_telemetry::evaluation_blocked(reason);
+            self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
+            println!("Review blocked: {reason}");
+            return Ok(false);
         }
 
         // Review readiness is a trusted synchronization point for the
@@ -6052,7 +6092,11 @@ impl LiveCli {
         Ok(false)
     }
 
-    fn record_runtime_calibration(&mut self, validation_passed: bool, evaluation_passed: bool) {
+    fn record_runtime_calibration(
+        &mut self,
+        validation_passed: bool,
+        evaluation: &requirement_evaluator::EvaluationReport,
+    ) {
         if is_private_mode() {
             return;
         }
@@ -6067,9 +6111,13 @@ impl LiveCli {
             |duration| duration.as_secs().to_string(),
         );
         let mut store = self.calibration.clone();
+        let evaluator_execution_succeeded =
+            evaluation.error.is_none() && !evaluation.requirements.is_empty();
+        let requirements_satisfied = evaluation.allows_review();
         let mut record = |profile: &model_router::ModelProfile,
                           role: model_router::ModelRole,
-                          passed: bool,
+                          first_pass_success: bool,
+                          evaluation_passed: bool,
                           rework: bool| {
             let outcome = model_router::OutcomeMetadata {
                 profile_id: profile.id.clone(),
@@ -6077,9 +6125,9 @@ impl LiveCli {
                 role,
                 runtime_identity: env!("CARGO_PKG_VERSION").to_string(),
                 difficulty_bucket: bucket,
-                first_pass_success: passed && validation_passed,
+                first_pass_success,
                 validation_passed,
-                evaluation_passed: Some(passed),
+                evaluation_passed: Some(evaluation_passed),
                 rework_required: rework,
                 escalation_required: self.escalation_requested,
                 elapsed_ms: None,
@@ -6091,15 +6139,17 @@ impl LiveCli {
             record(
                 &profile,
                 model_router::ModelRole::Writer,
-                evaluation_passed,
-                !evaluation_passed,
+                validation_passed && requirements_satisfied,
+                requirements_satisfied,
+                !requirements_satisfied,
             );
         }
         if let Some(profile) = self.selected_evaluator_profile.clone() {
             record(
                 &profile,
                 model_router::ModelRole::Evaluator,
-                evaluation_passed,
+                evaluator_execution_succeeded,
+                evaluator_execution_succeeded,
                 false,
             );
         }
@@ -7795,6 +7845,7 @@ fn trusted_hud_line(
     let candidate = match candidate_state {
         CandidateLifecycleState::Editing => "editing",
         CandidateLifecycleState::ValidationBlocked => "validation-blocked",
+        CandidateLifecycleState::EvaluationBlocked => "evaluation-blocked",
         CandidateLifecycleState::ReviewReady => "review-ready",
         CandidateLifecycleState::Applied => "applied",
         CandidateLifecycleState::Discarded => "discarded",
@@ -8373,6 +8424,7 @@ fn candidate_state_label(state: CandidateLifecycleState) -> &'static str {
     match state {
         CandidateLifecycleState::Editing => "editing",
         CandidateLifecycleState::ValidationBlocked => "validation-blocked",
+        CandidateLifecycleState::EvaluationBlocked => "evaluation-blocked",
         CandidateLifecycleState::ReviewReady => "review-ready",
         CandidateLifecycleState::Applied => "applied",
         CandidateLifecycleState::Discarded => "discarded",
@@ -11884,6 +11936,7 @@ mod tests {
     fn candidate_lifecycle_reuses_only_non_terminal_candidates() {
         assert!(CandidateLifecycleState::Editing.reuses_candidate());
         assert!(CandidateLifecycleState::ValidationBlocked.reuses_candidate());
+        assert!(CandidateLifecycleState::EvaluationBlocked.reuses_candidate());
         assert!(CandidateLifecycleState::ReviewReady.reuses_candidate());
         assert!(!CandidateLifecycleState::Applied.reuses_candidate());
         assert!(!CandidateLifecycleState::Discarded.reuses_candidate());

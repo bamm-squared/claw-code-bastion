@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 
-pub const CALIBRATION_SCHEMA_VERSION: u32 = 1;
+// Version 2 changes observed evaluator outcomes to distinguish successful
+// gap detection from evaluator failure. Older observations cannot be safely
+// interpreted under that distinction and are therefore ignored on load.
+pub const CALIBRATION_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum CalibrationEvidenceKind {

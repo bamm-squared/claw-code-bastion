@@ -307,6 +307,16 @@ fn parse_model_evaluation(response: &str) -> Result<ModelEvaluationEnvelope, Str
 
 impl EvaluationReport {
     #[must_use]
+    pub fn allows_review(&self) -> bool {
+        self.validation_passed
+            && self.error.is_none()
+            && !self.requirements.is_empty()
+            && self.requirements.iter().all(|finding| {
+                finding.state == RequirementState::Satisfied && !finding.rework_recommended
+            })
+    }
+
+    #[must_use]
     pub fn has_rework_finding(&self) -> bool {
         self.requirements
             .iter()
@@ -372,6 +382,23 @@ mod tests {
             .iter()
             .all(|finding| finding.state == RequirementState::Uncertain));
         assert!(!report.has_rework_finding());
+        assert!(!report.allows_review());
+    }
+
+    #[test]
+    fn review_requires_successful_complete_semantic_evaluation() {
+        let satisfied = RequirementEvaluator::from_model_response(
+            r#"{"requirements":[{"requirement_id":"r1","state":"satisfied","finding":"ok","evidence":"tests pass","confidence":"high","rework_recommended":false}]}"#,
+            true,
+        )
+        .expect("satisfied evaluator response");
+        assert!(satisfied.allows_review());
+
+        assert!(!RequirementEvaluator::unavailable(true, "no eligible profile").allows_review());
+        assert!(
+            !RequirementEvaluator::deterministic(&plan(), &["src/provider.rs".into()], true,)
+                .allows_review()
+        );
     }
 
     #[test]

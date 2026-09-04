@@ -173,7 +173,16 @@ def tool_for(index, task, repair=False, inject_validation_failure=False):
     return actions_for(task, repair, inject_validation_failure)[index]
 
 
-def response(number, stream, task, rework_test=False):
+def response(
+    number,
+    stream,
+    task,
+    rework_test=False,
+    evaluator_unavailable=False,
+    is_evaluator=False,
+    evaluator_call=0,
+    writer_index=0,
+):
     response_id = f"local-{number}"
     if number <= 3:
         finding = json.dumps(
@@ -196,8 +205,10 @@ def response(number, stream, task, rework_test=False):
             ],
             "usage": {"input_tokens": 10, "output_tokens": 5},
         }
-    if not stream:
-        if rework_test and number == 15:
+    if is_evaluator:
+        if evaluator_unavailable:
+            evaluation = "The evaluator is unavailable for this deterministic regression."
+        elif rework_test and evaluator_call == 1:
             evaluation = json.dumps(
                 {
                     "requirements": [
@@ -241,11 +252,13 @@ def response(number, stream, task, rework_test=False):
             "usage": {"input_tokens": 10, "output_tokens": 5},
         }
 
-    repair = rework_test and number >= 16
-    writer_start = 16 if repair else 4
-    index = number - writer_start
-    if index < len(actions_for(task, repair)):
-        name, arguments = tool_for(index, task, repair, rework_test)
+    repair = rework_test and evaluator_call > 0
+    inject_validation_failure = rework_test and evaluator_call == 0
+    actions = actions_for(task, repair, inject_validation_failure)
+    if writer_index < len(actions):
+        name, arguments = tool_for(
+            writer_index, task, repair, inject_validation_failure
+        )
         item_id = f"item-{number}"
         call_id = f"call-{number}"
         encoded = json.dumps(arguments, separators=(",", ":"))
@@ -313,8 +326,11 @@ def response(number, stream, task, rework_test=False):
 
 class ResponsesHandler(BaseHTTPRequestHandler):
     request_number = 0
+    evaluator_calls = 0
+    writer_calls_since_evaluator = 0
     task = "config-threading"
     rework_test = False
+    evaluator_unavailable = False
 
     def log_message(self, format_string, *args):
         print(f"fake-responses request={self.request_number} path={self.path}", flush=True)
@@ -324,11 +340,28 @@ class ResponsesHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("content-length", "0"))
         request = json.loads(self.rfile.read(length))
         stream = bool(request.get("stream", True))
+        is_evaluator = "Independent Requirement Evaluation" in json.dumps(request)
+        if is_evaluator:
+            ResponsesHandler.evaluator_calls += 1
+            ResponsesHandler.writer_calls_since_evaluator = 0
+            evaluator_call = ResponsesHandler.evaluator_calls
+            writer_index = 0
+        elif ResponsesHandler.request_number > 3:
+            evaluator_call = ResponsesHandler.evaluator_calls
+            writer_index = ResponsesHandler.writer_calls_since_evaluator
+            ResponsesHandler.writer_calls_since_evaluator += 1
+        else:
+            evaluator_call = ResponsesHandler.evaluator_calls
+            writer_index = 0
         payload = response(
             ResponsesHandler.request_number,
             stream,
             ResponsesHandler.task,
             ResponsesHandler.rework_test,
+            ResponsesHandler.evaluator_unavailable,
+            is_evaluator,
+            evaluator_call,
+            writer_index,
         )
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream" if stream else "application/json")
@@ -359,9 +392,15 @@ def main():
         action="store_true",
         help="fail the first retry-policy candidate, then provide a repair sequence",
     )
+    parser.add_argument(
+        "--evaluator-unavailable",
+        action="store_true",
+        help="return an invalid evaluator response so Review must fail closed",
+    )
     args = parser.parse_args()
     ResponsesHandler.task = args.task
     ResponsesHandler.rework_test = args.rework_test
+    ResponsesHandler.evaluator_unavailable = args.evaluator_unavailable
     server = HTTPServer((args.host, args.port), ResponsesHandler)
     if args.port_file:
         args.port_file.write_text(str(server.server_address[1]) + "\n")
