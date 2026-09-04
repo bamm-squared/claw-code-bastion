@@ -76,7 +76,9 @@ use tools::{
 };
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
-const MAX_REWORK_CYCLES: u8 = 2;
+const MAX_VALIDATION_REPAIR_CYCLES: u8 = 2;
+const MAX_EVALUATOR_REWORK_CYCLES: u8 = 1;
+const MAX_TOTAL_CORRECTION_CYCLES: u8 = MAX_VALIDATION_REPAIR_CYCLES + MAX_EVALUATOR_REWORK_CYCLES;
 fn max_tokens_for_model(model: &str) -> u32 {
     let model = model.to_ascii_lowercase();
     if model.starts_with("gpt-4o") {
@@ -4088,6 +4090,8 @@ struct LiveCli {
     pending_rework: Option<model_router::EscalationPackage>,
     rework_profile: Option<model_router::ModelProfile>,
     rework_cycles: u8,
+    validation_repair_cycles: u8,
+    evaluator_rework_cycles: u8,
     escalation_requested: bool,
     rework_blocked: Option<String>,
     exploration_input: Option<String>,
@@ -5054,6 +5058,8 @@ impl LiveCli {
             pending_rework: None,
             rework_profile: None,
             rework_cycles: 0,
+            validation_repair_cycles: 0,
+            evaluator_rework_cycles: 0,
             escalation_requested: false,
             rework_blocked: None,
             exploration_input: None,
@@ -6247,6 +6253,7 @@ impl LiveCli {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn record_evaluation_rework(
         &mut self,
         evaluation: &requirement_evaluator::EvaluationReport,
@@ -6254,12 +6261,27 @@ impl LiveCli {
         validation_evidence: &str,
         validation_passed: bool,
     ) {
-        if self.rework_cycles >= MAX_REWORK_CYCLES {
+        let validation_repair = !validation_passed;
+        let (used_cycles, cycle_limit, phase) = if validation_repair {
+            (
+                self.validation_repair_cycles,
+                MAX_VALIDATION_REPAIR_CYCLES,
+                "validation repair",
+            )
+        } else {
+            (
+                self.evaluator_rework_cycles,
+                MAX_EVALUATOR_REWORK_CYCLES,
+                "evaluator rework",
+            )
+        };
+        if used_cycles >= cycle_limit || self.rework_cycles >= MAX_TOTAL_CORRECTION_CYCLES {
+            let reason = format!("{phase} limit reached");
             self.task_plan.add_discovered_item(
                 "Resolve remaining requirement evaluation findings with user guidance",
-                "rework limit reached",
+                &reason,
             );
-            self.rework_blocked = Some("rework limit reached".to_string());
+            self.rework_blocked = Some(reason);
             return;
         }
         for finding in &evaluation.requirements {
@@ -6269,6 +6291,13 @@ impl LiveCli {
             }
         }
         self.rework_cycles = self.rework_cycles.saturating_add(1);
+        if validation_repair {
+            self.validation_repair_cycles = self.validation_repair_cycles.saturating_add(1);
+            benchmark_telemetry::validation_repair_cycle();
+        } else {
+            self.evaluator_rework_cycles = self.evaluator_rework_cycles.saturating_add(1);
+            benchmark_telemetry::evaluator_rework_cycle();
+        }
         let current_profile = self.selected_writer_profile.clone();
         let escalation = evaluation.requirements.iter().any(|finding| {
             finding.rework_recommended
@@ -6344,7 +6373,6 @@ impl LiveCli {
             repository_intelligence: self.task_plan.known_impact.join("\n"),
             unresolved_questions: self.task_plan.open_questions.clone(),
         });
-        benchmark_telemetry::rework_cycle();
         if escalation {
             self.last_routing_explanation = Some(
                 "Evaluation identified a likely capability-sensitive gap; next retained-candidate rework may escalate."

@@ -136,8 +136,26 @@ fn client_uses_the_capped_policy() {
 }
 """
 
+RETRY_CLIENT_TESTS_UNCAPPED = """use claw_retry_fixture::{client::Client, config::RetryConfig};
 
-def actions_for(task, repair=False, inject_validation_failure=False):
+#[test]
+fn client_uses_configured_retry_delays() {
+    let client = Client::new(RetryConfig {
+        max_attempts: 5,
+        base_delay_ms: 50,
+        max_delay_ms: 500,
+    });
+    assert_eq!(client.retry_delays(3), vec![50, 100, 200]);
+}
+"""
+
+
+def actions_for(
+    task,
+    repair=False,
+    inject_validation_failure=False,
+    inject_evaluator_gap=False,
+):
     if task == "retry-policy":
         return [
             ("read_file", {"path": "Cargo.toml"}),
@@ -157,7 +175,15 @@ def actions_for(task, repair=False, inject_validation_failure=False):
                 },
             ),
             ("write_file", {"path": "tests/retry.rs", "content": RETRY_TESTS}),
-            ("write_file", {"path": "tests/client.rs", "content": RETRY_CLIENT_TESTS}),
+            (
+                "write_file",
+                {
+                    "path": "tests/client.rs",
+                    "content": RETRY_CLIENT_TESTS_UNCAPPED
+                    if inject_evaluator_gap and not repair
+                    else RETRY_CLIENT_TESTS,
+                },
+            ),
         ]
     return [
         ("read_file", {"path": "src/config.rs"}),
@@ -169,8 +195,16 @@ def actions_for(task, repair=False, inject_validation_failure=False):
     ]
 
 
-def tool_for(index, task, repair=False, inject_validation_failure=False):
-    return actions_for(task, repair, inject_validation_failure)[index]
+def tool_for(
+    index,
+    task,
+    repair=False,
+    inject_validation_failure=False,
+    inject_evaluator_gap=False,
+):
+    return actions_for(
+        task, repair, inject_validation_failure, inject_evaluator_gap
+    )[index]
 
 
 def response(
@@ -178,6 +212,7 @@ def response(
     stream,
     task,
     rework_test=False,
+    evaluator_rework_test=False,
     evaluator_unavailable=False,
     is_evaluator=False,
     evaluator_call=0,
@@ -208,15 +243,21 @@ def response(
     if is_evaluator:
         if evaluator_unavailable:
             evaluation = "The evaluator is unavailable for this deterministic regression."
-        elif rework_test and evaluator_call == 1:
+        elif (rework_test or evaluator_rework_test) and evaluator_call == 1:
+            if evaluator_rework_test:
+                finding = "Client integration does not verify the configured delay ceiling."
+                evidence = "tests/client.rs only exercises an uncapped retry schedule."
+            else:
+                finding = "Cross-module validation failed; repair using the trusted diagnostic."
+                evidence = "The candidate did not pass trusted validation."
             evaluation = json.dumps(
                 {
                     "requirements": [
                         {
                             "requirement_id": "task",
                             "state": "gap_found",
-                            "finding": "Cross-module validation failed; repair using the trusted diagnostic.",
-                            "evidence": "The candidate did not pass trusted validation.",
+                            "finding": finding,
+                            "evidence": evidence,
                             "confidence": "high",
                             "rework_recommended": True,
                         }
@@ -252,12 +293,19 @@ def response(
             "usage": {"input_tokens": 10, "output_tokens": 5},
         }
 
-    repair = rework_test and evaluator_call > 0
+    repair = (rework_test or evaluator_rework_test) and evaluator_call > 0
     inject_validation_failure = rework_test and evaluator_call == 0
-    actions = actions_for(task, repair, inject_validation_failure)
+    inject_evaluator_gap = evaluator_rework_test and evaluator_call == 0
+    actions = actions_for(
+        task, repair, inject_validation_failure, inject_evaluator_gap
+    )
     if writer_index < len(actions):
         name, arguments = tool_for(
-            writer_index, task, repair, inject_validation_failure
+            writer_index,
+            task,
+            repair,
+            inject_validation_failure,
+            inject_evaluator_gap,
         )
         item_id = f"item-{number}"
         call_id = f"call-{number}"
@@ -330,6 +378,7 @@ class ResponsesHandler(BaseHTTPRequestHandler):
     writer_calls_since_evaluator = 0
     task = "config-threading"
     rework_test = False
+    evaluator_rework_test = False
     evaluator_unavailable = False
 
     def log_message(self, format_string, *args):
@@ -358,6 +407,7 @@ class ResponsesHandler(BaseHTTPRequestHandler):
             stream,
             ResponsesHandler.task,
             ResponsesHandler.rework_test,
+            ResponsesHandler.evaluator_rework_test,
             ResponsesHandler.evaluator_unavailable,
             is_evaluator,
             evaluator_call,
@@ -397,9 +447,15 @@ def main():
         action="store_true",
         help="return an invalid evaluator response so Review must fail closed",
     )
+    parser.add_argument(
+        "--evaluator-rework-test",
+        action="store_true",
+        help="start with valid code but incomplete Client coverage, then provide evaluator rework",
+    )
     args = parser.parse_args()
     ResponsesHandler.task = args.task
     ResponsesHandler.rework_test = args.rework_test
+    ResponsesHandler.evaluator_rework_test = args.evaluator_rework_test
     ResponsesHandler.evaluator_unavailable = args.evaluator_unavailable
     server = HTTPServer((args.host, args.port), ResponsesHandler)
     if args.port_file:

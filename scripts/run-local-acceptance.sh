@@ -3,23 +3,40 @@ set -Eeuo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TASK_ID=config-threading
+TASKS_PATH="$ROOT/benchmarks/tasks.v1.json"
 WORKER_IMAGE=${CLAW_ACCEPTANCE_WORKER_IMAGE:-ghcr.io/bamm-squared/claw-bastion-runtime:0.1.0-rc.2}
 VALIDATOR_IMAGE=${CLAW_ACCEPTANCE_VALIDATOR_IMAGE:-claw-bastion-validator-rust:0.1.0-rc.2}
 SETTINGS_PATH=${CLAW_ACCEPTANCE_SETTINGS_PATH:-"$ROOT/benchmarks/settings.local.json"}
 ARTIFACTS_DIR=${CLAW_ACCEPTANCE_ARTIFACTS_DIR:-"$ROOT/artifacts/acceptance/$(date -u +%Y%m%dT%H%M%SZ)-$$"}
+PROVIDER_FLAGS=()
 
 usage() {
     cat <<'EOF'
-Usage: scripts/run-local-acceptance.sh [--artifacts-dir PATH]
+Usage: scripts/run-local-acceptance.sh [--task ID] [--rework-test]
+       [--evaluator-rework-test] [--evaluator-unavailable]
+       [--artifacts-dir PATH]
 
-Runs the single repository-owned config-threading acceptance against the
-loopback deterministic Responses provider. It never contacts an external
-provider.
+Runs one repository-owned acceptance task against the loopback deterministic
+Responses provider. It never contacts an external provider.
 EOF
 }
 
 while (($#)); do
     case "$1" in
+        --task)
+            (($# >= 2)) || { echo "--task requires an ID" >&2; exit 2; }
+            TASK_ID=$2
+            case "$TASK_ID" in
+                config-threading) TASKS_PATH="$ROOT/benchmarks/tasks.v1.json" ;;
+                retry-policy) TASKS_PATH="$ROOT/benchmarks/tasks.realistic.v1.json" ;;
+                *) echo "unsupported task: $TASK_ID" >&2; exit 2 ;;
+            esac
+            shift 2
+            ;;
+        --rework-test|--evaluator-rework-test|--evaluator-unavailable)
+            PROVIDER_FLAGS+=("$1")
+            shift
+            ;;
         --artifacts-dir)
             (($# >= 2)) || { echo "--artifacts-dir requires a path" >&2; exit 2; }
             ARTIFACTS_DIR=$2
@@ -99,7 +116,8 @@ echo "building workspace" | tee "$BUILD_LOG"
 echo "starting repository-owned fake Responses provider" | tee "$PROVIDER_LOG"
 python3 "$ROOT/benchmarks/fake_responses_provider.py" \
     --host 127.0.0.1 --port 0 \
-    --port-file "$PORT_FILE" --ready-file "$READY_FILE" >>"$PROVIDER_LOG" 2>&1 &
+    --port-file "$PORT_FILE" --ready-file "$READY_FILE" \
+    --task "$TASK_ID" "${PROVIDER_FLAGS[@]}" >>"$PROVIDER_LOG" 2>&1 &
 provider_pid=$!
 for _ in {1..100}; do
     if [[ -f "$READY_FILE" && -s "$PORT_FILE" ]]; then
@@ -129,7 +147,7 @@ set +e
         CLAW_VALIDATOR_IMAGE="$VALIDATOR_IMAGE" \
         "$ROOT/rust/target/debug/agent-bench" run \
         --execution production --interactive \
-        --tasks "$ROOT/benchmarks/tasks.v1.json" --task "$TASK_ID" \
+        --tasks "$TASKS_PATH" --task "$TASK_ID" \
         --models "$ROOT/benchmarks/models.local.json" \
         --settings "$SETTINGS_PATH" \
         --binary "$ROOT/rust/target/debug/claw" \

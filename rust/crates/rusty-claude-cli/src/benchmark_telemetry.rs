@@ -53,6 +53,8 @@ pub struct Snapshot {
     pub validation_checks: Vec<ValidationDiagnostic>,
     pub validation_history: Vec<ValidationAttempt>,
     pub rework_cycles: u64,
+    pub validation_repair_cycles: u64,
+    pub evaluator_rework_cycles: u64,
     pub evaluator_selected_profile: Option<String>,
     pub evaluator_route_reason: Option<String>,
     pub evaluator_route_rejections: Vec<RoutingRejection>,
@@ -432,8 +434,19 @@ pub fn validation_details(
     persist_snapshot();
 }
 
-pub fn rework_cycle() {
-    with_state(|s| s.snapshot.rework_cycles += 1);
+pub fn validation_repair_cycle() {
+    with_state(|s| {
+        s.snapshot.rework_cycles += 1;
+        s.snapshot.validation_repair_cycles += 1;
+    });
+    persist_snapshot();
+}
+
+pub fn evaluator_rework_cycle() {
+    with_state(|s| {
+        s.snapshot.rework_cycles += 1;
+        s.snapshot.evaluator_rework_cycles += 1;
+    });
     persist_snapshot();
 }
 
