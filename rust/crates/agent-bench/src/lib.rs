@@ -900,14 +900,14 @@ fn run_production_one(
         repetition,
         started_at_ms: started_at,
         finished_at_ms: epoch_ms(),
-        first_pass: if oracle_ok {
+        first_pass: if oracle_ok && production_rework_cycles(production_telemetry.as_ref()) == 0 {
             "FIRST_PASS_PASS"
         } else {
             "FIRST_PASS_FAIL"
         }
         .to_string(),
         final_correctness: if oracle_ok { "PASS" } else { "FAIL" }.to_string(),
-        rework_cycles: 0,
+        rework_cycles: production_rework_cycles(production_telemetry.as_ref()),
         usage,
         timing,
         activity,
@@ -1023,7 +1023,7 @@ fn production_failure_record(
         finished_at_ms: epoch_ms(),
         first_pass: "FIRST_PASS_FAIL".to_string(),
         final_correctness: "FAIL".to_string(),
-        rework_cycles: 0,
+        rework_cycles: production_rework_cycles(production_telemetry.as_ref()),
         usage: production_telemetry.as_ref().map_or_else(
             || zero_usage(profile),
             |telemetry| usage_from_production_telemetry(telemetry, benchmark_config, profile),
@@ -1316,6 +1316,14 @@ fn timing_from_production_telemetry(telemetry: &Value, fallback_ms: u128) -> Tim
 
 fn validation_from_production_telemetry(telemetry: &Value) -> String {
     telemetry_string(telemetry, "validation_result").unwrap_or_else(|| "NOT_REPORTED".to_string())
+}
+
+fn production_rework_cycles(telemetry: Option<&Value>) -> u32 {
+    telemetry
+        .and_then(|value| value.get("rework_cycles"))
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0)
 }
 
 fn split_partial_telemetry(error: &str) -> (String, Option<Value>) {

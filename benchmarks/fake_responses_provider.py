@@ -72,6 +72,23 @@ pub fn retry_delays(config: &RetryConfig, retry_count: u32) -> Vec<u64> {
 }
 """
 
+RETRY_BROKEN = """use crate::config::RetryConfig;
+
+pub fn backoff_delay_ms(config: &RetryConfig, retry_index: u32) -> u64 {
+    let multiplier = 1u64.checked_shl(retry_index).unwrap_or(u64::MAX);
+    config
+        .base_delay_ms
+        .saturating_mul(multiplier)
+        .min(config.max_delay_m)
+}
+
+pub fn retry_delays(config: &RetryConfig, retry_count: u32) -> Vec<u64> {
+    (0..retry_count)
+        .map(|index| backoff_delay_ms(config, index))
+        .collect()
+}
+"""
+
 RETRY_TESTS = """use claw_retry_fixture::{config::RetryConfig, retry};
 
 #[test]
@@ -120,7 +137,7 @@ fn client_uses_the_capped_policy() {
 """
 
 
-def actions_for(task):
+def actions_for(task, repair=False, inject_validation_failure=False):
     if task == "retry-policy":
         return [
             ("read_file", {"path": "Cargo.toml"}),
@@ -130,7 +147,15 @@ def actions_for(task):
             ("read_file", {"path": "tests/retry.rs"}),
             ("read_file", {"path": "tests/client.rs"}),
             ("write_file", {"path": "src/config.rs", "content": RETRY_CONFIG}),
-            ("write_file", {"path": "src/retry.rs", "content": RETRY}),
+            (
+                "write_file",
+                {
+                    "path": "src/retry.rs",
+                    "content": RETRY_BROKEN
+                    if inject_validation_failure and not repair
+                    else RETRY,
+                },
+            ),
             ("write_file", {"path": "tests/retry.rs", "content": RETRY_TESTS}),
             ("write_file", {"path": "tests/client.rs", "content": RETRY_CLIENT_TESTS}),
         ]
@@ -144,11 +169,11 @@ def actions_for(task):
     ]
 
 
-def tool_for(index, task):
-    return actions_for(task)[index]
+def tool_for(index, task, repair=False, inject_validation_failure=False):
+    return actions_for(task, repair, inject_validation_failure)[index]
 
 
-def response(number, stream, task):
+def response(number, stream, task, rework_test=False):
     response_id = f"local-{number}"
     if number <= 3:
         finding = json.dumps(
@@ -172,20 +197,36 @@ def response(number, stream, task):
             "usage": {"input_tokens": 10, "output_tokens": 5},
         }
     if not stream:
-        evaluation = json.dumps(
-            {
-                "requirements": [
-                    {
-                        "requirement_id": "task",
-                        "state": "satisfied",
-                        "finding": "All requested behavior is present.",
-                        "evidence": "Trusted validation passed.",
-                        "confidence": "high",
-                        "rework_recommended": False,
-                    }
-                ]
-            }
-        )
+        if rework_test and number == 15:
+            evaluation = json.dumps(
+                {
+                    "requirements": [
+                        {
+                            "requirement_id": "task",
+                            "state": "gap_found",
+                            "finding": "Cross-module validation failed; repair using the trusted diagnostic.",
+                            "evidence": "The candidate did not pass trusted validation.",
+                            "confidence": "high",
+                            "rework_recommended": True,
+                        }
+                    ]
+                }
+            )
+        else:
+            evaluation = json.dumps(
+                {
+                    "requirements": [
+                        {
+                            "requirement_id": "task",
+                            "state": "satisfied",
+                            "finding": "All requested behavior is present.",
+                            "evidence": "Trusted validation passed.",
+                            "confidence": "high",
+                            "rework_recommended": False,
+                        }
+                    ]
+                }
+            )
         return {
             "id": response_id,
             "object": "response",
@@ -200,9 +241,11 @@ def response(number, stream, task):
             "usage": {"input_tokens": 10, "output_tokens": 5},
         }
 
-    index = number - 4
-    if index < len(actions_for(task)):
-        name, arguments = tool_for(index, task)
+    repair = rework_test and number >= 16
+    writer_start = 16 if repair else 4
+    index = number - writer_start
+    if index < len(actions_for(task, repair)):
+        name, arguments = tool_for(index, task, repair, rework_test)
         item_id = f"item-{number}"
         call_id = f"call-{number}"
         encoded = json.dumps(arguments, separators=(",", ":"))
@@ -271,6 +314,7 @@ def response(number, stream, task):
 class ResponsesHandler(BaseHTTPRequestHandler):
     request_number = 0
     task = "config-threading"
+    rework_test = False
 
     def log_message(self, format_string, *args):
         print(f"fake-responses request={self.request_number} path={self.path}", flush=True)
@@ -280,7 +324,12 @@ class ResponsesHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("content-length", "0"))
         request = json.loads(self.rfile.read(length))
         stream = bool(request.get("stream", True))
-        payload = response(ResponsesHandler.request_number, stream, ResponsesHandler.task)
+        payload = response(
+            ResponsesHandler.request_number,
+            stream,
+            ResponsesHandler.task,
+            ResponsesHandler.rework_test,
+        )
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream" if stream else "application/json")
         self.send_header("x-request-id", f"local-req-{ResponsesHandler.request_number}")
@@ -305,8 +354,14 @@ def main():
     parser.add_argument(
         "--task", choices=["config-threading", "retry-policy"], default="config-threading"
     )
+    parser.add_argument(
+        "--rework-test",
+        action="store_true",
+        help="fail the first retry-policy candidate, then provide a repair sequence",
+    )
     args = parser.parse_args()
     ResponsesHandler.task = args.task
+    ResponsesHandler.rework_test = args.rework_test
     server = HTTPServer((args.host, args.port), ResponsesHandler)
     if args.port_file:
         args.port_file.write_text(str(server.server_address[1]) + "\n")

@@ -92,6 +92,7 @@ pub enum ValidationStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationCheckResult {
     pub name: String,
+    pub command: String,
     pub required: bool,
     pub status: ValidationStatus,
     pub exit_code: Option<i32>,
@@ -193,6 +194,7 @@ impl ValidationResult {
             validation_identity: plan.identity(backend),
             checks: vec![ValidationCheckResult {
                 name: String::from("validator startup"),
+                command: String::from("validator startup"),
                 required: true,
                 status: ValidationStatus::Blocked,
                 exit_code: None,
@@ -453,6 +455,7 @@ fn run_check(command: &[String], check: &ValidationCheck) -> io::Result<Validati
     let exit_code = child.try_wait()?.and_then(|status| status.code());
     Ok(ValidationCheckResult {
         name: check.name.clone(),
+        command: check.command.clone(),
         required: check.required,
         status,
         exit_code,
@@ -729,6 +732,7 @@ mod tests {
             validation_identity: ValidationIdentity([0; 32]),
             checks: vec![ValidationCheckResult {
                 name: String::from("test"),
+                command: String::from("test"),
                 required: true,
                 status: ValidationStatus::Fail,
                 exit_code: Some(1),

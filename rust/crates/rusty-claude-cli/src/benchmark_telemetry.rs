@@ -48,6 +48,11 @@ pub struct Snapshot {
     pub candidate_mutations: u64,
     pub validation_attempts: u64,
     pub validation_result: Option<String>,
+    pub validation_candidate_identity: Option<String>,
+    pub validation_identity: Option<String>,
+    pub validation_checks: Vec<ValidationDiagnostic>,
+    pub validation_history: Vec<ValidationAttempt>,
+    pub rework_cycles: u64,
     pub started_at_ms: u128,
     pub elapsed_ms: u128,
     pub terminal_status: String,
@@ -69,6 +74,24 @@ pub struct ProviderCallRecord {
     pub cache_write_tokens: u64,
     pub estimated_cost_usd: Option<f64>,
     pub price_source: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Default)]
+pub struct ValidationDiagnostic {
+    pub name: String,
+    pub command: String,
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Default)]
+pub struct ValidationAttempt {
+    pub candidate_identity: String,
+    pub validation_identity: String,
+    pub checks: Vec<ValidationDiagnostic>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -378,6 +401,29 @@ pub fn validation(result: &str) {
         s.snapshot.validation_attempts += 1;
         s.snapshot.validation_result = Some(result.into());
     });
+    persist_snapshot();
+}
+
+pub fn validation_details(
+    candidate_identity: &str,
+    validation_identity: &str,
+    checks: Vec<ValidationDiagnostic>,
+) {
+    with_state(|s| {
+        s.snapshot.validation_candidate_identity = Some(candidate_identity.to_string());
+        s.snapshot.validation_identity = Some(validation_identity.to_string());
+        s.snapshot.validation_checks.clone_from(&checks);
+        s.snapshot.validation_history.push(ValidationAttempt {
+            candidate_identity: candidate_identity.to_string(),
+            validation_identity: validation_identity.to_string(),
+            checks,
+        });
+    });
+    persist_snapshot();
+}
+
+pub fn rework_cycle() {
+    with_state(|s| s.snapshot.rework_cycles += 1);
     persist_snapshot();
 }
 

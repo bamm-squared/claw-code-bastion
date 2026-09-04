@@ -4085,6 +4085,7 @@ struct LiveCli {
     selected_evaluator_profile: Option<model_router::ModelProfile>,
     calibration_path: Option<PathBuf>,
     pending_rework: Option<model_router::EscalationPackage>,
+    rework_profile: Option<model_router::ModelProfile>,
     rework_cycles: u8,
     escalation_requested: bool,
     rework_blocked: Option<String>,
@@ -4520,6 +4521,34 @@ fn validation_status(validation: &runtime::validator::ValidationResult) -> &'sta
     } else {
         "PASS"
     }
+}
+
+fn render_validation_evidence(validation: &runtime::validator::ValidationResult) -> String {
+    let mut output = format!(
+        "candidate_identity={} validation_identity={}\n",
+        validation.candidate_identity, validation.validation_identity
+    );
+    for check in &validation.checks {
+        let _ = writeln!(
+            output,
+            "check={} command={} status={} exit_code={:?}",
+            check.name,
+            check.command,
+            format_validation_status(check.status),
+            check.exit_code
+        );
+        let diagnostic = if check.stderr.is_empty() {
+            &check.stdout
+        } else {
+            &check.stderr
+        };
+        if !diagnostic.is_empty() {
+            output.push_str("diagnostic: ");
+            output.push_str(&truncate_for_summary(diagnostic, 2_000));
+            output.push('\n');
+        }
+    }
+    truncate_for_summary(&output, 12_000)
 }
 
 #[derive(Debug, Deserialize)]
@@ -5020,6 +5049,7 @@ impl LiveCli {
             selected_evaluator_profile: None,
             calibration_path,
             pending_rework: None,
+            rework_profile: None,
             rework_cycles: 0,
             escalation_requested: false,
             rework_blocked: None,
@@ -5039,6 +5069,16 @@ impl LiveCli {
 
     fn route_writer_for_current_task(&mut self) {
         orchestration_trace("writer_routing_started");
+        if let Some(profile) = self.rework_profile.clone() {
+            self.model.clone_from(&profile.model);
+            self.selected_writer_profile = Some(profile.clone());
+            self.last_routing_explanation = Some(format!(
+                "Bounded validation repair reuses the initially selected profile {}.",
+                profile.id
+            ));
+            orchestration_trace(format!("writer_profile_selected profile={}", profile.id));
+            return;
+        }
         if self.routing_policy.disable_automatic
             && self.explicit_writer_profile.is_none()
             && !self.escalation_requested
@@ -5759,10 +5799,27 @@ impl LiveCli {
 
         benchmark_telemetry::lifecycle_event("validation_started");
         let validation = runtime.validate_candidate(&changes)?;
-        benchmark_telemetry::validation("completed");
+        let validation_diagnostics = render_validation_evidence(&validation);
+        benchmark_telemetry::validation_details(
+            &changes.id.to_string(),
+            &validation.validation_identity.to_string(),
+            validation
+                .checks
+                .iter()
+                .map(|check| benchmark_telemetry::ValidationDiagnostic {
+                    name: check.name.clone(),
+                    command: check.command.clone(),
+                    status: format_validation_status(check.status).to_string(),
+                    exit_code: check.exit_code,
+                    stdout: truncate_for_summary(&check.stdout, 2_000),
+                    stderr: truncate_for_summary(&check.stderr, 4_000),
+                    truncated: check.truncated,
+                })
+                .collect(),
+        );
+        benchmark_telemetry::validation(validation_status(&validation));
         benchmark_telemetry::lifecycle_event("validation_completed");
         if validation.has_infrastructure_failure() {
-            benchmark_telemetry::validation("blocked_infrastructure");
             self.candidate_state = CandidateLifecycleState::ValidationBlocked;
             println!(
                 "Validation blocked by infrastructure; candidate retained and no evaluator or rework was started."
@@ -5791,7 +5848,7 @@ impl LiveCli {
             self.task_plan.authoritative_request(),
             runtime.execution_backend().as_ref(),
         );
-        let validation_evidence = validation_intelligence::analyze(
+        let validation_intelligence_evidence = validation_intelligence::analyze(
             &changed_paths,
             repository_context
                 .as_ref()
@@ -5817,8 +5874,8 @@ impl LiveCli {
                     &evaluation,
                     &changed_paths,
                     &candidate_diff,
-                    if normal_apply_allowed { "PASS" } else { "FAIL" },
-                    &validation_evidence.render(),
+                    &validation_diagnostics,
+                    &validation_intelligence_evidence.render(),
                 );
             let evaluator_route = model_router::ModelRouter::route_with_calibration(
                 &self.model_pool,
@@ -5880,7 +5937,12 @@ impl LiveCli {
             } else {
                 println!("Saved trusted candidate checkpoint before automatic rework.");
             }
-            self.record_evaluation_rework(&active_evaluation, &changed_paths, normal_apply_allowed);
+            self.record_evaluation_rework(
+                &active_evaluation,
+                &changed_paths,
+                &validation_diagnostics,
+                normal_apply_allowed,
+            );
             if self.pending_rework.is_some() {
                 self.candidate_state = CandidateLifecycleState::Editing;
                 println!("↻ Independent evaluation requested bounded automatic rework.");
@@ -6088,6 +6150,7 @@ impl LiveCli {
             let continue_rework = self.review_candidate_changes(&mut runtime)?;
             self.replace_runtime(runtime)?;
             if !continue_rework {
+                self.rework_profile = None;
                 return Ok(());
             }
         }
@@ -6120,6 +6183,7 @@ impl LiveCli {
             .restore(checkpoint_id, &candidate_root)?;
         self.evaluation = None;
         self.pending_rework = None;
+        self.rework_profile = None;
         self.escalation_requested = false;
         self.rework_blocked = None;
         self.task_plan.invalidate_after_candidate_restore();
@@ -6137,6 +6201,7 @@ impl LiveCli {
         &mut self,
         evaluation: &requirement_evaluator::EvaluationReport,
         changed_paths: &[String],
+        validation_evidence: &str,
         validation_passed: bool,
     ) {
         if self.rework_cycles >= MAX_REWORK_CYCLES {
@@ -6154,7 +6219,7 @@ impl LiveCli {
             }
         }
         self.rework_cycles = self.rework_cycles.saturating_add(1);
-        let signals = routing_signals(&self.task_plan);
+        let current_profile = self.selected_writer_profile.clone();
         let escalation = evaluation.requirements.iter().any(|finding| {
             finding.rework_recommended
                 && [
@@ -6168,6 +6233,7 @@ impl LiveCli {
                 .any(|term| finding.finding.to_ascii_lowercase().contains(term))
         });
         self.escalation_requested = escalation;
+        self.rework_profile = None;
         self.rework_blocked = None;
         if escalation {
             let current_id = self
@@ -6190,11 +6256,23 @@ impl LiveCli {
                 self.routing_policy.clone(),
             );
             if decision.selected.is_none() {
-                self.rework_blocked = Some(
-                    "REWORK REQUIRES STRONGER MODEL; NO ELIGIBLE CONFIGURED PROFILE AVAILABLE"
-                        .to_string(),
-                );
+                if validation_passed {
+                    self.rework_blocked = Some(
+                        "REWORK REQUIRES STRONGER MODEL; NO ELIGIBLE CONFIGURED PROFILE AVAILABLE"
+                            .to_string(),
+                    );
+                } else {
+                    self.rework_profile = current_profile.clone();
+                    self.escalation_requested = false;
+                    self.last_routing_explanation = Some(
+                        "No stronger profile qualified; trusted validation failure permits one bounded repair using the initially selected profile."
+                            .to_string(),
+                    );
+                }
             }
+        }
+        if !escalation {
+            self.rework_profile = current_profile;
         }
         if self.rework_blocked.is_some() {
             self.pending_rework = None;
@@ -6212,10 +6290,11 @@ impl LiveCli {
                 .collect::<Vec<_>>()
                 .join("\n"),
             evaluation_findings: evaluation.summary(),
-            validation_evidence: if validation_passed { "PASS" } else { "FAIL" }.to_string(),
+            validation_evidence: validation_evidence.to_string(),
             repository_intelligence: self.task_plan.known_impact.join("\n"),
             unresolved_questions: self.task_plan.open_questions.clone(),
         });
+        benchmark_telemetry::rework_cycle();
         if escalation {
             self.last_routing_explanation = Some(
                 "Evaluation identified a likely capability-sensitive gap; next retained-candidate rework may escalate."
