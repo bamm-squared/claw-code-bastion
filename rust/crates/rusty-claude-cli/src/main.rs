@@ -4257,6 +4257,7 @@ fn format_validation_status(status: runtime::ValidationStatus) -> &'static str {
 }
 
 const REVIEW_DIFF_MAX_BYTES: usize = 64 * 1024;
+const EVALUATION_DIFF_MAX_BYTES: usize = 48 * 1024;
 const REVIEW_SOURCE_MAX_BYTES: u64 = 256 * 1024;
 const REVIEW_LINE_MAX_CHARS: usize = 400;
 
@@ -4451,6 +4452,29 @@ fn render_candidate_file_diff(
         output.push_str(
             "\n... Diff truncated for display. Candidate identity covers the complete change.\n",
         );
+    }
+    output
+}
+
+fn render_candidate_evaluation_diff(
+    changes: &CandidateChangeSet,
+    baseline_root: &Path,
+    candidate_root: &Path,
+) -> String {
+    let mut output = String::new();
+    for change in &changes.changes {
+        if output.len() >= EVALUATION_DIFF_MAX_BYTES {
+            break;
+        }
+        let diff = render_candidate_file_diff(change, baseline_root, candidate_root);
+        let remaining = EVALUATION_DIFF_MAX_BYTES.saturating_sub(output.len());
+        if diff.len() <= remaining {
+            output.push_str(&diff);
+        } else {
+            output.push_str(&diff[..remaining]);
+            output.push_str("\n... Candidate evidence truncated at a bounded limit.\n");
+            break;
+        }
     }
     output
 }
@@ -5755,8 +5779,6 @@ impl LiveCli {
             }
             return Ok(false);
         }
-        self.candidate_state = CandidateLifecycleState::ReviewReady;
-        benchmark_telemetry::lifecycle_event("review_ready");
         let policy = runtime::ValidationPolicy::default();
         let normal_apply_allowed = validation.allows_apply(changes.id, policy, false);
         let blocked_apply_allowed = validation.allows_apply(changes.id, policy, true);
@@ -5783,11 +5805,18 @@ impl LiveCli {
         );
         self.evaluation = Some(evaluation.clone());
         if !evaluation.deterministic {
+            let candidate_diff = runtime.candidate_review_roots().map_or_else(
+                String::new,
+                |(baseline_root, candidate_root)| {
+                    render_candidate_evaluation_diff(&changes, &baseline_root, &candidate_root)
+                },
+            );
             let request =
-                requirement_evaluator::RequirementEvaluator::request_with_validation_evidence(
+                requirement_evaluator::RequirementEvaluator::request_with_candidate_evidence(
                     &self.task_plan,
                     &evaluation,
                     &changed_paths,
+                    &candidate_diff,
                     if normal_apply_allowed { "PASS" } else { "FAIL" },
                     &validation_evidence.render(),
                 );
@@ -5861,6 +5890,12 @@ impl LiveCli {
         if let Some(reason) = &self.rework_blocked {
             println!("Automatic correction unavailable: {reason}");
         }
+
+        // Review readiness is a trusted synchronization point for the
+        // interactive acceptance driver. Publish it only after validation
+        // and any independent evaluation/rework decision have completed.
+        self.candidate_state = CandidateLifecycleState::ReviewReady;
+        benchmark_telemetry::lifecycle_event("review_ready");
 
         let action = loop {
             println!("\n{}", render_review_overview(&changes, &validation));
@@ -9860,7 +9895,7 @@ fn execute_evaluator_profile(
         max_tokens: 2_048,
         messages: vec![InputMessage::user_text(request_text)],
         system: Some(
-            "You are an independent requirement evaluator. Return only JSON with a requirements array."
+            "You are an independent requirement evaluator. Return only one JSON object, with no markdown or prose, using exactly this shape: {\"requirements\":[{\"requirement_id\":\"...\",\"state\":\"satisfied|partially_satisfied|missing_evidence|gap_found|uncertain\",\"finding\":\"...\",\"evidence\":\"...\",\"confidence\":\"low|medium|high\",\"rework_recommended\":false}]}."
                 .to_string(),
         ),
         stream: false,
