@@ -546,10 +546,17 @@ fn build_responses_request(request: &MessageRequest) -> Value {
     for message in &request.messages {
         for block in &message.content {
             match block {
-                InputContentBlock::Text { text } => input.push(json!({
-                    "role": message.role,
-                    "content": [{"type": "input_text", "text": text}],
-                })),
+                InputContentBlock::Text { text } => {
+                    let content_type = if message.role == "assistant" {
+                        "output_text"
+                    } else {
+                        "input_text"
+                    };
+                    input.push(json!({
+                        "role": message.role,
+                        "content": [{"type": content_type, "text": text}],
+                    }));
+                }
                 InputContentBlock::Image { media_type, data } => input.push(json!({
                     "role": message.role,
                     "content": [{"type": "input_image", "image_url": format!("data:{media_type};base64,{data}")}],
@@ -646,5 +653,23 @@ mod tests {
         assert_eq!(payload["tools"][0]["type"], "function");
         assert_eq!(payload["reasoning"]["effort"], "medium");
         assert_eq!(payload["max_output_tokens"], 64);
+    }
+
+    #[test]
+    fn renders_assistant_text_as_responses_output_text() {
+        let request = MessageRequest {
+            model: "gpt-5.6-luna".into(),
+            max_tokens: 64,
+            messages: vec![InputMessage {
+                role: "assistant".into(),
+                content: vec![crate::types::InputContentBlock::Text {
+                    text: "previous assistant response".into(),
+                }],
+            }],
+            ..Default::default()
+        };
+        let payload = build_responses_request(&request);
+        assert_eq!(payload["input"][0]["role"], "assistant");
+        assert_eq!(payload["input"][0]["content"][0]["type"], "output_text");
     }
 }
