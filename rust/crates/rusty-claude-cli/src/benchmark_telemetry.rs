@@ -110,6 +110,8 @@ pub struct RequirementCoverage {
     pub id: String,
     pub status: String,
     pub evidence: String,
+    pub boundary: String,
+    pub basis: String,
 }
 
 #[derive(Clone, Debug, Serialize, Default)]

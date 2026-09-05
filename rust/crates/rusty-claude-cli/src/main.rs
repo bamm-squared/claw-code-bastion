@@ -6574,6 +6574,8 @@ impl LiveCli {
                     id: contract.id.clone(),
                     status: contract.status.label().to_string(),
                     evidence: contract.evidence.clone(),
+                    boundary: contract.verification_boundary.label().to_string(),
+                    basis: contract.verification_basis.clone(),
                 })
                 .collect(),
         );

@@ -40,9 +40,66 @@ pub struct ExpectedContract {
     pub expectation: String,
     pub basis: String,
     #[serde(default)]
+    pub verification_boundary: VerificationBoundary,
+    #[serde(default)]
+    pub verification_basis: String,
+    #[serde(default)]
     pub status: ContractStatus,
     #[serde(default)]
     pub evidence: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum VerificationBoundary {
+    #[default]
+    UnitBehavior,
+    PublicApi,
+    StateTransition,
+    Integration,
+    ProcessInteraction,
+    Compatibility,
+    ErrorPath,
+    Persistence,
+}
+
+impl VerificationBoundary {
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::UnitBehavior => "unit behavior",
+            Self::PublicApi => "public API",
+            Self::StateTransition => "state transition",
+            Self::Integration => "integration",
+            Self::ProcessInteraction => "process/interaction",
+            Self::Compatibility => "compatibility",
+            Self::ErrorPath => "error path",
+            Self::Persistence => "persistence",
+        }
+    }
+
+    #[must_use]
+    pub fn rationale(&self) -> &'static str {
+        match self {
+            Self::UnitBehavior => {
+                "the obligation describes local behavior that can be exercised directly"
+            }
+            Self::PublicApi => "the obligation concerns the behavior or shape exposed to callers",
+            Self::StateTransition => {
+                "the obligation depends on ordering, state, or repeated operations"
+            }
+            Self::Integration => "the obligation crosses module or subsystem boundaries",
+            Self::ProcessInteraction => {
+                "the obligation depends on a process, terminal, or user interaction boundary"
+            }
+            Self::Compatibility => {
+                "the obligation preserves existing callers or established behavior"
+            }
+            Self::ErrorPath => {
+                "the obligation concerns rejection, cancellation, or recovery behavior"
+            }
+            Self::Persistence => "the obligation must survive a storage or reload boundary",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -167,6 +224,11 @@ impl TaskPlan {
                 };
                 ExpectedContract {
                     id: format!("contract-{}", index + 1),
+                    verification_boundary: infer_verification_boundary(&expectation),
+                    verification_basis: format!(
+                        "{basis}; {}",
+                        infer_verification_boundary(&expectation).rationale()
+                    ),
                     expectation,
                     basis,
                     status: ContractStatus::default(),
@@ -251,12 +313,20 @@ impl TaskPlan {
         for contract in &mut self.contracts {
             if contract.status != ContractStatus::Verified {
                 contract.status = ContractStatus::CandidateEvidence;
-                contract.evidence = truncate(&evidence, MAX_STATEMENT_BYTES);
+                contract.evidence = truncate(
+                    &format!(
+                        "{evidence}; planned boundary: {}. Candidate edits are not behavioral proof at this boundary.",
+                        contract.verification_boundary.label()
+                    ),
+                    MAX_STATEMENT_BYTES,
+                );
             }
         }
+        self.revision = self.revision.saturating_add(1);
     }
 
     pub fn record_contract_evidence(&mut self, contract_id: &str, verified: bool, evidence: &str) {
+        let item_id = contract_item_id(contract_id);
         if let Some(contract) = self
             .contracts
             .iter_mut()
@@ -268,6 +338,18 @@ impl TaskPlan {
                 ContractStatus::Unresolved
             };
             contract.evidence = truncate(evidence, MAX_STATEMENT_BYTES);
+        }
+        if let Some(item) = self
+            .items
+            .iter_mut()
+            .find(|item| item.id == item_id.as_deref().unwrap_or(contract_id))
+        {
+            item.status = if verified {
+                PlanItemStatus::Verified
+            } else {
+                PlanItemStatus::NeedsResearch
+            };
+            item.provenance = truncate(evidence, MAX_STATEMENT_BYTES);
         }
         self.revision = self.revision.saturating_add(1);
     }
@@ -282,16 +364,24 @@ impl TaskPlan {
     }
 
     pub fn reopen_for_evaluation(&mut self, item_id: &str, reason: &str) {
-        if let Some(item) = self.items.iter_mut().find(|item| item.id == item_id) {
+        let plan_item_id = contract_item_id(item_id);
+        if let Some(item) = self
+            .items
+            .iter_mut()
+            .find(|item| item.id == plan_item_id.as_deref().unwrap_or(item_id))
+        {
             item.status = PlanItemStatus::NeedsResearch;
             item.provenance = truncate(reason, MAX_STATEMENT_BYTES);
             self.revision = self.revision.saturating_add(1);
         }
-        if let Some(contract) = self
-            .contracts
-            .iter_mut()
-            .find(|contract| contract.id == item_id)
-        {
+        if let Some(contract) = self.contracts.iter_mut().find(|contract| {
+            contract.id == item_id
+                || contract.id
+                    == format!(
+                        "contract-{}",
+                        item_id.strip_prefix("item-").unwrap_or(item_id)
+                    )
+        }) {
             contract.status = ContractStatus::Unresolved;
             contract.evidence = truncate(reason, MAX_STATEMENT_BYTES);
         }
@@ -348,8 +438,14 @@ impl TaskPlan {
                 output.push_str(" [");
                 output.push_str(&contract.basis);
                 output.push_str("; ");
+                output.push_str("boundary: ");
+                output.push_str(contract.verification_boundary.label());
+                output.push_str("; ");
                 output.push_str(contract.status.label());
                 output.push_str("]\n");
+                output.push_str("  verification basis: ");
+                output.push_str(&contract.verification_basis);
+                output.push('\n');
                 if !contract.evidence.is_empty() {
                     output.push_str("  evidence: ");
                     output.push_str(&contract.evidence);
@@ -384,6 +480,9 @@ impl TaskPlan {
         output.push_str(
             "Completion evidence audit: account for every work item and expected contract before declaring completion. Candidate edits establish implementation activity, not behavioral proof; verify behavior at its actual interaction boundary. If evidence is incomplete, keep the obligation unresolved and continue or report the uncertainty.\n",
         );
+        output.push_str(
+            "Verification planning: choose evidence that exercises each contract at its planned boundary; a nearby helper test is not sufficient when the obligation is public, integrated, stateful, persistent, error-facing, or interactive. Update the plan when a test surface cannot establish the obligation.\n",
+        );
         output.push_str("Open questions:\n");
         for question in &self.open_questions {
             output.push_str("- ");
@@ -394,6 +493,83 @@ impl TaskPlan {
             "Advisory only: source, trusted validation, and Review/Apply remain authoritative.\n",
         );
         output
+    }
+}
+
+fn contract_item_id(contract_id: &str) -> Option<String> {
+    contract_id
+        .strip_prefix("contract-")
+        .map(|number| format!("item-{number}"))
+}
+
+fn infer_verification_boundary(expectation: &str) -> VerificationBoundary {
+    let lower = expectation.to_ascii_lowercase();
+    if [
+        "interactive",
+        "stdin",
+        "stdout",
+        "terminal",
+        "prompt",
+        "process",
+        "cli",
+        "eof",
+        "input",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
+    {
+        VerificationBoundary::ProcessInteraction
+    } else if [
+        "compatib",
+        "backward",
+        "legacy",
+        "existing caller",
+        "public surface",
+        "preserve",
+        "unchanged",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
+    {
+        VerificationBoundary::Compatibility
+    } else if ["persist", "storage", "save", "load", "reload", "survive"]
+        .iter()
+        .any(|term| lower.contains(term))
+    {
+        VerificationBoundary::Persistence
+    } else if [
+        "state",
+        "transition",
+        "sequence",
+        "ordering",
+        "order-dependent",
+        "idempot",
+        "retry",
+        "history",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
+    {
+        VerificationBoundary::StateTransition
+    } else if ["across", "integration", "end-to-end", "subsystem", "module"]
+        .iter()
+        .any(|term| lower.contains(term))
+    {
+        VerificationBoundary::Integration
+    } else if [
+        "error", "invalid", "reject", "cancel", "failure", "recover", "must not",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
+    {
+        VerificationBoundary::ErrorPath
+    } else if ["api", "caller", "signature", "public"]
+        .iter()
+        .any(|term| lower.contains(term))
+    {
+        VerificationBoundary::PublicApi
+    } else {
+        VerificationBoundary::UnitBehavior
     }
 }
 
@@ -590,5 +766,40 @@ mod tests {
         assert_eq!(plan.contracts[0].status, ContractStatus::CandidateEvidence);
         assert!(!plan.all_contracts_verified());
         assert!(plan.render().contains("Completion evidence audit"));
+    }
+
+    #[test]
+    fn verification_boundary_is_derived_with_user_requirement_provenance() {
+        let plan = TaskPlan::from_request(
+            "Handle interactive stdin input. Preserve compatibility. Reject invalid values.",
+            None,
+        );
+        assert_eq!(
+            plan.contracts[0].verification_boundary,
+            VerificationBoundary::ProcessInteraction
+        );
+        assert_eq!(
+            plan.contracts[1].verification_boundary,
+            VerificationBoundary::Compatibility
+        );
+        assert_eq!(
+            plan.contracts[2].verification_boundary,
+            VerificationBoundary::ErrorPath
+        );
+        assert!(plan.contracts[0]
+            .verification_basis
+            .contains("user requirement"));
+        assert!(plan.render().contains("Verification planning"));
+    }
+
+    #[test]
+    fn insufficient_contract_evidence_reopens_matching_plan_item() {
+        let mut plan = TaskPlan::from_request("Handle interactive input.", None);
+        plan.mark_implemented("item-1", "candidate writer");
+        plan.record_candidate_evidence(&["src/tool.rs".to_string()]);
+        plan.record_contract_evidence("contract-1", false, "helper test only");
+        assert_eq!(plan.contracts[0].status, ContractStatus::Unresolved);
+        assert_eq!(plan.items[0].status, PlanItemStatus::NeedsResearch);
+        assert_eq!(plan.items[0].provenance, "helper test only");
     }
 }

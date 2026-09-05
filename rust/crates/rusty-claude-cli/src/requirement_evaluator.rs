@@ -208,8 +208,14 @@ impl RequirementEvaluator {
                 output.push_str(" [");
                 output.push_str(&contract.basis);
                 output.push_str("; ");
+                output.push_str("verification boundary: ");
+                output.push_str(contract.verification_boundary.label());
+                output.push_str("; ");
                 output.push_str(contract.status.label());
                 output.push_str("]\n");
+                output.push_str("  verification basis: ");
+                output.push_str(&contract.verification_basis);
+                output.push('\n');
                 if !contract.evidence.is_empty() {
                     output.push_str("  evidence: ");
                     output.push_str(&contract.evidence);
@@ -520,6 +526,7 @@ mod tests {
         assert!(rendered.contains("Validation relevance"));
         assert!(rendered.contains("test relationship unknown"));
         assert!(rendered.contains("Established requirements"));
+        assert!(rendered.contains("verification boundary"));
     }
 
     #[test]
