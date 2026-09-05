@@ -454,6 +454,52 @@ fn real_worker_edit_positive_control() {
 
 #[test]
 #[ignore = "requires a working rootless Podman runtime and CLAW_REAL_PODMAN_IMAGE"]
+fn real_worker_grep_empty_type_searches_mixed_language_surface() {
+    let (root, _canonical, candidate) = worker_fixture("grep-empty-type");
+    fs::create_dir_all(candidate.join("rust/crates/tools/src"))
+        .expect("create Rust source surface");
+    fs::create_dir_all(candidate.join("src")).expect("create Python source surface");
+    fs::write(
+        candidate.join("rust/crates/tools/src/lib.rs"),
+        "pub struct AskUserQuestion;\n",
+    )
+    .expect("write Rust source");
+    fs::write(
+        candidate.join("src/ask_user_question.py"),
+        "class AskUserQuestion:\n    pass\n",
+    )
+    .expect("write Python mirror");
+
+    let mut worker = PodmanWorkerClient::spawn(&worker_spec(&candidate)).expect("spawn worker");
+    let response = worker
+        .request(&json!({
+            "operation": "grep",
+            "input": {
+                "pattern": "AskUserQuestion",
+                "path": ".",
+                "type": "",
+                "output_mode": "files_with_matches"
+            }
+        }))
+        .expect("grep through rebuilt worker");
+    assert_eq!(response.get("ok"), Some(&Value::Bool(true)));
+    let filenames = response["result"]["filenames"]
+        .as_array()
+        .expect("grep filenames");
+    assert!(filenames
+        .iter()
+        .filter_map(Value::as_str)
+        .any(|path| path.ends_with("rust/crates/tools/src/lib.rs")));
+    assert!(filenames
+        .iter()
+        .filter_map(Value::as_str)
+        .any(|path| path.ends_with("src/ask_user_question.py")));
+    drop(worker);
+    fs::remove_dir_all(root).expect("clean mixed-language grep fixture");
+}
+
+#[test]
+#[ignore = "requires a working rootless Podman runtime and CLAW_REAL_PODMAN_IMAGE"]
 fn real_worker_outside_write_is_denied() {
     let (root, _canonical, candidate) = worker_fixture("worker-outside-write");
     let outside = root.join("outside.txt");
