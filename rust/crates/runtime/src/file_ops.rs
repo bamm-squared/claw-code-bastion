@@ -650,10 +650,12 @@ fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
         })
         .transpose()?;
     let file_type = input.file_type.as_deref().filter(|kind| {
-        !matches!(
-            kind.to_ascii_lowercase().as_str(),
-            "text" | "regex" | "literal" | "content"
-        )
+        let normalized = kind.trim().to_ascii_lowercase();
+        !normalized.is_empty()
+            && !matches!(
+                normalized.as_str(),
+                "text" | "regex" | "literal" | "content"
+            )
     });
     let output_mode = input
         .output_mode
@@ -1190,6 +1192,34 @@ mod tests {
         })
         .expect("grep should succeed");
         assert!(grep_output.content.unwrap_or_default().contains("hello"));
+    }
+
+    #[test]
+    fn empty_file_type_is_treated_as_unfiltered() {
+        let dir = temp_path("empty-grep-type");
+        std::fs::create_dir_all(&dir).expect("directory should be created");
+        std::fs::write(dir.join("demo.rs"), "pub fn target() {}\n")
+            .expect("Rust file should be written");
+
+        let output = grep_search(&GrepSearchInput {
+            pattern: String::from("target"),
+            path: Some(dir.to_string_lossy().into_owned()),
+            glob: None,
+            output_mode: Some(String::from("files_with_matches")),
+            before: None,
+            after: None,
+            context_short: None,
+            context: None,
+            line_numbers: None,
+            case_insensitive: None,
+            file_type: Some(String::new()),
+            head_limit: None,
+            offset: None,
+            multiline: None,
+        })
+        .expect("empty type should not restrict the search");
+
+        assert_eq!(output.num_files, 1);
     }
 
     #[test]
