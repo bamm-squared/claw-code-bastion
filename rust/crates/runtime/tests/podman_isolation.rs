@@ -11,11 +11,11 @@
 //! a real home directory, credential directory, or canonical checkout.
 
 use runtime::{
-    apply_approved_changes, create_disposable_snapshot, CandidateChangeSetId, ConfigSource,
-    McpServerConfig, McpServerManager, McpStdioServerConfig, NetworkCapability,
-    PodmanValidatorBackend, PodmanWorkerClient, PodmanWorkerSpec, ScopedMcpServerConfig,
-    ValidatedCandidateInput, ValidationCheck, ValidationPlan, ValidationSnapshot, ValidationStatus,
-    ValidatorBackend,
+    apply_approved_changes, create_disposable_snapshot, detect_validation_plan,
+    CandidateChangeSetId, ConfigSource, McpServerConfig, McpServerManager, McpStdioServerConfig,
+    NetworkCapability, PodmanValidatorBackend, PodmanWorkerClient, PodmanWorkerSpec,
+    ScopedMcpServerConfig, ValidatedCandidateInput, ValidationCheck, ValidationPlan,
+    ValidationSnapshot, ValidationStatus, ValidatorBackend,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -313,6 +313,93 @@ fn real_validator_is_fresh_networkless_and_does_not_mutate_candidate() {
         println!("CLAW_SECURITY_ASSERTION {capability} PASS");
     }
     fs::remove_dir_all(root).expect("clean validator fixture");
+}
+
+#[test]
+#[ignore = "requires a working rootless Podman runtime and CLAW_REAL_PODMAN_IMAGE"]
+fn real_nested_rust_plan_rejects_malformed_candidate_and_accepts_repair() {
+    let root = temp_root("nested-rust-plan");
+    let canonical = root.join("canonical");
+    let workspace = canonical.join("rust");
+    let crate_root = workspace.join("crates/sample");
+    fs::create_dir_all(crate_root.join("src")).expect("create nested Rust workspace");
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/sample\"]\nresolver = \"2\"\n",
+    )
+    .expect("write workspace manifest");
+    fs::write(
+        crate_root.join("Cargo.toml"),
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write crate manifest");
+    fs::write(
+        crate_root.join("src/lib.rs"),
+        "pub fn answer() -> u8 { 1 }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn answer_is_one() { assert_eq!(super::answer(), 1); }\n}\n",
+    )
+    .expect("write baseline source");
+
+    let task = create_disposable_snapshot(&canonical).expect("create nested Rust snapshot");
+    let candidate_source = task.candidate.root.join("rust/crates/sample/src/lib.rs");
+    fs::write(
+        &candidate_source,
+        "pub fn answer() -> u8 { 2 }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn answer_is_two() { assert_eq!(super::answer(), 2); }\n    }\n}\n",
+    )
+    .expect("write malformed candidate");
+    let malformed = task.scan().expect("scan malformed candidate");
+    let plan = detect_validation_plan(&task.candidate.root);
+    assert_eq!(plan.checks.len(), 3);
+    assert!(plan
+        .checks
+        .iter()
+        .all(|check| check.command.contains("--manifest-path 'rust/Cargo.toml'")));
+    let snapshot = ValidationSnapshot::create_verified(&task.candidate, &task.baseline, &malformed)
+        .expect("create malformed validation snapshot");
+    let backend = PodmanValidatorBackend {
+        image: image(),
+        ..PodmanValidatorBackend::default()
+    };
+    let malformed_result = backend
+        .validate(&snapshot.input(), &plan)
+        .expect("run validator on malformed candidate");
+    assert_eq!(malformed_result.checks.len(), 3);
+    assert!(malformed_result
+        .checks
+        .iter()
+        .any(|check| check.status == ValidationStatus::Fail));
+    assert!(malformed_result
+        .checks
+        .iter()
+        .any(|check| !check.stderr.is_empty() || !check.stdout.is_empty()));
+    drop(snapshot);
+
+    fs::write(
+        &candidate_source,
+        "pub fn answer() -> u8 {\n    2\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn answer_is_two() {\n        assert_eq!(super::answer(), 2);\n    }\n}\n",
+    )
+    .expect("repair candidate source");
+    let repaired = task.scan().expect("scan repaired candidate");
+    let repaired_snapshot =
+        ValidationSnapshot::create_verified(&task.candidate, &task.baseline, &repaired)
+            .expect("create repaired validation snapshot");
+    let repaired_result = backend
+        .validate(&repaired_snapshot.input(), &plan)
+        .expect("run validator on repaired candidate");
+    assert!(
+        repaired_result
+            .checks
+            .iter()
+            .all(|check| check.status == ValidationStatus::Pass),
+        "repaired validation checks: {:#?}",
+        repaired_result.checks
+    );
+    assert_eq!(
+        fs::read_to_string(canonical.join("rust/crates/sample/src/lib.rs")).unwrap(),
+        "pub fn answer() -> u8 { 1 }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn answer_is_one() { assert_eq!(super::answer(), 1); }\n}\n"
+    );
+    drop(repaired_snapshot);
+    task.discard().expect("discard nested Rust task");
+    fs::remove_dir_all(root).expect("clean nested Rust validator fixture");
 }
 
 fn worker_spec(workspace: &Path) -> PodmanWorkerSpec {

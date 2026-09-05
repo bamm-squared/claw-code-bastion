@@ -113,12 +113,13 @@ impl ValidationResult {
     /// Infrastructure could not produce trustworthy candidate evidence.
     #[must_use]
     pub fn has_infrastructure_failure(&self) -> bool {
-        self.checks.iter().any(|check| {
-            matches!(
-                check.status,
-                ValidationStatus::Blocked | ValidationStatus::Error | ValidationStatus::Timeout
-            )
-        })
+        self.checks.is_empty()
+            || self.checks.iter().any(|check| {
+                matches!(
+                    check.status,
+                    ValidationStatus::Blocked | ValidationStatus::Error | ValidationStatus::Timeout
+                )
+            })
     }
 }
 
@@ -157,7 +158,10 @@ impl ValidationResult {
         policy: ValidationPolicy,
         blocked_override: bool,
     ) -> bool {
-        if self.candidate_identity != candidate || !policy.require_validation {
+        if self.candidate_identity != candidate
+            || !policy.require_validation
+            || self.checks.is_empty()
+        {
             return false;
         }
         for check in &self.checks {
@@ -518,12 +522,21 @@ fn read_bounded(mut reader: impl Read) -> io::Result<(String, bool)> {
 #[must_use]
 pub fn detect_validation_plan(root: &Path) -> ValidationPlan {
     let mut checks = Vec::new();
-    if root.join("Cargo.toml").is_file() {
-        checks.push(check("cargo fmt", "cargo fmt --check"));
-        checks.push(check("cargo test --workspace", "cargo test --workspace"));
+    if let Some(manifest) = find_manifest(root, "Cargo.toml") {
+        let manifest_arg = shell_quote(&manifest);
+        checks.push(check(
+            "cargo fmt",
+            format!("cargo fmt --check --all --manifest-path {manifest_arg}"),
+        ));
+        checks.push(check(
+            "cargo test --workspace",
+            format!("cargo test --workspace --manifest-path {manifest_arg}"),
+        ));
         checks.push(check(
             "cargo clippy",
-            "cargo clippy --workspace --all-targets -- -D warnings",
+            format!(
+                "cargo clippy --workspace --all-targets --manifest-path {manifest_arg} -- -D warnings"
+            ),
         ));
     }
     if let Ok(package) = fs::read_to_string(root.join("package.json")) {
@@ -544,6 +557,34 @@ pub fn detect_validation_plan(root: &Path) -> ValidationPlan {
         checks.push(check("pytest", "pytest"));
     }
     ValidationPlan::new(checks)
+}
+
+fn find_manifest(root: &Path, name: &str) -> Option<String> {
+    if root.join(name).is_file() {
+        return Some(name.to_string());
+    }
+
+    let mut children = fs::read_dir(root)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    children.sort();
+    children
+        .into_iter()
+        .find(|path| path.join(name).is_file())
+        .map(|path| {
+            path.strip_prefix(root)
+                .expect("manifest child must be under root")
+                .join(name)
+                .display()
+                .to_string()
+        })
+}
+
+fn shell_quote(path: &str) -> String {
+    format!("'{}'", path.replace('\'', "'\\''"))
 }
 
 fn check(name: impl Into<String>, command: impl Into<String>) -> ValidationCheck {
@@ -706,6 +747,40 @@ mod tests {
             plan.identity(&first.identity()),
             plan.identity(&second.identity())
         );
+    }
+
+    #[test]
+    fn nested_cargo_workspace_is_validated_with_its_manifest() {
+        let root = std::env::temp_dir().join(format!("claw-validator-plan-{}", unique_stamp()));
+        fs::create_dir_all(root.join("rust")).unwrap();
+        fs::write(root.join("rust/Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+
+        let plan = detect_validation_plan(&root);
+        assert_eq!(plan.checks.len(), 3);
+        assert!(plan
+            .checks
+            .iter()
+            .all(|check| check.command.contains("--manifest-path 'rust/Cargo.toml'")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_validation_evidence_is_infrastructure_failure_and_cannot_apply() {
+        let plan = ValidationPlan::new(Vec::new());
+        let result = ValidationResult {
+            candidate_identity: CandidateChangeSetId::zero(),
+            validation_identity: plan.identity("podman-validator-v2"),
+            checks: Vec::new(),
+            duration: Duration::ZERO,
+        };
+
+        assert!(result.has_infrastructure_failure());
+        assert!(!result.allows_apply(
+            CandidateChangeSetId::zero(),
+            ValidationPolicy::default(),
+            false
+        ));
     }
 
     #[test]
