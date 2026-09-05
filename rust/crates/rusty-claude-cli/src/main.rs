@@ -79,6 +79,7 @@ const DEFAULT_MODEL: &str = "claude-opus-4-6";
 const MAX_VALIDATION_REPAIR_CYCLES: u8 = 2;
 const MAX_EVALUATOR_REWORK_CYCLES: u8 = 1;
 const MAX_TOTAL_CORRECTION_CYCLES: u8 = MAX_VALIDATION_REPAIR_CYCLES + MAX_EVALUATOR_REWORK_CYCLES;
+const MAX_COMPLETION_AUDIT_CYCLES: u8 = 1;
 fn max_tokens_for_model(model: &str) -> u32 {
     let model = model.to_ascii_lowercase();
     if model.starts_with("gpt-4o") {
@@ -4092,6 +4093,9 @@ struct LiveCli {
     rework_cycles: u8,
     validation_repair_cycles: u8,
     evaluator_rework_cycles: u8,
+    completion_audit_cycles: u8,
+    completion_audit_pending: bool,
+    completion_audit_candidate_id: Option<String>,
     escalation_requested: bool,
     rework_blocked: Option<String>,
     exploration_input: Option<String>,
@@ -5213,6 +5217,9 @@ impl LiveCli {
             rework_cycles: 0,
             validation_repair_cycles: 0,
             evaluator_rework_cycles: 0,
+            completion_audit_cycles: 0,
+            completion_audit_pending: false,
+            completion_audit_candidate_id: None,
             escalation_requested: false,
             rework_blocked: None,
             exploration_input: None,
@@ -5566,6 +5573,9 @@ impl LiveCli {
         if self.exploration_input.as_deref() != Some(input) && self.pending_rework.is_none() {
             self.selected_evaluator_profile = None;
             self.evaluator_routing_signals = None;
+            self.completion_audit_cycles = 0;
+            self.completion_audit_pending = false;
+            self.completion_audit_candidate_id = None;
         }
         if self.exploration_input.as_deref() == Some(input) || self.pending_rework.is_some() {
             return;
@@ -5968,6 +5978,23 @@ impl LiveCli {
             return Ok(false);
         }
 
+        let candidate_id = changes.id.to_string();
+        if self.completion_audit_pending
+            && self.completion_audit_candidate_id.as_deref() == Some(candidate_id.as_str())
+        {
+            self.completion_audit_pending = false;
+            self.completion_audit_candidate_id = None;
+            self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
+            benchmark_telemetry::lifecycle_event("completion_audit_blocked");
+            println!(
+                "Completion evidence audit stopped: the bounded follow-up did not change the candidate."
+            );
+            return Ok(false);
+        }
+
+        self.completion_audit_pending = false;
+        self.completion_audit_candidate_id = None;
+
         benchmark_telemetry::lifecycle_event("candidate_review_started");
         if !io::stdin().is_terminal() {
             benchmark_telemetry::lifecycle_event("interactive_review_unavailable");
@@ -6038,6 +6065,62 @@ impl LiveCli {
                 .map(|selection| selection.text.as_str()),
             &self.task_plan.contracts,
         );
+        if normal_apply_allowed {
+            let completion_gaps = self.task_plan.completion_audit_gaps(
+                &changed_paths,
+                &validation_intelligence_evidence.missing_evidence,
+            );
+            if !completion_gaps.is_empty() {
+                if self.completion_audit_cycles < MAX_COMPLETION_AUDIT_CYCLES {
+                    if let Err(error) = self.checkpoint_before_rework(runtime, &changes) {
+                        eprintln!("warning: unable to create completion-audit checkpoint: {error}");
+                    }
+                    for gap in &completion_gaps {
+                        self.task_plan.reopen_for_completion_audit(gap);
+                    }
+                    self.record_requirement_coverage();
+                    self.completion_audit_cycles = self.completion_audit_cycles.saturating_add(1);
+                    self.completion_audit_pending = true;
+                    self.completion_audit_candidate_id = Some(changes.id.to_string());
+                    self.rework_profile = self.selected_writer_profile.clone();
+                    self.pending_rework = Some(model_router::EscalationPackage {
+                        original_requirement: self.task_plan.authoritative_request().to_string(),
+                        task_plan: self.task_plan.render(),
+                        candidate_summary: format!("Changed paths: {}", changed_paths.join(", ")),
+                        expected_contracts: self
+                            .task_plan
+                            .contracts
+                            .iter()
+                            .map(|contract| format!("{}: {}", contract.id, contract.expectation))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        evaluation_findings: completion_gaps
+                            .iter()
+                            .map(|gap| format!("{}: {}", gap.contract_id, gap.reason))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                        validation_evidence: "Trusted validation passed; this is not evidence that the requested behavioral boundary was exercised.".to_string(),
+                        repository_intelligence: self.task_plan.known_impact.join("\n"),
+                        unresolved_questions: self.task_plan.open_questions.clone(),
+                    });
+                    benchmark_telemetry::lifecycle_event("completion_audit_followup_requested");
+                    self.candidate_state = CandidateLifecycleState::Editing;
+                    println!(
+                        "↻ Completion evidence audit requested one bounded writer follow-up for {} contract(s).",
+                        completion_gaps.len()
+                    );
+                    return Ok(true);
+                }
+                for gap in &completion_gaps {
+                    self.task_plan.reopen_for_completion_audit(gap);
+                }
+                self.record_requirement_coverage();
+                benchmark_telemetry::lifecycle_event("completion_audit_unresolved");
+                println!(
+                    "Completion evidence remains unresolved after the bounded writer follow-up; continuing to independent evaluation."
+                );
+            }
+        }
         let evaluation = requirement_evaluator::RequirementEvaluator::deterministic(
             &self.task_plan,
             &changed_paths,
@@ -6374,7 +6457,7 @@ impl LiveCli {
                 self.prepare_turn_runtime(emit_output, original_input)?;
             let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
             let result = runtime.run_turn_with_images(
-                "Apply the focused evaluator rework package to the retained candidate. Do not discard valid existing changes.",
+                "Apply the focused correction package to the retained candidate. Do not discard valid existing changes.",
                 image_blocks,
                 Some(&mut permission_prompter),
             );
@@ -6390,6 +6473,14 @@ impl LiveCli {
             let continue_rework = self.review_candidate_changes(&mut runtime)?;
             self.replace_runtime(runtime)?;
             if !continue_rework {
+                if self.completion_audit_pending {
+                    self.completion_audit_pending = false;
+                    self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
+                    benchmark_telemetry::lifecycle_event("completion_audit_blocked");
+                    println!(
+                        "Completion evidence audit stopped: the bounded follow-up made no candidate changes."
+                    );
+                }
                 self.rework_profile = None;
                 return Ok(());
             }
@@ -6424,6 +6515,9 @@ impl LiveCli {
         self.evaluation = None;
         self.pending_rework = None;
         self.rework_profile = None;
+        self.completion_audit_cycles = 0;
+        self.completion_audit_pending = false;
+        self.completion_audit_candidate_id = None;
         self.escalation_requested = false;
         self.rework_blocked = None;
         self.task_plan.invalidate_after_candidate_restore();

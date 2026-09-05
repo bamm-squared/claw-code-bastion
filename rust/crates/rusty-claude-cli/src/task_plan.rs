@@ -49,6 +49,14 @@ pub struct ExpectedContract {
     pub evidence: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompletionAuditGap {
+    pub contract_id: String,
+    pub expectation: String,
+    pub boundary: VerificationBoundary,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum VerificationBoundary {
     #[default]
@@ -325,6 +333,74 @@ impl TaskPlan {
         self.revision = self.revision.saturating_add(1);
     }
 
+    #[must_use]
+    pub fn completion_audit_gaps(
+        &self,
+        changed_paths: &[String],
+        missing_evidence: &[String],
+    ) -> Vec<CompletionAuditGap> {
+        let has_test_change = changed_paths.iter().any(|path| is_test_path(path));
+        let evidence_is_incomplete = changed_paths.is_empty() || !has_test_change;
+        if !evidence_is_incomplete {
+            return Vec::new();
+        }
+        self.contracts
+            .iter()
+            .filter(|contract| contract.status != ContractStatus::Verified)
+            .take(MAX_CONTRACTS)
+            .map(|contract| {
+                let detail = missing_evidence
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "no changed test surface was identified".to_string());
+                CompletionAuditGap {
+                    contract_id: contract.id.clone(),
+                    expectation: contract.expectation.clone(),
+                    boundary: contract.verification_boundary.clone(),
+                    reason: format!(
+                        "{} requires {} evidence, but the current candidate provides only implementation activity: {}",
+                        contract.id,
+                        contract.verification_boundary.label(),
+                        detail
+                    ),
+                }
+            })
+            .collect()
+    }
+
+    pub fn reopen_for_completion_audit(&mut self, gap: &CompletionAuditGap) {
+        let item_id = contract_item_id(&gap.contract_id);
+        if let Some(item) = self
+            .items
+            .iter_mut()
+            .find(|item| item.id == item_id.as_deref().unwrap_or(&gap.contract_id))
+        {
+            item.status = PlanItemStatus::NeedsResearch;
+            item.provenance = truncate(&gap.reason, MAX_STATEMENT_BYTES);
+        }
+        if let Some(contract) = self
+            .contracts
+            .iter_mut()
+            .find(|contract| contract.id == gap.contract_id)
+        {
+            contract.status = ContractStatus::Unresolved;
+            contract.evidence = truncate(&gap.reason, MAX_STATEMENT_BYTES);
+        }
+        if !self
+            .open_questions
+            .iter()
+            .any(|question| question.starts_with("Completion evidence follow-up"))
+        {
+            self.open_questions.push(format!(
+                "Completion evidence follow-up for {}: {}",
+                gap.contract_id,
+                truncate(&gap.reason, 160)
+            ));
+        }
+        self.open_questions.truncate(MAX_CONTRACTS);
+        self.revision = self.revision.saturating_add(1);
+    }
+
     pub fn record_contract_evidence(&mut self, contract_id: &str, verified: bool, evidence: &str) {
         let item_id = contract_item_id(contract_id);
         if let Some(contract) = self
@@ -500,6 +576,14 @@ fn contract_item_id(contract_id: &str) -> Option<String> {
     contract_id
         .strip_prefix("contract-")
         .map(|number| format!("item-{number}"))
+}
+
+fn is_test_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("/test")
+        || lower.starts_with("test/")
+        || lower.starts_with("tests/")
+        || lower.ends_with("_test.rs")
 }
 
 fn infer_verification_boundary(expectation: &str) -> VerificationBoundary {
@@ -766,6 +850,35 @@ mod tests {
         assert_eq!(plan.contracts[0].status, ContractStatus::CandidateEvidence);
         assert!(!plan.all_contracts_verified());
         assert!(plan.render().contains("Completion evidence audit"));
+    }
+
+    #[test]
+    fn completion_audit_reopens_unproven_behavioral_contract() {
+        let mut plan = TaskPlan::from_request("Handle interactive stdin input", None);
+        plan.record_candidate_evidence(&["src/tool.rs".to_string()]);
+        let gaps = plan.completion_audit_gaps(
+            &["src/tool.rs".to_string()],
+            &["No interaction evidence".to_string()],
+        );
+
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].boundary, VerificationBoundary::ProcessInteraction);
+        plan.reopen_for_completion_audit(&gaps[0]);
+        assert_eq!(plan.contracts[0].status, ContractStatus::Unresolved);
+        assert_eq!(plan.items[0].status, PlanItemStatus::NeedsResearch);
+        assert!(plan.render().contains("Completion evidence follow-up"));
+    }
+
+    #[test]
+    fn completion_audit_accepts_a_changed_test_surface_without_unknown_evidence() {
+        let mut plan = TaskPlan::from_request("Update the local behavior", None);
+        plan.record_candidate_evidence(&["src/tool.rs".to_string(), "tests/tool.rs".to_string()]);
+        assert!(plan
+            .completion_audit_gaps(
+                &["src/tool.rs".to_string(), "tests/tool.rs".to_string()],
+                &[],
+            )
+            .is_empty());
     }
 
     #[test]

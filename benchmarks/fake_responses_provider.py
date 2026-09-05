@@ -412,6 +412,8 @@ def actions_for(
     repair=False,
     inject_validation_failure=False,
     inject_evaluator_gap=False,
+    completion_audit_test=False,
+    completion_audit_followup=False,
 ):
     if task == "retry-policy":
         return [
@@ -452,7 +454,7 @@ def actions_for(
             ("write_file", {"path": "tests/ledger.rs", "content": EVENT_LEDGER_TESTS}),
         ]
     if task == "api-compat":
-        return [
+        actions = [
             ("read_file", {"path": "Cargo.toml"}),
             ("read_file", {"path": "src/lib.rs"}),
             ("read_file", {"path": "src/request.rs"}),
@@ -462,6 +464,15 @@ def actions_for(
             ("write_file", {"path": "src/client.rs", "content": API_CLIENT}),
             ("write_file", {"path": "tests/request.rs", "content": API_TESTS}),
         ]
+        if completion_audit_test:
+            if completion_audit_followup and ResponsesHandler.completion_audit_stall_test:
+                return []
+            return (
+                [("write_file", {"path": "tests/request.rs", "content": API_TESTS})]
+                if completion_audit_followup
+                else actions[:-1]
+            )
+        return actions
     return [
         ("read_file", {"path": "src/config.rs"}),
         ("read_file", {"path": "tests/config.rs"}),
@@ -478,9 +489,16 @@ def tool_for(
     repair=False,
     inject_validation_failure=False,
     inject_evaluator_gap=False,
+    completion_audit_test=False,
+    completion_audit_followup=False,
 ):
     return actions_for(
-        task, repair, inject_validation_failure, inject_evaluator_gap
+        task,
+        repair,
+        inject_validation_failure,
+        inject_evaluator_gap,
+        completion_audit_test,
+        completion_audit_followup,
     )[index]
 
 
@@ -496,6 +514,8 @@ def response(
     writer_index=0,
     is_explorer=False,
     contract_ids=None,
+    completion_audit_test=False,
+    completion_audit_followup=False,
 ):
     response_id = f"local-{number}"
     if is_explorer:
@@ -589,7 +609,12 @@ def response(
     inject_validation_failure = rework_test and evaluator_call == 0
     inject_evaluator_gap = evaluator_rework_test and evaluator_call == 0
     actions = actions_for(
-        task, repair, inject_validation_failure, inject_evaluator_gap
+        task,
+        repair,
+        inject_validation_failure,
+        inject_evaluator_gap,
+        completion_audit_test,
+        completion_audit_followup,
     )
     if writer_index < len(actions):
         name, arguments = tool_for(
@@ -598,6 +623,8 @@ def response(
             repair,
             inject_validation_failure,
             inject_evaluator_gap,
+            completion_audit_test,
+            completion_audit_followup,
         )
         item_id = f"item-{number}"
         call_id = f"call-{number}"
@@ -672,6 +699,9 @@ class ResponsesHandler(BaseHTTPRequestHandler):
     rework_test = False
     evaluator_rework_test = False
     evaluator_unavailable = False
+    completion_audit_test = False
+    completion_audit_followup_consumed = False
+    completion_audit_stall_test = False
 
     def log_message(self, format_string, *args):
         print(f"fake-responses request={self.request_number} path={self.path}", flush=True)
@@ -688,7 +718,10 @@ class ResponsesHandler(BaseHTTPRequestHandler):
             or "Do not propose edits" in request_text
             or "read-only exploration" in request_text
         )
+        if ResponsesHandler.completion_audit_test:
+            is_explorer = ResponsesHandler.request_number <= 2
         contract_ids = list(dict.fromkeys(re.findall(r"contract-\d+", request_text)))
+        completion_audit_followup = False
         if is_evaluator:
             ResponsesHandler.evaluator_calls += 1
             ResponsesHandler.writer_calls_since_evaluator = 0
@@ -696,11 +729,26 @@ class ResponsesHandler(BaseHTTPRequestHandler):
             writer_index = 0
         elif not is_explorer:
             evaluator_call = ResponsesHandler.evaluator_calls
-            writer_index = ResponsesHandler.writer_calls_since_evaluator
+            completion_audit_followup = (
+                ResponsesHandler.completion_audit_test
+                and not ResponsesHandler.completion_audit_followup_consumed
+                and (
+                    "focused correction" in request_text.lower()
+                    or ResponsesHandler.writer_calls_since_evaluator > 7
+                )
+            )
+            if completion_audit_followup:
+                ResponsesHandler.completion_audit_followup_consumed = True
+            writer_index = (
+                0
+                if completion_audit_followup
+                else ResponsesHandler.writer_calls_since_evaluator
+            )
             ResponsesHandler.writer_calls_since_evaluator += 1
         else:
             evaluator_call = ResponsesHandler.evaluator_calls
             writer_index = 0
+            completion_audit_followup = False
         payload = response(
             ResponsesHandler.request_number,
             stream,
@@ -713,6 +761,16 @@ class ResponsesHandler(BaseHTTPRequestHandler):
             writer_index,
             is_explorer,
             contract_ids,
+            completion_audit_test=ResponsesHandler.completion_audit_test,
+            completion_audit_followup=completion_audit_followup
+            if not is_evaluator and not is_explorer
+            else False,
+        )
+        print(
+            f"phase req={ResponsesHandler.request_number} explorer={is_explorer} "
+            f"evaluator={is_evaluator} followup={completion_audit_followup} "
+            f"writer_index={writer_index} writer_calls={ResponsesHandler.writer_calls_since_evaluator}",
+            flush=True,
         )
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream" if stream else "application/json")
@@ -753,11 +811,25 @@ def main():
         action="store_true",
         help="start with valid code but incomplete Client coverage, then provide evaluator rework",
     )
+    parser.add_argument(
+        "--completion-audit-test",
+        action="store_true",
+        help="omit API compatibility tests initially, then add them during the bounded completion-evidence follow-up",
+    )
+    parser.add_argument(
+        "--completion-audit-stall-test",
+        action="store_true",
+        help="make the bounded completion-evidence follow-up make no edits",
+    )
     args = parser.parse_args()
     ResponsesHandler.task = args.task
     ResponsesHandler.rework_test = args.rework_test
     ResponsesHandler.evaluator_rework_test = args.evaluator_rework_test
     ResponsesHandler.evaluator_unavailable = args.evaluator_unavailable
+    ResponsesHandler.completion_audit_test = (
+        args.completion_audit_test or args.completion_audit_stall_test
+    )
+    ResponsesHandler.completion_audit_stall_test = args.completion_audit_stall_test
     server = HTTPServer((args.host, args.port), ResponsesHandler)
     if args.port_file:
         args.port_file.write_text(str(server.server_address[1]) + "\n")

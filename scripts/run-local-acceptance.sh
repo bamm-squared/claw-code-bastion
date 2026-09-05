@@ -14,6 +14,7 @@ usage() {
     cat <<'EOF'
 Usage: scripts/run-local-acceptance.sh [--task ID] [--rework-test]
        [--evaluator-rework-test] [--evaluator-unavailable]
+       [--completion-audit-test] [--completion-audit-stall-test]
        [--artifacts-dir PATH]
 
 Runs one repository-owned acceptance task against the loopback deterministic
@@ -34,7 +35,7 @@ while (($#)); do
             esac
             shift 2
             ;;
-        --rework-test|--evaluator-rework-test|--evaluator-unavailable)
+        --rework-test|--evaluator-rework-test|--evaluator-unavailable|--completion-audit-test|--completion-audit-stall-test)
             PROVIDER_FLAGS+=("$1")
             shift
             ;;
