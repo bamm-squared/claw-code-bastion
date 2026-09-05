@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use glob::Pattern;
 use regex::RegexBuilder;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use walkdir::WalkDir;
 
 /// Maximum file size that can be read (10 MB).
@@ -281,10 +281,13 @@ pub struct WriteFileOutput {
     pub kind: String,
     #[serde(rename = "filePath")]
     pub file_path: String,
+    #[serde(serialize_with = "serialize_bounded_text")]
     pub content: String,
     #[serde(rename = "structuredPatch")]
+    #[serde(serialize_with = "serialize_bounded_patch")]
     pub structured_patch: Vec<StructuredPatchHunk>,
     #[serde(rename = "originalFile")]
+    #[serde(serialize_with = "serialize_bounded_optional_text")]
     pub original_file: Option<String>,
     #[serde(rename = "gitDiff")]
     pub git_diff: Option<serde_json::Value>,
@@ -296,12 +299,16 @@ pub struct EditFileOutput {
     #[serde(rename = "filePath")]
     pub file_path: String,
     #[serde(rename = "oldString")]
+    #[serde(serialize_with = "serialize_bounded_text")]
     pub old_string: String,
     #[serde(rename = "newString")]
+    #[serde(serialize_with = "serialize_bounded_text")]
     pub new_string: String,
     #[serde(rename = "originalFile")]
+    #[serde(serialize_with = "serialize_bounded_text")]
     pub original_file: String,
     #[serde(rename = "structuredPatch")]
+    #[serde(serialize_with = "serialize_bounded_patch")]
     pub structured_patch: Vec<StructuredPatchHunk>,
     #[serde(rename = "userModified")]
     pub user_modified: bool,
@@ -309,6 +316,75 @@ pub struct EditFileOutput {
     pub replace_all: bool,
     #[serde(rename = "gitDiff")]
     pub git_diff: Option<serde_json::Value>,
+}
+
+const MAX_SERIALIZED_TOOL_TEXT_BYTES: usize = 8 * 1024;
+const MAX_SERIALIZED_PATCH_BYTES: usize = 32 * 1024;
+
+fn bounded_tool_text(value: &str) -> String {
+    if value.len() <= MAX_SERIALIZED_TOOL_TEXT_BYTES {
+        value.to_owned()
+    } else {
+        format!("[tool output omitted: {} bytes]", value.len())
+    }
+}
+
+#[allow(clippy::ptr_arg)]
+fn serialize_bounded_text<S>(value: &String, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(&bounded_tool_text(value))
+}
+
+#[allow(clippy::ref_option)]
+fn serialize_bounded_optional_text<S>(
+    value: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    value
+        .as_ref()
+        .map(|value| bounded_tool_text(value))
+        .serialize(serializer)
+}
+
+fn bounded_patch(patches: &[StructuredPatchHunk]) -> Vec<StructuredPatchHunk> {
+    let mut bytes: usize = 0;
+    let mut output = Vec::new();
+
+    for patch in patches {
+        let mut bounded = patch.clone();
+        bounded.lines.clear();
+        for line in &patch.lines {
+            let line_bytes = line.len().saturating_add(1);
+            if bytes.saturating_add(line_bytes) > MAX_SERIALIZED_PATCH_BYTES {
+                bounded.lines.push(format!(
+                    "[patch output omitted: more than {MAX_SERIALIZED_PATCH_BYTES} bytes]"
+                ));
+                output.push(bounded);
+                return output;
+            }
+            bytes = bytes.saturating_add(line_bytes);
+            bounded.lines.push(line.clone());
+        }
+        output.push(bounded);
+    }
+
+    output
+}
+
+#[allow(clippy::ptr_arg)]
+fn serialize_bounded_patch<S>(
+    patches: &Vec<StructuredPatchHunk>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    bounded_patch(patches).serialize(serializer)
 }
 
 /// Result of a glob-based filename search.
@@ -543,6 +619,7 @@ fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOutput
 }
 
 /// Runs a regex search over workspace files with optional context lines.
+#[allow(clippy::too_many_lines)]
 fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     let base_path = input
         .path
@@ -557,13 +634,27 @@ fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
         .build()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
 
-    let glob_filter = input
+    let glob_filters = input
         .glob
         .as_deref()
-        .map(Pattern::new)
-        .transpose()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-    let file_type = input.file_type.as_deref();
+        .map(expand_braces)
+        .map(|patterns| {
+            patterns
+                .into_iter()
+                .map(|pattern| {
+                    Pattern::new(&pattern).map_err(|error| {
+                        io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>()
+        })
+        .transpose()?;
+    let file_type = input.file_type.as_deref().filter(|kind| {
+        !matches!(
+            kind.to_ascii_lowercase().as_str(),
+            "text" | "regex" | "literal" | "content"
+        )
+    });
     let output_mode = input
         .output_mode
         .clone()
@@ -575,7 +666,7 @@ fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     let mut total_matches = 0usize;
 
     for file_path in collect_search_files(&base_path)? {
-        if !matches_optional_filters(&file_path, glob_filter.as_ref(), file_type) {
+        if !matches_optional_filters(&file_path, &base_path, glob_filters.as_deref(), file_type) {
             continue;
         }
 
@@ -669,24 +760,45 @@ fn collect_search_files(base_path: &Path) -> io::Result<Vec<PathBuf>> {
 
 fn matches_optional_filters(
     path: &Path,
-    glob_filter: Option<&Pattern>,
+    base_path: &Path,
+    glob_filters: Option<&[Pattern]>,
     file_type: Option<&str>,
 ) -> bool {
-    if let Some(glob_filter) = glob_filter {
-        let path_string = path.to_string_lossy();
-        if !glob_filter.matches(&path_string) && !glob_filter.matches_path(path) {
+    if let Some(glob_filters) = glob_filters {
+        let relative_path = path.strip_prefix(base_path).unwrap_or(path);
+        let path_string = relative_path.to_string_lossy();
+        if !glob_filters
+            .iter()
+            .any(|glob_filter| glob_filter.matches(&path_string))
+        {
             return false;
         }
     }
 
     if let Some(file_type) = file_type {
         let extension = path.extension().and_then(|extension| extension.to_str());
-        if extension != Some(file_type) {
+        if !matches_file_type(extension, file_type) {
             return false;
         }
     }
 
     true
+}
+
+fn matches_file_type(extension: Option<&str>, file_type: &str) -> bool {
+    let normalized = file_type
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    let expected_extension = match normalized.as_str() {
+        "rust" => "rs",
+        "python" => "py",
+        "javascript" => "js",
+        "typescript" => "ts",
+        "markdown" => "md",
+        value => value,
+    };
+    extension.is_some_and(|value| value.eq_ignore_ascii_case(expected_extension))
 }
 
 fn apply_limit<T>(
@@ -886,6 +998,46 @@ mod tests {
     }
 
     #[test]
+    fn serialized_file_mutation_output_bounds_large_payloads() {
+        let dir = temp_path("bounded-mutation-output");
+        std::fs::create_dir_all(&dir).expect("workspace should be created");
+        let file = dir.join("large.rs");
+        let original = "old\n".repeat(4_000);
+        let replacement = "new\n".repeat(4_000);
+        std::fs::write(&file, &original).expect("file should be written");
+
+        let output = edit_file(
+            file.to_string_lossy().as_ref(),
+            &original,
+            &replacement,
+            false,
+        )
+        .expect("edit should succeed");
+        let serialized = serde_json::to_string(&output).expect("output should serialize");
+        let value: serde_json::Value =
+            serde_json::from_str(&serialized).expect("serialized output should be JSON");
+
+        assert!(serialized.len() < super::MAX_SERIALIZED_PATCH_BYTES * 2);
+        assert!(value["originalFile"]
+            .as_str()
+            .expect("original file should remain represented")
+            .starts_with("[tool output omitted:"));
+        assert!(value["newString"]
+            .as_str()
+            .expect("new string should remain represented")
+            .starts_with("[tool output omitted:"));
+        assert!(value["structuredPatch"][0]["lines"]
+            .as_array()
+            .expect("patch lines should remain represented")
+            .iter()
+            .any(|line| line
+                .as_str()
+                .is_some_and(|line| line.starts_with("[patch output omitted:"))));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn rejects_binary_files() {
         let path = temp_path("binary-test.bin");
         std::fs::write(&path, b"\x00\x01\x02\x03binary content").expect("write should succeed");
@@ -1038,6 +1190,45 @@ mod tests {
         })
         .expect("grep should succeed");
         assert!(grep_output.content.unwrap_or_default().contains("hello"));
+    }
+
+    #[test]
+    fn capability_grep_matches_workspace_relative_globs() {
+        let dir = temp_path("capability-grep-relative-glob");
+        std::fs::create_dir_all(dir.join("rust/crates/tools/src"))
+            .expect("workspace should be created");
+        std::fs::write(
+            dir.join("rust/crates/tools/src/lib.rs"),
+            "pub fn target() {}\n",
+        )
+        .expect("Rust file should be written");
+        std::fs::write(dir.join("README.md"), "target\n").expect("README should be written");
+
+        let capability = FilesystemCapability::workspace(&dir);
+        let output = capability
+            .grep_search(&GrepSearchInput {
+                pattern: String::from("target"),
+                path: Some(dir.to_string_lossy().into_owned()),
+                glob: Some(String::from("**/*.{rs,md}")),
+                output_mode: Some(String::from("files_with_matches")),
+                before: None,
+                after: None,
+                context_short: None,
+                context: None,
+                line_numbers: None,
+                case_insensitive: None,
+                file_type: Some(String::from("rust")),
+                head_limit: None,
+                offset: None,
+                multiline: None,
+            })
+            .expect("workspace-relative glob should search successfully");
+
+        assert_eq!(output.num_files, 1);
+        assert_eq!(
+            output.filenames,
+            vec![dir.join("rust/crates/tools/src/lib.rs").to_string_lossy()]
+        );
     }
 
     #[test]

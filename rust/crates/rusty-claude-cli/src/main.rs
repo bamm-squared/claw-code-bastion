@@ -4265,7 +4265,10 @@ fn format_validation_status(status: runtime::ValidationStatus) -> &'static str {
 
 const REVIEW_DIFF_MAX_BYTES: usize = 64 * 1024;
 const EVALUATION_DIFF_MAX_BYTES: usize = 48 * 1024;
-const REVIEW_SOURCE_MAX_BYTES: u64 = 256 * 1024;
+// Source reads are bounded independently from the rendered diff. A source
+// file can be larger than the display budget while still containing a small,
+// reviewable change near one location.
+const REVIEW_SOURCE_MAX_BYTES: u64 = 1024 * 1024;
 const REVIEW_LINE_MAX_CHARS: usize = 400;
 
 fn render_review_overview(
@@ -4333,6 +4336,190 @@ fn read_review_text(root: &Path, path: &Path) -> Result<Option<Vec<String>>, Str
         return Ok(None);
     };
     Ok(Some(text.lines().map(truncate_review_line).collect()))
+}
+
+enum DiffLine {
+    Equal(String),
+    Delete(String),
+    Insert(String),
+}
+
+impl DiffLine {
+    fn is_change(&self) -> bool {
+        !matches!(self, Self::Equal(_))
+    }
+
+    fn old_lines(&self) -> usize {
+        usize::from(matches!(self, Self::Equal(_) | Self::Delete(_)))
+    }
+
+    fn new_lines(&self) -> usize {
+        usize::from(matches!(self, Self::Equal(_) | Self::Insert(_)))
+    }
+}
+
+#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+fn line_diff(old: &[String], new: &[String]) -> Vec<DiffLine> {
+    let max = old.len().saturating_add(new.len());
+    let offset = max.saturating_add(1) as isize;
+    let mut frontier = vec![0_isize; max.saturating_mul(2).saturating_add(3)];
+    let mut trace = Vec::new();
+    let mut finished_depth = 0;
+
+    'search: for depth in 0..=max {
+        let depth = depth as isize;
+        for diagonal in (-depth..=depth).step_by(2) {
+            let index = |value: isize| (value + offset) as usize;
+            let mut x = if diagonal == -depth
+                || (diagonal != depth
+                    && frontier[index(diagonal - 1)] < frontier[index(diagonal + 1)])
+            {
+                frontier[index(diagonal + 1)]
+            } else {
+                frontier[index(diagonal - 1)].saturating_add(1)
+            };
+            let mut y = x - diagonal;
+            while x < old.len() as isize
+                && y < new.len() as isize
+                && old[x as usize] == new[y as usize]
+            {
+                x += 1;
+                y += 1;
+            }
+            frontier[index(diagonal)] = x;
+            if x >= old.len() as isize && y >= new.len() as isize {
+                finished_depth = depth as usize;
+                trace.push(frontier.clone());
+                break 'search;
+            }
+        }
+        trace.push(frontier.clone());
+    }
+
+    let index = |value: isize| (value + offset) as usize;
+    let mut x = old.len() as isize;
+    let mut y = new.len() as isize;
+    let mut reversed = Vec::new();
+    for depth in (1..=finished_depth).rev() {
+        let diagonal = x - y;
+        let previous = &trace[depth - 1];
+        let previous_diagonal = if diagonal == -(depth as isize)
+            || (diagonal != depth as isize
+                && previous[index(diagonal - 1)] < previous[index(diagonal + 1)])
+        {
+            diagonal + 1
+        } else {
+            diagonal - 1
+        };
+        let previous_x = previous[index(previous_diagonal)];
+        let previous_y = previous_x - previous_diagonal;
+        while x > previous_x && y > previous_y {
+            reversed.push(DiffLine::Equal(old[(x - 1) as usize].clone()));
+            x -= 1;
+            y -= 1;
+        }
+        if x == previous_x {
+            reversed.push(DiffLine::Insert(new[(y - 1) as usize].clone()));
+            y -= 1;
+        } else {
+            reversed.push(DiffLine::Delete(old[(x - 1) as usize].clone()));
+            x -= 1;
+        }
+    }
+    while x > 0 && y > 0 {
+        reversed.push(DiffLine::Equal(old[(x - 1) as usize].clone()));
+        x -= 1;
+        y -= 1;
+    }
+    while x > 0 {
+        reversed.push(DiffLine::Delete(old[(x - 1) as usize].clone()));
+        x -= 1;
+    }
+    while y > 0 {
+        reversed.push(DiffLine::Insert(new[(y - 1) as usize].clone()));
+        y -= 1;
+    }
+    reversed.reverse();
+    reversed
+}
+
+fn render_bounded_line_diff(old: &[String], new: &[String], max_bytes: usize) -> String {
+    let diff = line_diff(old, new);
+    let mut changed_spans = Vec::new();
+    let mut index = 0;
+    while index < diff.len() {
+        if !diff[index].is_change() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < diff.len() && diff[index].is_change() {
+            index += 1;
+        }
+        changed_spans.push((start, index));
+    }
+
+    let mut hunks: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in changed_spans {
+        let start = start.saturating_sub(3);
+        let end = end.saturating_add(3).min(diff.len());
+        if let Some((_, previous_end)) = hunks.last_mut() {
+            if start <= previous_end.saturating_add(6) {
+                *previous_end = (*previous_end).max(end);
+                continue;
+            }
+        }
+        hunks.push((start, end));
+    }
+
+    let mut output = String::new();
+    let mut truncated = false;
+    for (start, end) in hunks {
+        let old_before = diff[..start].iter().map(DiffLine::old_lines).sum::<usize>();
+        let new_before = diff[..start].iter().map(DiffLine::new_lines).sum::<usize>();
+        let old_count = diff[start..end]
+            .iter()
+            .map(DiffLine::old_lines)
+            .sum::<usize>();
+        let new_count = diff[start..end]
+            .iter()
+            .map(DiffLine::new_lines)
+            .sum::<usize>();
+        let header = format!(
+            "@@ -{},{} +{},{} @@\n",
+            old_before + 1,
+            old_count,
+            new_before + 1,
+            new_count
+        );
+        if output.len().saturating_add(header.len()) > max_bytes {
+            truncated = true;
+            break;
+        }
+        output.push_str(&header);
+        for line in &diff[start..end] {
+            let (prefix, text) = match line {
+                DiffLine::Equal(text) => (' ', text),
+                DiffLine::Delete(text) => ('-', text),
+                DiffLine::Insert(text) => ('+', text),
+            };
+            let rendered = format!("{prefix}{text}\n");
+            if output.len().saturating_add(rendered.len()) > max_bytes {
+                truncated = true;
+                break;
+            }
+            output.push_str(&rendered);
+        }
+        if truncated {
+            break;
+        }
+    }
+    if truncated {
+        output.push_str(
+            "\n... Diff truncated for display. Candidate identity covers the complete change.\n",
+        );
+    }
+    output
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4416,50 +4603,8 @@ fn render_candidate_file_diff(
             )
         }
     };
-    let prefix = old
-        .iter()
-        .zip(&new)
-        .take_while(|(left, right)| left == right)
-        .count();
-    let suffix = old[prefix..]
-        .iter()
-        .rev()
-        .zip(new[prefix..].iter().rev())
-        .take_while(|(left, right)| left == right)
-        .count();
-    let old_end = old.len().saturating_sub(suffix);
-    let new_end = new.len().saturating_sub(suffix);
-    let context_start = prefix.saturating_sub(3);
-    let old_context_end = (old_end + 3).min(old.len());
-    let new_context_end = (new_end + 3).min(new.len());
-    let old_hunk_count = old_context_end.saturating_sub(context_start);
-    let new_hunk_count = new_context_end.saturating_sub(context_start);
-    let _ = writeln!(
-        output,
-        "@@ -{},{} +{},{} @@",
-        context_start + 1,
-        old_hunk_count,
-        context_start + 1,
-        new_hunk_count
-    );
-    for line in &old[context_start..prefix] {
-        let _ = writeln!(output, " {line}");
-    }
-    for line in &old[prefix..old_end] {
-        let _ = writeln!(output, "-{line}");
-    }
-    for line in &new[prefix..new_end] {
-        let _ = writeln!(output, "+{line}");
-    }
-    for line in &old[old_end..old_context_end] {
-        let _ = writeln!(output, " {line}");
-    }
-    if output.len() > REVIEW_DIFF_MAX_BYTES {
-        output.truncate(REVIEW_DIFF_MAX_BYTES);
-        output.push_str(
-            "\n... Diff truncated for display. Candidate identity covers the complete change.\n",
-        );
-    }
+    let remaining = REVIEW_DIFF_MAX_BYTES.saturating_sub(output.len());
+    output.push_str(&render_bounded_line_diff(&old, &new, remaining));
     output
 }
 
@@ -4478,7 +4623,15 @@ fn render_candidate_evaluation_diff(
         if diff.len() <= remaining {
             output.push_str(&diff);
         } else {
-            output.push_str(&diff[..remaining]);
+            let end = diff
+                .char_indices()
+                .take_while(|(index, character)| {
+                    index.saturating_add(character.len_utf8()) <= remaining
+                })
+                .map(|(index, character)| index.saturating_add(character.len_utf8()))
+                .last()
+                .unwrap_or(0);
+            output.push_str(&diff[..end]);
             output.push_str("\n... Candidate evidence truncated at a bounded limit.\n");
             break;
         }
@@ -16413,6 +16566,66 @@ mod candidate_review_diff_tests {
             &snapshot.candidate.root,
         )
         .contains("Binary file changed"));
+        snapshot.discard().expect("snapshot should clean up");
+        fs::remove_dir_all(root).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn renders_small_change_from_large_source_file() {
+        let root = fixture_root();
+        fs::create_dir_all(&root).expect("fixture root should exist");
+        let baseline = "unchanged line\n".repeat(25_000);
+        fs::write(root.join("large.rs"), &baseline).expect("large fixture should write");
+
+        let snapshot = create_disposable_snapshot(&root).expect("snapshot should be created");
+        let candidate = baseline.replacen("unchanged line", "changed line", 1);
+        fs::write(snapshot.candidate.root.join("large.rs"), candidate)
+            .expect("candidate modification should write");
+        let changes = snapshot.scan().expect("candidate scan should succeed");
+        let large = changes
+            .changes
+            .iter()
+            .find(|change| change.path() == std::path::Path::new("large.rs"))
+            .expect("large change should exist");
+        let rendered =
+            render_candidate_file_diff(large, &snapshot.baseline.root, &snapshot.candidate.root);
+
+        assert!(rendered.contains("-unchanged line"));
+        assert!(rendered.contains("+changed line"));
+        assert!(!rendered.contains("Diff unavailable"));
+        assert!(rendered.len() <= super::REVIEW_DIFF_MAX_BYTES + 128);
+        snapshot.discard().expect("snapshot should clean up");
+        fs::remove_dir_all(root).expect("fixture should clean up");
+    }
+
+    #[test]
+    fn renders_distant_changes_as_separate_hunks() {
+        let root = fixture_root();
+        fs::create_dir_all(&root).expect("fixture root should exist");
+        let mut baseline = String::new();
+        for index in 0..200 {
+            writeln!(&mut baseline, "line {index}").expect("line should format");
+        }
+        fs::write(root.join("distant.rs"), &baseline).expect("fixture should write");
+
+        let snapshot = create_disposable_snapshot(&root).expect("snapshot should be created");
+        let candidate = baseline
+            .replacen("line 10\n", "first replacement\n", 1)
+            .replacen("line 180\n", "second replacement\n", 1);
+        fs::write(snapshot.candidate.root.join("distant.rs"), candidate)
+            .expect("candidate modification should write");
+        let changes = snapshot.scan().expect("candidate scan should succeed");
+        let distant = changes
+            .changes
+            .first()
+            .expect("distant change should exist");
+        let rendered =
+            render_candidate_file_diff(distant, &snapshot.baseline.root, &snapshot.candidate.root);
+
+        assert!(rendered.matches("@@").count() >= 2);
+        assert!(rendered.contains("+first replacement"));
+        assert!(rendered.contains("+second replacement"));
+        assert!(!rendered.contains(" line 100"));
         snapshot.discard().expect("snapshot should clean up");
         fs::remove_dir_all(root).expect("fixture should clean up");
     }

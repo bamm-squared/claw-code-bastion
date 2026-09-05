@@ -1004,7 +1004,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "glob_search",
-            description: "Find files by glob pattern.",
+            description: "Find files by glob pattern in the isolated workspace. Use workspace-relative paths or /workspace/project; never use the host checkout path.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1018,7 +1018,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "grep_search",
-            description: "Search file contents with a regex pattern.",
+            description: "Search file contents with a regex pattern in the isolated workspace. Use workspace-relative paths or /workspace/project; never use the host checkout path. The optional type is a file extension; text/regex are accepted as search-mode labels.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
