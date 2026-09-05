@@ -63,6 +63,7 @@ pub struct Snapshot {
     pub writer_route_rejections: Vec<RoutingRejection>,
     pub writer_route_estimate: Option<RoutingEstimate>,
     pub evaluation_blocked_reason: Option<String>,
+    pub requirement_coverage: Vec<RequirementCoverage>,
     pub started_at_ms: u128,
     pub elapsed_ms: u128,
     pub terminal_status: String,
@@ -102,6 +103,13 @@ pub struct ValidationAttempt {
     pub candidate_identity: String,
     pub validation_identity: String,
     pub checks: Vec<ValidationDiagnostic>,
+}
+
+#[derive(Clone, Debug, Serialize, Default)]
+pub struct RequirementCoverage {
+    pub id: String,
+    pub status: String,
+    pub evidence: String,
 }
 
 #[derive(Clone, Debug, Serialize, Default)]
@@ -502,6 +510,13 @@ pub fn evaluation_blocked(reason: &str) {
         s.snapshot.evaluation_blocked_reason = Some(reason.chars().take(1_000).collect());
     });
     lifecycle_event("evaluation_blocked");
+    persist_snapshot();
+}
+
+pub fn requirement_coverage(coverage: Vec<RequirementCoverage>) {
+    with_state(|s| {
+        s.snapshot.requirement_coverage = coverage;
+    });
     persist_snapshot();
 }
 

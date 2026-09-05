@@ -7,6 +7,7 @@ changed by the normal Claw tool executor, never by this process.
 
 import argparse
 import json
+import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -493,9 +494,11 @@ def response(
     is_evaluator=False,
     evaluator_call=0,
     writer_index=0,
+    is_explorer=False,
+    contract_ids=None,
 ):
     response_id = f"local-{number}"
-    if number <= 3:
+    if is_explorer:
         finding = json.dumps(
             {
                 "subject": "fixture",
@@ -517,41 +520,54 @@ def response(
             "usage": {"input_tokens": 10, "output_tokens": 5},
         }
     if is_evaluator:
+        contract_ids = contract_ids or ["task"]
         if evaluator_unavailable:
             evaluation = "The evaluator is unavailable for this deterministic regression."
         elif (rework_test or evaluator_rework_test) and evaluator_call == 1:
-            if evaluator_rework_test:
-                finding = "Client integration does not verify the configured delay ceiling."
-                evidence = "tests/client.rs only exercises an uncapped retry schedule."
-            else:
-                finding = "Cross-module validation failed; repair using the trusted diagnostic."
-                evidence = "The candidate did not pass trusted validation."
-            evaluation = json.dumps(
-                {
-                    "requirements": [
+            requirements = []
+            for index, contract_id in enumerate(contract_ids):
+                if index == 0:
+                    if evaluator_rework_test:
+                        finding = "Client integration does not verify the configured delay ceiling."
+                        evidence = "tests/client.rs only exercises an uncapped retry schedule."
+                    else:
+                        finding = "Cross-module validation failed; repair using the trusted diagnostic."
+                        evidence = "The candidate did not pass trusted validation."
+                    requirements.append(
                         {
-                            "requirement_id": "task",
+                            "requirement_id": contract_id,
                             "state": "gap_found",
                             "finding": finding,
                             "evidence": evidence,
                             "confidence": "high",
                             "rework_recommended": True,
                         }
-                    ]
-                }
-            )
+                    )
+                else:
+                    requirements.append(
+                        {
+                            "requirement_id": contract_id,
+                            "state": "satisfied",
+                            "finding": "Requirement remains satisfied.",
+                            "evidence": "Trusted validation passed.",
+                            "confidence": "high",
+                            "rework_recommended": False,
+                        }
+                    )
+            evaluation = json.dumps({"requirements": requirements})
         else:
             evaluation = json.dumps(
                 {
                     "requirements": [
                         {
-                            "requirement_id": "task",
+                            "requirement_id": contract_id,
                             "state": "satisfied",
                             "finding": "All requested behavior is present.",
                             "evidence": "Trusted validation passed.",
                             "confidence": "high",
                             "rework_recommended": False,
                         }
+                        for contract_id in contract_ids
                     ]
                 }
             )
@@ -665,13 +681,20 @@ class ResponsesHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("content-length", "0"))
         request = json.loads(self.rfile.read(length))
         stream = bool(request.get("stream", True))
-        is_evaluator = "Independent Requirement Evaluation" in json.dumps(request)
+        request_text = json.dumps(request)
+        is_evaluator = "Independent Requirement Evaluation" in request_text
+        is_explorer = (
+            ResponsesHandler.request_number == 1
+            or "Do not propose edits" in request_text
+            or "read-only exploration" in request_text
+        )
+        contract_ids = list(dict.fromkeys(re.findall(r"contract-\d+", request_text)))
         if is_evaluator:
             ResponsesHandler.evaluator_calls += 1
             ResponsesHandler.writer_calls_since_evaluator = 0
             evaluator_call = ResponsesHandler.evaluator_calls
             writer_index = 0
-        elif ResponsesHandler.request_number > 3:
+        elif not is_explorer:
             evaluator_call = ResponsesHandler.evaluator_calls
             writer_index = ResponsesHandler.writer_calls_since_evaluator
             ResponsesHandler.writer_calls_since_evaluator += 1
@@ -688,6 +711,8 @@ class ResponsesHandler(BaseHTTPRequestHandler):
             is_evaluator,
             evaluator_call,
             writer_index,
+            is_explorer,
+            contract_ids,
         )
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream" if stream else "application/json")

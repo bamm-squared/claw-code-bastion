@@ -6023,6 +6023,10 @@ impl LiveCli {
             .iter()
             .map(|change| change.path().display().to_string())
             .collect::<Vec<_>>();
+        benchmark_telemetry::lifecycle_event("completion_audit_started");
+        self.task_plan.record_candidate_evidence(&changed_paths);
+        self.record_requirement_coverage();
+        benchmark_telemetry::lifecycle_event("completion_audit_completed");
         let repository_context = build_repository_context(
             self.task_plan.authoritative_request(),
             runtime.execution_backend().as_ref(),
@@ -6093,9 +6097,10 @@ impl LiveCli {
             self.evaluation = Some(match evaluator_route.selected {
                 Some(profile) => match execute_evaluator_profile(&profile, &request) {
                     Ok(response) => {
-                        requirement_evaluator::RequirementEvaluator::from_model_response(
+                        requirement_evaluator::RequirementEvaluator::from_model_response_for_plan(
                             &response,
                             normal_apply_allowed,
+                            &self.task_plan,
                         )
                         .unwrap_or_else(|error| {
                             requirement_evaluator::RequirementEvaluator::unavailable(
@@ -6123,6 +6128,15 @@ impl LiveCli {
             .evaluation
             .clone()
             .unwrap_or_else(|| evaluation.clone());
+        for finding in &active_evaluation.requirements {
+            self.task_plan.record_contract_evidence(
+                &finding.requirement_id,
+                finding.state == requirement_evaluator::RequirementState::Satisfied
+                    && !finding.rework_recommended,
+                &format!("{}: {}", finding.finding, finding.evidence),
+            );
+        }
+        self.record_requirement_coverage();
         println!("\nRequirement evaluation\n{}", active_evaluation.summary());
 
         if active_evaluation.has_rework_finding() {
@@ -6155,10 +6169,14 @@ impl LiveCli {
             &active_evaluation,
         );
 
-        if !active_evaluation.allows_review() {
-            let reason = active_evaluation.error.as_deref().unwrap_or(
-                "independent semantic evaluation did not establish that all requirements are satisfied",
-            );
+        if !active_evaluation.allows_review() || !self.task_plan.all_contracts_verified() {
+            let reason = if self.task_plan.all_contracts_verified() {
+                active_evaluation.error.as_deref().unwrap_or(
+                    "independent semantic evaluation did not establish that all requirements are satisfied",
+                )
+            } else {
+                "completion evidence audit has unresolved or unverified requirements"
+            };
             benchmark_telemetry::evaluation_blocked(reason);
             self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
             println!("Review blocked: {reason}");
@@ -6545,6 +6563,20 @@ impl LiveCli {
                     .to_string(),
             );
         }
+    }
+
+    fn record_requirement_coverage(&self) {
+        benchmark_telemetry::requirement_coverage(
+            self.task_plan
+                .contracts
+                .iter()
+                .map(|contract| benchmark_telemetry::RequirementCoverage {
+                    id: contract.id.clone(),
+                    status: contract.status.label().to_string(),
+                    evidence: contract.evidence.clone(),
+                })
+                .collect(),
+        );
     }
 
     fn run_review_command(

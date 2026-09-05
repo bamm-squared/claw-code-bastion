@@ -39,6 +39,31 @@ pub struct ExpectedContract {
     pub id: String,
     pub expectation: String,
     pub basis: String,
+    #[serde(default)]
+    pub status: ContractStatus,
+    #[serde(default)]
+    pub evidence: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ContractStatus {
+    #[default]
+    Unverified,
+    CandidateEvidence,
+    Verified,
+    Unresolved,
+}
+
+impl ContractStatus {
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Unverified => "unverified",
+            Self::CandidateEvidence => "candidate evidence only",
+            Self::Verified => "verified",
+            Self::Unresolved => "unresolved",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -76,6 +101,13 @@ impl TaskPlan {
                 item.provenance =
                     "candidate checkpoint restored; candidate-dependent state must be reconfirmed"
                         .to_string();
+                changed = true;
+            }
+        }
+        for contract in &mut self.contracts {
+            if contract.status != ContractStatus::Unverified || !contract.evidence.is_empty() {
+                contract.status = ContractStatus::Unverified;
+                contract.evidence.clear();
                 changed = true;
             }
         }
@@ -125,13 +157,21 @@ impl TaskPlan {
             .collect();
         self.contracts = clauses(&self.full_request)
             .into_iter()
-            .filter(|clause| contains_constraint_language(clause))
             .take(MAX_CONTRACTS)
             .enumerate()
-            .map(|(index, expectation)| ExpectedContract {
-                id: format!("contract-{}", index + 1),
-                expectation,
-                basis: "user constraint".to_string(),
+            .map(|(index, expectation)| {
+                let basis = if contains_constraint_language(expectation.as_str()) {
+                    "user constraint".to_string()
+                } else {
+                    "user requirement".to_string()
+                };
+                ExpectedContract {
+                    id: format!("contract-{}", index + 1),
+                    expectation,
+                    basis,
+                    status: ContractStatus::default(),
+                    evidence: String::new(),
+                }
             })
             .collect();
         self.known_impact = repository_context
@@ -202,11 +242,58 @@ impl TaskPlan {
             .collect();
     }
 
+    pub fn record_candidate_evidence(&mut self, changed_paths: &[String]) {
+        let evidence = if changed_paths.is_empty() {
+            "No candidate paths changed; implementation evidence is absent.".to_string()
+        } else {
+            format!("Candidate changed paths: {}", changed_paths.join(", "))
+        };
+        for contract in &mut self.contracts {
+            if contract.status != ContractStatus::Verified {
+                contract.status = ContractStatus::CandidateEvidence;
+                contract.evidence = truncate(&evidence, MAX_STATEMENT_BYTES);
+            }
+        }
+    }
+
+    pub fn record_contract_evidence(&mut self, contract_id: &str, verified: bool, evidence: &str) {
+        if let Some(contract) = self
+            .contracts
+            .iter_mut()
+            .find(|contract| contract.id == contract_id)
+        {
+            contract.status = if verified {
+                ContractStatus::Verified
+            } else {
+                ContractStatus::Unresolved
+            };
+            contract.evidence = truncate(evidence, MAX_STATEMENT_BYTES);
+        }
+        self.revision = self.revision.saturating_add(1);
+    }
+
+    #[must_use]
+    pub fn all_contracts_verified(&self) -> bool {
+        !self.contracts.is_empty()
+            && self
+                .contracts
+                .iter()
+                .all(|contract| contract.status == ContractStatus::Verified)
+    }
+
     pub fn reopen_for_evaluation(&mut self, item_id: &str, reason: &str) {
         if let Some(item) = self.items.iter_mut().find(|item| item.id == item_id) {
             item.status = PlanItemStatus::NeedsResearch;
             item.provenance = truncate(reason, MAX_STATEMENT_BYTES);
             self.revision = self.revision.saturating_add(1);
+        }
+        if let Some(contract) = self
+            .contracts
+            .iter_mut()
+            .find(|contract| contract.id == item_id)
+        {
+            contract.status = ContractStatus::Unresolved;
+            contract.evidence = truncate(reason, MAX_STATEMENT_BYTES);
         }
         self.open_questions.push(format!(
             "Evaluation follow-up for {item_id}: {}",
@@ -223,6 +310,10 @@ impl TaskPlan {
             ) {
                 item.status = PlanItemStatus::EvaluationFailed;
             }
+        }
+        for contract in &mut self.contracts {
+            contract.status = ContractStatus::Unresolved;
+            contract.evidence = truncate(reason, MAX_STATEMENT_BYTES);
         }
         self.open_questions.push(format!(
             "Validation requires follow-up: {}",
@@ -256,7 +347,14 @@ impl TaskPlan {
                 output.push_str(&contract.expectation);
                 output.push_str(" [");
                 output.push_str(&contract.basis);
+                output.push_str("; ");
+                output.push_str(contract.status.label());
                 output.push_str("]\n");
+                if !contract.evidence.is_empty() {
+                    output.push_str("  evidence: ");
+                    output.push_str(&contract.evidence);
+                    output.push('\n');
+                }
             }
         }
         if !self.known_impact.is_empty() {
@@ -283,6 +381,9 @@ impl TaskPlan {
                 "Scope is a bounded hypothesis; verify it before changing similarly named alternate surfaces.\n",
             );
         }
+        output.push_str(
+            "Completion evidence audit: account for every work item and expected contract before declaring completion. Candidate edits establish implementation activity, not behavioral proof; verify behavior at its actual interaction boundary. If evidence is incomplete, keep the obligation unresolved and continue or report the uncertainty.\n",
+        );
         output.push_str("Open questions:\n");
         for question in &self.open_questions {
             output.push_str("- ");
@@ -301,9 +402,29 @@ fn clauses(request: &str) -> Vec<String> {
         .split(|character: char| {
             character == '.' || character == '!' || character == '?' || character == '\n'
         })
-        .map(str::trim)
+        .flat_map(expand_requirement_clause)
+        .map(|clause| clause.trim().to_string())
         .filter(|clause| clause.len() > 8)
-        .map(|clause| truncate(clause, MAX_STATEMENT_BYTES))
+        .map(|clause| truncate(&clause, MAX_STATEMENT_BYTES))
+        .collect()
+}
+
+fn expand_requirement_clause(clause: &str) -> Vec<String> {
+    let Some((prefix, list)) = clause.split_once(" for ") else {
+        return vec![clause.to_string()];
+    };
+    let entries = list
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| entry.strip_prefix("and ").unwrap_or(entry))
+        .collect::<Vec<_>>();
+    if entries.len() < 2 {
+        return vec![clause.to_string()];
+    }
+    entries
+        .into_iter()
+        .map(|entry| format!("{prefix} for {entry}"))
         .collect()
 }
 
@@ -352,7 +473,7 @@ mod tests {
         );
         assert!(plan.original_request.contains("Update provider handling"));
         assert_eq!(plan.items.len(), 2);
-        assert_eq!(plan.contracts.len(), 1);
+        assert_eq!(plan.contracts.len(), 2);
         assert!(plan.render().contains("Advisory only"));
     }
 
@@ -446,5 +567,28 @@ mod tests {
             .contracts
             .iter()
             .any(|contract| contract.expectation.contains("Preserve private mode")));
+    }
+
+    #[test]
+    fn behavioral_list_becomes_bounded_traceable_contracts() {
+        let plan = TaskPlan::from_request(
+            "Harden the tool for free-form answers, choices, invalid input, and cancellation.",
+            None,
+        );
+        assert_eq!(plan.contracts.len(), 4);
+        assert!(plan
+            .contracts
+            .iter()
+            .all(|contract| contract.basis == "user requirement"));
+        assert!(!plan.all_contracts_verified());
+    }
+
+    #[test]
+    fn candidate_evidence_is_not_verified_without_evaluation() {
+        let mut plan = TaskPlan::from_request("Update the behavior", None);
+        plan.record_candidate_evidence(&["src/tool.rs".to_string()]);
+        assert_eq!(plan.contracts[0].status, ContractStatus::CandidateEvidence);
+        assert!(!plan.all_contracts_verified());
+        assert!(plan.render().contains("Completion evidence audit"));
     }
 }
