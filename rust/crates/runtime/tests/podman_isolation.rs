@@ -325,12 +325,12 @@ fn real_nested_rust_plan_rejects_malformed_candidate_and_accepts_repair() {
     fs::create_dir_all(crate_root.join("src")).expect("create nested Rust workspace");
     fs::write(
         workspace.join("Cargo.toml"),
-        "[workspace]\nmembers = [\"crates/sample\"]\nresolver = \"2\"\n",
+        "[workspace]\nmembers = [\"crates/sample\"]\nresolver = \"2\"\n\n[workspace.dependencies]\nserde = { version = \"1\", features = [\"derive\"] }\n",
     )
     .expect("write workspace manifest");
     fs::write(
         crate_root.join("Cargo.toml"),
-        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nserde.workspace = true\n",
     )
     .expect("write crate manifest");
     fs::write(

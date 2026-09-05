@@ -4,6 +4,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
+COPY rust/Cargo.toml /opt/claw-source/Cargo.toml
+COPY rust/Cargo.lock /opt/claw-source/Cargo.lock
+COPY rust/crates /opt/claw-source/crates
+RUN CARGO_NET_OFFLINE=false cargo fetch --locked --manifest-path /opt/claw-source/Cargo.toml
+
 ENV CARGO_TERM_COLOR=always \
     CARGO_NET_OFFLINE=true \
     PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
