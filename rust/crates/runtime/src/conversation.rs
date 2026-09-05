@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
+use std::hash::{Hash, Hasher};
 
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
@@ -19,6 +20,7 @@ use crate::validator::ValidationResult;
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+const MAX_IDENTICAL_TOOL_ITERATIONS: usize = 3;
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -403,6 +405,8 @@ where
         let mut tool_results = Vec::new();
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
+        let mut previous_tool_fingerprint = None;
+        let mut identical_tool_iterations = 0;
 
         loop {
             iterations += 1;
@@ -466,6 +470,7 @@ where
                 break;
             }
 
+            let mut tool_fingerprint = std::collections::hash_map::DefaultHasher::new();
             for (tool_use_id, tool_name, input) in pending_tool_uses {
                 let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
                 let effective_input = pre_hook_result
@@ -512,6 +517,8 @@ where
                         None,
                     )
                 };
+                tool_name.hash(&mut tool_fingerprint);
+                effective_input.hash(&mut tool_fingerprint);
 
                 let result_message = match permission_outcome {
                     PermissionOutcome::Allow => {
@@ -560,11 +567,33 @@ where
                         true,
                     ),
                 };
+                if let Some(ContentBlock::ToolResult {
+                    output, is_error, ..
+                }) = result_message.blocks.first()
+                {
+                    output.hash(&mut tool_fingerprint);
+                    is_error.hash(&mut tool_fingerprint);
+                }
                 self.session
                     .push_message(result_message.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 self.record_tool_finished(iterations, &result_message);
                 tool_results.push(result_message);
+            }
+
+            let fingerprint = tool_fingerprint.finish();
+            if previous_tool_fingerprint == Some(fingerprint) {
+                identical_tool_iterations += 1;
+            } else {
+                identical_tool_iterations = 0;
+            }
+            previous_tool_fingerprint = Some(fingerprint);
+            if identical_tool_iterations >= MAX_IDENTICAL_TOOL_ITERATIONS {
+                let error = RuntimeError::new(
+                    "conversation loop stopped after repeated identical tool results made no progress",
+                );
+                self.record_turn_failed(iterations, &error);
+                return Err(error);
             }
         }
 
@@ -1888,6 +1917,43 @@ mod tests {
         assert!(error
             .to_string()
             .contains("conversation loop exceeded the maximum number of iterations"));
+    }
+
+    #[test]
+    fn run_turn_stops_repeated_identical_tool_results() {
+        struct LoopingApi;
+
+        impl ApiClient for LoopingApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "tool-1".to_string(),
+                        name: "echo".to_string(),
+                        input: "unchanged".to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            LoopingApi,
+            StaticToolExecutor::new().register("echo", |input| Ok(input.to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let error = runtime
+            .run_turn("loop", None)
+            .expect_err("identical tool loop should stop");
+
+        assert!(error
+            .to_string()
+            .contains("repeated identical tool results made no progress"));
     }
 
     #[test]
