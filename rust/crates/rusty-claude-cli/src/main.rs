@@ -12171,9 +12171,9 @@ impl CliToolExecutor {
 
 fn writer_iteration_budget(mode: task_plan::PlanningMode) -> usize {
     match mode {
-        task_plan::PlanningMode::Minimal => 16,
-        task_plan::PlanningMode::Standard => 32,
-        task_plan::PlanningMode::Milestone => 64,
+        task_plan::PlanningMode::Minimal => 12,
+        task_plan::PlanningMode::Standard => 20,
+        task_plan::PlanningMode::Milestone => 40,
     }
 }
 
