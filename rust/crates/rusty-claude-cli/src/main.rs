@@ -4100,7 +4100,14 @@ struct LiveCli {
     rework_blocked: Option<String>,
     exploration_input: Option<String>,
     exploration_context: Option<String>,
+    repository_map_cache: Option<RepositoryMapCache>,
     checkpoint_store: runtime::CandidateCheckpointStore,
+}
+
+#[derive(Clone)]
+struct RepositoryMapCache {
+    request: String,
+    selection: ContextSelection,
 }
 
 #[derive(Debug, Clone)]
@@ -5224,6 +5231,7 @@ impl LiveCli {
             rework_blocked: None,
             exploration_input: None,
             exploration_context: None,
+            repository_map_cache: None,
             checkpoint_store,
         };
         cli.persist_session()?;
@@ -5576,6 +5584,7 @@ impl LiveCli {
             self.completion_audit_cycles = 0;
             self.completion_audit_pending = false;
             self.completion_audit_candidate_id = None;
+            self.repository_map_cache = None;
         }
         if self.exploration_input.as_deref() == Some(input) || self.pending_rework.is_some() {
             return;
@@ -5594,6 +5603,10 @@ impl LiveCli {
             &repository_context.seed_files,
             &repository_context.surface_guidance,
         );
+        self.repository_map_cache = Some(RepositoryMapCache {
+            request: input.to_string(),
+            selection: repository_context.clone(),
+        });
         let signals = routing_signals(&self.task_plan);
         let questions = exploration::questions_for(signals);
         orchestration_trace(format!("exploration_decision jobs={}", questions.len()));
@@ -5673,7 +5686,15 @@ impl LiveCli {
         } else {
             task_input
         };
-        let repository_context = build_repository_context(context_input, retained_backend.as_ref());
+        let repository_context = if retained_backend.is_none() {
+            self.repository_map_cache
+                .as_ref()
+                .filter(|cache| cache.request == context_input)
+                .map(|cache| cache.selection.clone())
+                .or_else(|| build_repository_context(context_input, None))
+        } else {
+            build_repository_context(context_input, retained_backend.as_ref())
+        };
         let repository_text = repository_context
             .as_ref()
             .map(|selection| selection.text.as_str());
@@ -5687,7 +5708,7 @@ impl LiveCli {
                 );
             }
         }
-        let plan_text = self.task_plan.render();
+        let plan_text = self.task_plan.render_for_writer();
         let pending_rework = self.pending_rework.take();
         let plan_text = pending_rework
             .as_ref()
@@ -5978,6 +5999,8 @@ impl LiveCli {
             return Ok(false);
         }
 
+        benchmark_telemetry::lifecycle_event("candidate_submitted");
+
         let candidate_id = changes.id.to_string();
         if self.completion_audit_pending
             && self.completion_audit_candidate_id.as_deref() == Some(candidate_id.as_str())
@@ -6085,7 +6108,6 @@ impl LiveCli {
                     self.rework_profile = self.selected_writer_profile.clone();
                     self.pending_rework = Some(model_router::EscalationPackage {
                         original_requirement: self.task_plan.authoritative_request().to_string(),
-                        task_plan: self.task_plan.render(),
                         candidate_summary: format!("Changed paths: {}", changed_paths.join(", ")),
                         expected_contracts: self
                             .task_plan
@@ -6637,7 +6659,6 @@ impl LiveCli {
         }
         self.pending_rework = Some(model_router::EscalationPackage {
             original_requirement: self.task_plan.authoritative_request().to_string(),
-            task_plan: self.task_plan.render(),
             candidate_summary: format!("Changed paths: {}", changed_paths.join(", ")),
             expected_contracts: self
                 .task_plan

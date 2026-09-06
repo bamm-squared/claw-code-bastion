@@ -131,6 +131,24 @@ impl ContractStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlanningMode {
+    Minimal,
+    Standard,
+    Milestone,
+}
+
+impl PlanningMode {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Standard => "standard",
+            Self::Milestone => "milestone",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TaskPlan {
     /// The complete user request. This is authoritative input for evaluation;
@@ -153,6 +171,22 @@ pub struct TaskPlan {
 }
 
 impl TaskPlan {
+    #[must_use]
+    pub fn planning_mode(&self) -> PlanningMode {
+        let scope = self
+            .items
+            .len()
+            .max(self.contracts.len())
+            .max(self.repository_files.len());
+        if scope <= 1 && self.known_impact.len() <= 2 {
+            PlanningMode::Minimal
+        } else if scope <= 4 && self.open_questions.len() <= 4 {
+            PlanningMode::Standard
+        } else {
+            PlanningMode::Milestone
+        }
+    }
+
     pub fn invalidate_after_candidate_restore(&mut self) {
         let mut changed = false;
         for item in &mut self.items {
@@ -570,6 +604,80 @@ impl TaskPlan {
         );
         output
     }
+
+    /// Render the bounded writer packet. It keeps navigational state and
+    /// evidence references while leaving exact source discovery to the normal
+    /// repository tools.
+    #[must_use]
+    pub fn render_for_writer(&self) -> String {
+        let mut output = String::from("[Task working map]\nMode: ");
+        output.push_str(self.planning_mode().label());
+        output.push_str("\nGoal: ");
+        output.push_str(&self.original_request);
+        output.push_str("\nObligations:\n");
+        for item in self.items.iter().take(MAX_ITEMS) {
+            output.push_str("- ");
+            output.push_str(&item.id);
+            output.push_str(": ");
+            output.push_str(&item.statement);
+            output.push_str(" [");
+            output.push_str(status_label(&item.status));
+            output.push_str("]\n");
+        }
+        for contract in self.contracts.iter().take(MAX_CONTRACTS) {
+            output.push_str("- ");
+            output.push_str(&contract.id);
+            output.push_str(": ");
+            output.push_str(&contract.expectation);
+            output.push_str(" [boundary: ");
+            output.push_str(contract.verification_boundary.label());
+            output.push_str("; ");
+            output.push_str(contract.status.label());
+            output.push_str("]\n");
+            if !contract.evidence.is_empty() {
+                output.push_str("  evidence: ");
+                output.push_str(&contract.evidence);
+                output.push('\n');
+            }
+        }
+        if !self.repository_files.is_empty() {
+            output.push_str("Repository fact references:\n");
+            for path in self.repository_files.iter().take(MAX_SCOPE_FILES) {
+                output.push_str("- ");
+                output.push_str(path);
+                output.push('\n');
+            }
+        }
+        if !self.primary_repository_files.is_empty() {
+            output.push_str("Likely authoritative scope (verify, do not assume):\n");
+            for path in self.primary_repository_files.iter().take(MAX_SCOPE_FILES) {
+                output.push_str("- ");
+                output.push_str(path);
+                output.push('\n');
+            }
+        }
+        for guidance in self
+            .implementation_surface_guidance
+            .iter()
+            .take(MAX_SCOPE_GUIDANCE)
+        {
+            output.push_str("Surface fact: ");
+            output.push_str(guidance);
+            output.push('\n');
+        }
+        if !self.open_questions.is_empty() {
+            output.push_str("Open questions:\n");
+            for question in self.open_questions.iter().take(MAX_CONTRACTS) {
+                output.push_str("- ");
+                output.push_str(question);
+                output.push('\n');
+            }
+        }
+        output.push_str(
+            "Use these obligations and fact references to navigate the candidate. Submit a coherent candidate when ready; source, trusted validation, and independent evaluation remain authoritative.\n",
+        );
+        output
+    }
 }
 
 fn contract_item_id(contract_id: &str) -> Option<String> {
@@ -903,6 +1011,37 @@ mod tests {
             .verification_basis
             .contains("user requirement"));
         assert!(plan.render().contains("Verification planning"));
+    }
+
+    #[test]
+    fn writer_packet_is_compact_and_complexity_adaptive() {
+        let small = TaskPlan::from_request("Fix one local behavior.", None);
+        let rendered = small.render_for_writer();
+        assert!(rendered.contains("Mode: minimal"));
+        assert!(!rendered.contains("Verification planning:"));
+
+        let mut medium = TaskPlan::from_request(
+            "Update the API. Preserve compatibility. Add tests. Handle errors.",
+            Some("src/api.rs\nreferences: tests/api.rs"),
+        );
+        medium.set_repository_scope(
+            &[
+                "src/api.rs".to_string(),
+                "tests/api.rs".to_string(),
+                "src/error.rs".to_string(),
+                "tests/error.rs".to_string(),
+                "src/client.rs".to_string(),
+            ],
+            &["src/api.rs".to_string()],
+            &["manifest-backed project: Cargo.toml".to_string()],
+        );
+        assert_ne!(medium.planning_mode(), PlanningMode::Minimal);
+        assert!(medium
+            .render_for_writer()
+            .contains("Repository fact references"));
+        assert!(medium
+            .render_for_writer()
+            .contains("Likely authoritative scope"));
     }
 
     #[test]
