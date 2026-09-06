@@ -62,6 +62,13 @@ pub trait ApiClient {
 pub trait ToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError>;
 
+    /// Return a writer checkpoint requested through an explicit lifecycle tool.
+    /// Checkpoints yield control to the orchestrator; they do not imply that
+    /// the candidate is correct.
+    fn take_checkpoint(&mut self) -> Option<WriterCheckpoint> {
+        None
+    }
+
     fn validate_candidate(
         &mut self,
         _changes: &CandidateChangeSet,
@@ -91,6 +98,15 @@ pub trait ToolExecutor {
     fn resume_candidate(&mut self) -> Result<(), ToolError> {
         Ok(())
     }
+}
+
+/// Explicit writer handoff state. The validator and evaluator remain the
+/// authorities for candidate correctness after a submit checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriterCheckpoint {
+    Submit { message: Option<String> },
+    Blocked { message: String },
+    NeedsUserInput { message: String },
 }
 
 /// Error returned when a tool invocation fails locally.
@@ -148,6 +164,7 @@ pub struct TurnSummary {
     pub iterations: usize,
     pub usage: TokenUsage,
     pub auto_compaction: Option<AutoCompactionEvent>,
+    pub checkpoint: Option<WriterCheckpoint>,
 }
 
 /// Details about automatic session compaction applied during a turn.
@@ -165,6 +182,10 @@ pub struct ConversationRuntime<C, T> {
     system_prompt: Vec<String>,
     repository_context: Option<String>,
     max_iterations: usize,
+    configured_max_iterations: usize,
+    checkpoint_finalization_turns: usize,
+    checkpoint_turns_remaining: usize,
+    checkpoint: Option<WriterCheckpoint>,
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
     auto_compaction_input_tokens_threshold: u32,
@@ -215,6 +236,10 @@ where
             system_prompt,
             repository_context: None,
             max_iterations: usize::MAX,
+            configured_max_iterations: usize::MAX,
+            checkpoint_finalization_turns: 0,
+            checkpoint_turns_remaining: 0,
+            checkpoint: None,
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
             auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
@@ -227,6 +252,25 @@ where
     #[must_use]
     pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
         self.max_iterations = max_iterations;
+        self.configured_max_iterations = max_iterations;
+        self.checkpoint_finalization_turns = 0;
+        self.checkpoint_turns_remaining = 0;
+        self
+    }
+
+    /// Configure a deterministic writer budget followed by a bounded wrap-up
+    /// window. The wrap-up prompt asks the writer to submit, block, or request
+    /// user input; it never evaluates the candidate's correctness.
+    #[must_use]
+    pub fn with_checkpoint_policy(
+        mut self,
+        max_iterations: usize,
+        finalization_turns: usize,
+    ) -> Self {
+        self.max_iterations = max_iterations;
+        self.configured_max_iterations = max_iterations;
+        self.checkpoint_finalization_turns = finalization_turns;
+        self.checkpoint_turns_remaining = finalization_turns;
         self
     }
 
@@ -405,10 +449,35 @@ where
         let mut tool_results = Vec::new();
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
+        self.max_iterations = self.configured_max_iterations;
+        self.checkpoint_turns_remaining = self.checkpoint_finalization_turns;
+        self.checkpoint = None;
         let mut previous_tool_fingerprint = None;
         let mut identical_tool_iterations = 0;
 
         loop {
+            if iterations >= self.max_iterations && self.checkpoint_turns_remaining > 0 {
+                self.checkpoint_turns_remaining -= 1;
+                self.max_iterations = self.max_iterations.saturating_add(1);
+                self.session
+                    .push_message(ConversationMessage {
+                        role: MessageRole::User,
+                        blocks: vec![ContentBlock::Text {
+                            text: "The bounded writer budget has been reached. Use the candidate_checkpoint tool now with submit, blocked, or needs_user_input. Do not begin broad new work; submit the best coherent candidate or state what prevents completion.".to_string(),
+                        }],
+                        usage: None,
+                    })
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                if let Some(session_tracer) = &self.session_tracer {
+                    session_tracer.record(
+                        "writer_checkpoint_prompted",
+                        Map::from_iter([(
+                            "finalization_turns_remaining".to_string(),
+                            Value::from(self.checkpoint_turns_remaining as u64),
+                        )]),
+                    );
+                }
+            }
             iterations += 1;
             if iterations > self.max_iterations {
                 let error = RuntimeError::new(
@@ -581,6 +650,11 @@ where
                 tool_results.push(result_message);
             }
 
+            if let Some(checkpoint) = self.tool_executor.take_checkpoint() {
+                self.checkpoint = Some(checkpoint);
+                break;
+            }
+
             let fingerprint = tool_fingerprint.finish();
             if previous_tool_fingerprint == Some(fingerprint) {
                 identical_tool_iterations += 1;
@@ -606,6 +680,7 @@ where
             iterations,
             usage: self.usage_tracker.cumulative_usage(),
             auto_compaction,
+            checkpoint: self.checkpoint.clone(),
         };
         self.record_turn_completed(&summary);
 
@@ -649,6 +724,11 @@ where
         self.tool_executor
             .finish_candidate()
             .map_err(|error| RuntimeError::new(error.to_string()))
+    }
+
+    /// Take the explicit writer checkpoint captured during the last turn.
+    pub fn take_checkpoint(&mut self) -> Option<WriterCheckpoint> {
+        self.checkpoint.take()
     }
 
     pub fn apply_candidate_changes(
@@ -965,7 +1045,8 @@ mod tests {
     use super::{
         build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
         AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        StaticToolExecutor, ToolExecutor, WriterCheckpoint,
+        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -1917,6 +1998,135 @@ mod tests {
         assert!(error
             .to_string()
             .contains("conversation loop exceeded the maximum number of iterations"));
+    }
+
+    #[test]
+    fn explicit_writer_checkpoint_yields_control_without_semantic_authority() {
+        struct CheckpointApi;
+
+        impl ApiClient for CheckpointApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "checkpoint-1".to_string(),
+                        name: "candidate_checkpoint".to_string(),
+                        input: r#"{"status":"submit"}"#.to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        struct CheckpointExecutor;
+
+        impl ToolExecutor for CheckpointExecutor {
+            fn execute(&mut self, _tool_name: &str, _input: &str) -> Result<String, ToolError> {
+                Ok(r#"{"accepted":true}"#.to_string())
+            }
+
+            fn take_checkpoint(&mut self) -> Option<WriterCheckpoint> {
+                Some(WriterCheckpoint::Submit { message: None })
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            CheckpointApi,
+            CheckpointExecutor,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        );
+
+        let summary = runtime
+            .run_turn("submit candidate", None)
+            .expect("checkpoint should complete the turn");
+
+        assert_eq!(summary.iterations, 1);
+        assert_eq!(
+            summary.checkpoint,
+            Some(WriterCheckpoint::Submit { message: None })
+        );
+        assert_eq!(
+            runtime.take_checkpoint(),
+            Some(WriterCheckpoint::Submit { message: None })
+        );
+    }
+
+    #[test]
+    fn writer_budget_allows_one_bounded_wrap_up_turn() {
+        struct WrapUpApi {
+            calls: usize,
+        }
+
+        impl ApiClient for WrapUpApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    return Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "echo-1".to_string(),
+                            name: "echo".to_string(),
+                            input: "work".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                assert!(request.messages.iter().any(|message| {
+                    message.blocks.iter().any(|block| {
+                        matches!(block, ContentBlock::Text { text } if text.contains("bounded writer budget"))
+                    })
+                }));
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "checkpoint-1".to_string(),
+                        name: "candidate_checkpoint".to_string(),
+                        input: r#"{"status":"blocked","message":"needs more work"}"#.to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        struct WrapUpExecutor {
+            checkpoint: bool,
+        }
+
+        impl ToolExecutor for WrapUpExecutor {
+            fn execute(&mut self, tool_name: &str, _input: &str) -> Result<String, ToolError> {
+                if tool_name == "candidate_checkpoint" {
+                    self.checkpoint = true;
+                }
+                Ok("ok".to_string())
+            }
+
+            fn take_checkpoint(&mut self) -> Option<WriterCheckpoint> {
+                self.checkpoint.then(|| WriterCheckpoint::Blocked {
+                    message: "needs more work".to_string(),
+                })
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            WrapUpApi { calls: 0 },
+            WrapUpExecutor { checkpoint: false },
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_checkpoint_policy(1, 1);
+
+        let summary = runtime
+            .run_turn("work", None)
+            .expect("wrap-up should terminate through an explicit checkpoint");
+
+        assert_eq!(summary.iterations, 2);
+        assert!(matches!(
+            summary.checkpoint,
+            Some(WriterCheckpoint::Blocked { .. })
+        ));
     }
 
     #[test]

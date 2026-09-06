@@ -65,7 +65,7 @@ use runtime::{
     McpServerManager, McpServerSpec, McpTool, MessageRole, ModelPricing, PermissionMode,
     PermissionPolicy, PodmanWorkerClient, PodmanWorkerSpec, ProjectContext, PromptCacheEvent,
     ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
-    UsageTracker, ValidationStatus,
+    UsageTracker, ValidationStatus, WriterCheckpoint,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -4196,6 +4196,19 @@ impl BuiltRuntime {
         self
     }
 
+    fn with_writer_checkpoint_policy(
+        mut self,
+        max_iterations: usize,
+        finalization_turns: usize,
+    ) -> Self {
+        let runtime = self
+            .runtime
+            .take()
+            .expect("runtime should exist before installing writer budget");
+        self.runtime = Some(runtime.with_checkpoint_policy(max_iterations, finalization_turns));
+        self
+    }
+
     fn shutdown_plugins(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.plugins_active {
             self.plugin_registry.shutdown()?;
@@ -5755,6 +5768,7 @@ impl LiveCli {
         } else {
             runtime.with_repository_context(plan_text)
         }
+        .with_writer_checkpoint_policy(writer_iteration_budget(self.task_plan.planning_mode()), 1)
         .with_hook_abort_signal(hook_abort_signal.clone());
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
 
@@ -5804,6 +5818,23 @@ impl LiveCli {
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
+                if let Some(checkpoint) = runtime.take_checkpoint() {
+                    match checkpoint {
+                        WriterCheckpoint::Submit { .. } => {}
+                        WriterCheckpoint::Blocked { message }
+                        | WriterCheckpoint::NeedsUserInput { message } => {
+                            let _ = runtime.finish_candidate()?;
+                            self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
+                            benchmark_telemetry::lifecycle_event("writer_checkpoint_blocked");
+                            println!("Writer checkpoint stopped before Review: {message}");
+                            self.replace_runtime(runtime)?;
+                            self.persist_session()?;
+                            self.context_tray.clear();
+                            self.attachments.clear();
+                            return Ok(());
+                        }
+                    }
+                }
                 let automatic_rework = self.review_candidate_changes(&mut runtime)?;
                 self.replace_runtime(runtime)?;
                 if automatic_rework {
@@ -6485,7 +6516,23 @@ impl LiveCli {
             );
             hook_abort_monitor.stop();
             match result {
-                Ok(_) => {}
+                Ok(_) => {
+                    if let Some(checkpoint) = runtime.take_checkpoint() {
+                        match checkpoint {
+                            WriterCheckpoint::Submit { .. } => {}
+                            WriterCheckpoint::Blocked { message }
+                            | WriterCheckpoint::NeedsUserInput { message } => {
+                                let _ = runtime.finish_candidate()?;
+                                self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
+                                benchmark_telemetry::lifecycle_event("writer_checkpoint_blocked");
+                                println!("Writer checkpoint stopped before Review: {message}");
+                                self.replace_runtime(runtime)?;
+                                self.rework_profile = None;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
                 Err(error) => {
                     let _ = runtime.discard_candidate();
                     self.candidate_state = CandidateLifecycleState::Discarded;
@@ -11769,6 +11816,7 @@ struct CliToolExecutor {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
+    pending_checkpoint: Option<WriterCheckpoint>,
 }
 
 impl CliToolExecutor {
@@ -11784,6 +11832,7 @@ impl CliToolExecutor {
             allowed_tools,
             tool_registry,
             mcp_state,
+            pending_checkpoint: None,
         }
     }
 
@@ -11871,6 +11920,10 @@ impl CliToolExecutor {
 }
 
 impl ToolExecutor for CliToolExecutor {
+    fn take_checkpoint(&mut self) -> Option<WriterCheckpoint> {
+        self.pending_checkpoint.take()
+    }
+
     fn finish_candidate(&mut self) -> Result<Option<CandidateChangeSet>, ToolError> {
         self.stop_isolated_mcp()?;
         self.tool_registry
@@ -11934,7 +11987,13 @@ impl ToolExecutor for CliToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        let result = if tool_name == "ToolSearch" {
+        let candidate_check = tool_name == "candidate_check";
+        if candidate_check {
+            benchmark_telemetry::lifecycle_event("candidate_check_started");
+        }
+        let result = if tool_name == "candidate_checkpoint" {
+            self.execute_candidate_checkpoint(&value)
+        } else if tool_name == "ToolSearch" {
             self.execute_search_tool(value)
         } else if self.tool_registry.has_runtime_tool(tool_name) {
             self.execute_runtime_tool(tool_name, value)
@@ -11945,6 +12004,9 @@ impl ToolExecutor for CliToolExecutor {
         };
         match result {
             Ok(output) => {
+                if candidate_check {
+                    benchmark_telemetry::lifecycle_event("candidate_check_completed");
+                }
                 if self.emit_output {
                     let markdown = format_tool_result(tool_name, &output, false);
                     self.renderer
@@ -11954,6 +12016,9 @@ impl ToolExecutor for CliToolExecutor {
                 Ok(output)
             }
             Err(error) => {
+                if candidate_check {
+                    benchmark_telemetry::lifecycle_event("candidate_check_failed");
+                }
                 if self.emit_output {
                     let markdown = format_tool_result(tool_name, &error.to_string(), true);
                     self.renderer
@@ -11963,6 +12028,71 @@ impl ToolExecutor for CliToolExecutor {
                 Err(error)
             }
         }
+    }
+}
+
+impl CliToolExecutor {
+    fn execute_candidate_checkpoint(&mut self, value: &Value) -> Result<String, ToolError> {
+        let status = value
+            .get("status")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::new("candidate_checkpoint requires a status"))?;
+        let message = value
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .chars()
+            .take(4_000)
+            .collect::<String>();
+        let checkpoint = match status {
+            "submit" => WriterCheckpoint::Submit {
+                message: (!message.is_empty()).then_some(message),
+            },
+            "blocked" => WriterCheckpoint::Blocked {
+                message: if message.is_empty() {
+                    "writer reported that the candidate is blocked".to_string()
+                } else {
+                    message
+                },
+            },
+            "needs_user_input" => WriterCheckpoint::NeedsUserInput {
+                message: if message.is_empty() {
+                    "writer requires user input before continuing".to_string()
+                } else {
+                    message
+                },
+            },
+            other => {
+                return Err(ToolError::new(format!(
+                    "unsupported candidate_checkpoint status `{other}`"
+                )))
+            }
+        };
+        if self.pending_checkpoint.is_some() {
+            return Err(ToolError::new(
+                "candidate_checkpoint was already requested in this turn",
+            ));
+        }
+        let response_status = match &checkpoint {
+            WriterCheckpoint::Submit { .. } => "submit",
+            WriterCheckpoint::Blocked { .. } => "blocked",
+            WriterCheckpoint::NeedsUserInput { .. } => "needs_user_input",
+        };
+        self.pending_checkpoint = Some(checkpoint);
+        Ok(json!({
+            "accepted": true,
+            "status": response_status,
+            "message": "The orchestrator will now handle this checkpoint.",
+        })
+        .to_string())
+    }
+}
+
+fn writer_iteration_budget(mode: task_plan::PlanningMode) -> usize {
+    match mode {
+        task_plan::PlanningMode::Minimal => 48,
+        task_plan::PlanningMode::Standard => 96,
+        task_plan::PlanningMode::Milestone => 160,
     }
 }
 

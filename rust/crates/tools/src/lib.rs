@@ -109,6 +109,13 @@ pub struct ToolSpec {
     pub required_permission: PermissionMode,
 }
 
+#[derive(Debug, Deserialize)]
+struct CandidateCheckInput {
+    checks: Vec<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct GlobalToolRegistry {
     plugin_tools: Vec<PluginTool>,
@@ -119,6 +126,18 @@ pub struct GlobalToolRegistry {
 
 pub trait ExecutionBackend: Send + std::fmt::Debug {
     fn execute(&mut self, tool_name: &str, input: &Value) -> Result<String, String>;
+
+    fn candidate_development_check(&mut self, _input: &Value) -> Result<String, String> {
+        Err(String::from(
+            "candidate development checks require an isolated candidate backend",
+        ))
+    }
+
+    fn run_candidate_development_check(&mut self, _input: &Value) -> Result<String, String> {
+        Err(String::from(
+            "candidate development checks require an isolated candidate backend",
+        ))
+    }
 
     fn isolated_workspace_root(&self) -> Option<PathBuf> {
         None
@@ -363,6 +382,101 @@ impl ExecutionBackend for IsolatedExecutionBackend {
             .map_err(|error| error.to_string())
     }
 
+    fn candidate_development_check(&mut self, input: &Value) -> Result<String, String> {
+        self.stop_worker();
+        let result = self.run_candidate_development_check(input);
+        let resume_result = self.resume_worker();
+        match (result, resume_result) {
+            (Ok(output), Ok(())) => Ok(output),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(resume_error)) => Err(format!(
+                "{error}; failed to resume isolated worker: {resume_error}"
+            )),
+        }
+    }
+
+    fn run_candidate_development_check(&mut self, input: &Value) -> Result<String, String> {
+        let request: CandidateCheckInput = serde_json::from_value(input.clone())
+            .map_err(|error| format!("invalid candidate_check input: {error}"))?;
+        if request.checks.is_empty() {
+            return Err(String::from(
+                "candidate_check requires at least one named check",
+            ));
+        }
+        let detected = runtime::detect_validation_plan(&self.workspace.candidate.root);
+        if detected.checks.is_empty() {
+            return development_check_infrastructure_error(
+                "no repository validation checks were discovered for the candidate",
+            );
+        }
+        let checks = request
+            .checks
+            .iter()
+            .map(|name| {
+                development_check_for_name(&detected, name, request.timeout_ms)
+                    .ok_or_else(|| format!("unsupported candidate check `{name}`"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let plan = runtime::ValidationPlan::new(checks);
+        if plan.checks.is_empty() {
+            return development_check_infrastructure_error("candidate check plan is empty");
+        }
+        let changes = self
+            .workspace
+            .scan()
+            .map_err(|error| format!("unable to scan candidate for development check: {error}"))?;
+        let snapshot = runtime::ValidationSnapshot::create_verified(
+            &self.workspace.candidate,
+            &self.workspace.baseline,
+            &changes,
+        )
+        .map_err(|error| format!("unable to snapshot candidate for development check: {error}"))?;
+        let backend = runtime::PodmanValidatorBackend {
+            image: std::env::var("CLAW_VALIDATOR_IMAGE")
+                .or_else(|_| std::env::var("CLAW_WORKER_IMAGE"))
+                .unwrap_or_else(|_| runtime::DEFAULT_RUNTIME_IMAGE.to_string()),
+            ..runtime::PodmanValidatorBackend::default()
+        };
+        let validation =
+            runtime::validator::ValidatorBackend::validate(&backend, &snapshot.input(), &plan)
+                .map_err(|error| format!("candidate development validator unavailable: {error}"))?;
+        let checks = validation
+            .checks
+            .iter()
+            .map(|check| {
+                json!({
+                    "name": check.name,
+                    "command": check.command,
+                    "status": format_validation_status(check.status),
+                    "exit_code": check.exit_code,
+                    "stdout": truncate_development_output(&check.stdout, 4_000),
+                    "stderr": truncate_development_output(&check.stderr, 8_000),
+                    "truncated": check.truncated,
+                })
+            })
+            .collect::<Vec<_>>();
+        let status = if validation.has_infrastructure_failure() {
+            "infrastructure_error"
+        } else if validation
+            .checks
+            .iter()
+            .all(|check| check.status == runtime::ValidationStatus::Pass)
+        {
+            "pass"
+        } else {
+            "fail"
+        };
+        serde_json::to_string(&json!({
+            "kind": "candidate_development_check",
+            "candidate_id": changes.id.to_string(),
+            "status": status,
+            "checks": checks,
+            "authorizes_review": false,
+            "note": "Development feedback only; submit the candidate for independent trusted validation.",
+        }))
+        .map_err(|error| error.to_string())
+    }
+
     fn execute_plugin(&mut self, tool: &PluginTool, input: &Value) -> Result<String, String> {
         let mut command = format!(
             "printf '%s' {} | env CLAWD_PLUGIN_ID={} CLAWD_PLUGIN_NAME={} CLAWD_TOOL_NAME={} CLAWD_TOOL_INPUT={} {}",
@@ -524,6 +638,65 @@ fn worker_request(tool_name: &str, input: &Value) -> Result<Value, String> {
         return Ok(json!({ "operation": "run_command", "command": command, "timeout": timeout }));
     }
     Ok(request)
+}
+
+fn development_check_for_name(
+    plan: &runtime::ValidationPlan,
+    requested: &str,
+    timeout_ms: Option<u64>,
+) -> Option<runtime::ValidationCheck> {
+    let requested = requested.trim().to_ascii_lowercase();
+    let aliases: &[&str] = match requested.as_str() {
+        "format" | "fmt" => &["cargo fmt"],
+        "test" | "tests" => &["cargo test --workspace"],
+        "clippy" | "lint" => &["cargo clippy"],
+        _ => &[],
+    };
+    plan.checks
+        .iter()
+        .find(|check| {
+            check.name.to_ascii_lowercase() == requested
+                || aliases
+                    .iter()
+                    .any(|alias| check.name.to_ascii_lowercase() == *alias)
+        })
+        .map(|check| {
+            let mut check = check.clone();
+            if let Some(timeout_ms) = timeout_ms {
+                check.timeout = Duration::from_millis(timeout_ms.clamp(1, 120_000));
+            }
+            check
+        })
+}
+
+fn development_check_infrastructure_error(message: &str) -> Result<String, String> {
+    serde_json::to_string(&json!({
+        "kind": "candidate_development_check",
+        "status": "infrastructure_error",
+        "checks": [],
+        "authorizes_review": false,
+        "error": message,
+    }))
+    .map_err(|error| error.to_string())
+}
+
+fn format_validation_status(status: runtime::ValidationStatus) -> &'static str {
+    match status {
+        runtime::ValidationStatus::Pass => "pass",
+        runtime::ValidationStatus::Fail => "fail",
+        runtime::ValidationStatus::Blocked => "blocked",
+        runtime::ValidationStatus::Timeout => "timeout",
+        runtime::ValidationStatus::Error => "error",
+        runtime::ValidationStatus::Skipped => "skipped",
+    }
+}
+
+fn truncate_development_output(value: &str, limit: usize) -> String {
+    let mut output = value.chars().take(limit).collect::<String>();
+    if value.chars().count() > limit {
+        output.push_str("\n[development check output truncated]\n");
+    }
+    output
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -827,6 +1000,18 @@ impl GlobalToolRegistry {
             .validate_candidate(changes)
     }
 
+    pub fn candidate_development_check(&self, input: &Value) -> Result<String, String> {
+        let Some(backend) = &self.execution_backend else {
+            return Err(String::from(
+                "candidate development checks require an isolated candidate backend",
+            ));
+        };
+        backend
+            .lock()
+            .map_err(|_| String::from("execution backend lock poisoned"))?
+            .candidate_development_check(input)
+    }
+
     pub fn discard_candidate(&self) -> Result<(), String> {
         let Some(backend) = &self.execution_backend else {
             return Ok(());
@@ -852,6 +1037,10 @@ impl GlobalToolRegistry {
             return Err(String::from("tool execution requires a PermissionEnforcer"));
         };
         if mvp_tool_specs().iter().any(|spec| spec.name == name) {
+            if name == "candidate_check" {
+                enforce_backend_permission(enforcer, name, input)?;
+                return self.candidate_development_check(input);
+            }
             if !is_host_side_tool(name) {
                 if let Some(backend) = &self.execution_backend {
                     enforce_backend_permission(enforcer, name, input)?;
@@ -921,6 +1110,8 @@ fn is_host_side_tool(name: &str) -> bool {
             | "GitBlame"
             | "GitBranches"
             | "GitChangedFiles"
+            | "candidate_check"
+            | "candidate_checkpoint"
     )
 }
 
@@ -1015,6 +1206,45 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "additionalProperties": false
             }),
             required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "candidate_check",
+            description: "Run a bounded named development check against the isolated candidate. This returns feedback only and never authorizes Review or Apply.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "checks": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["format", "test", "clippy"]
+                        },
+                        "minItems": 1,
+                        "maxItems": 3
+                    },
+                    "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 120_000 }
+                },
+                "required": ["checks"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
+            name: "candidate_checkpoint",
+            description: "Yield the writer to the orchestrator with submit, blocked, or needs_user_input. This is a lifecycle handoff, not a correctness claim.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["submit", "blocked", "needs_user_input"]
+                    },
+                    "message": { "type": "string", "maxLength": 4000 }
+                },
+                "required": ["status"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
             name: "grep_search",
@@ -1838,6 +2068,9 @@ fn execute_tool_with_enforcer(
         "StructuredOutput" => {
             from_value::<StructuredOutputInput>(input).and_then(run_structured_output)
         }
+        "candidate_checkpoint" => Err(String::from(
+            "candidate_checkpoint is available only in the primary interactive writer runtime",
+        )),
         "REPL" => from_value::<ReplInput>(input).and_then(run_repl),
         "PowerShell" => {
             // Parse input to get the command for permission classification
@@ -10268,6 +10501,25 @@ printf 'pwsh:%s' "$1"
         let mut registry = super::GlobalToolRegistry::builtin();
         registry.set_enforcer(PermissionEnforcer::new(policy));
         registry
+    }
+
+    #[test]
+    fn candidate_development_check_requires_an_isolated_candidate_backend() {
+        use runtime::permission_enforcer::PermissionEnforcer;
+        use runtime::PermissionPolicy;
+
+        let policy = mvp_tool_specs().into_iter().fold(
+            PermissionPolicy::new(runtime::PermissionMode::WorkspaceWrite),
+            |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
+        );
+        let mut registry = super::GlobalToolRegistry::builtin();
+        registry.set_enforcer(PermissionEnforcer::new(policy));
+
+        let error = registry
+            .execute("candidate_check", &json!({"checks": ["test"]}))
+            .expect_err("candidate checks need an isolated candidate");
+
+        assert!(error.contains("isolated candidate backend"));
     }
 
     #[test]

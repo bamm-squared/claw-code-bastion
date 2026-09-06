@@ -79,7 +79,7 @@ pub use config_validate::{
 pub use conversation::{
     auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
     ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolError,
-    ToolExecutor, TurnSummary,
+    ToolExecutor, TurnSummary, WriterCheckpoint,
 };
 pub use file_ops::{
     EditFileOutput, FilesystemCapability, GlobSearchOutput, GrepSearchInput, GrepSearchOutput,

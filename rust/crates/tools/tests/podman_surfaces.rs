@@ -71,6 +71,54 @@ fn plan(command: String) -> ValidationPlan {
 
 #[test]
 #[ignore = "requires a working rootless Podman runtime and CLAW_REAL_PODMAN_IMAGE"]
+fn real_candidate_check_runs_named_validation_in_isolated_candidate() {
+    let (root, canonical, _) = fixture("candidate-check");
+    fs::create_dir_all(canonical.join("rust/src")).expect("create nested workspace");
+    fs::write(
+        canonical.join("rust/Cargo.toml"),
+        "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n",
+    )
+    .expect("write workspace manifest");
+    fs::create_dir_all(canonical.join("rust/app/src")).expect("create crate");
+    fs::write(
+        canonical.join("rust/app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write crate manifest");
+    fs::write(
+        canonical.join("rust/app/src/lib.rs"),
+        "pub fn answer() -> u8 { 42 }\n",
+    )
+    .expect("write crate source");
+
+    let (canonical, candidate, backend) = backend(&canonical);
+    let registry = GlobalToolRegistry::builtin()
+        .with_enforcer(PermissionEnforcer::new(
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite)
+                .with_tool_requirement("candidate_check", PermissionMode::WorkspaceWrite),
+        ))
+        .with_execution_backend(Arc::clone(&backend));
+    let output = registry
+        .execute("candidate_check", &json!({"checks": ["test"]}))
+        .expect("candidate check should execute through isolated backend");
+    let output: serde_json::Value = serde_json::from_str(&output).expect("candidate check JSON");
+
+    assert_eq!(output["kind"], "candidate_development_check");
+    assert_eq!(output["status"], "pass");
+    assert_eq!(output["authorizes_review"], false);
+    assert_eq!(output["checks"][0]["name"], "cargo test --workspace");
+    assert_eq!(
+        fs::read_to_string(canonical.join("source.txt")).unwrap(),
+        "before"
+    );
+
+    drop(registry);
+    finish_backend(backend, &root);
+    let _ = fs::remove_dir_all(candidate);
+}
+
+#[test]
+#[ignore = "requires a working rootless Podman runtime and CLAW_REAL_PODMAN_IMAGE"]
 fn real_hook_execution_uses_isolated_candidate_and_no_host_fallback() {
     let (root, canonical, outside) = fixture("hook");
     fs::write(&outside, OUTSIDE_SENTINEL).expect("write outside canary");
