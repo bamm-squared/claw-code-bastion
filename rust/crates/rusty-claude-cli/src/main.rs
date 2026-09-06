@@ -38,7 +38,8 @@ use api::{
     detect_provider_kind, resolve_startup_auth_source, AnthropicClient, AuthSource,
     ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
     OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    RateLimitState, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 use base64::Engine;
 
@@ -80,6 +81,8 @@ const MAX_VALIDATION_REPAIR_CYCLES: u8 = 2;
 const MAX_EVALUATOR_REWORK_CYCLES: u8 = 1;
 const MAX_TOTAL_CORRECTION_CYCLES: u8 = MAX_VALIDATION_REPAIR_CYCLES + MAX_EVALUATOR_REWORK_CYCLES;
 const MAX_COMPLETION_AUDIT_CYCLES: u8 = 1;
+const WRITER_CONTEXT_CHECKPOINT_TOKENS: usize = 64_000;
+const WRITER_PROVIDER_HEADROOM_RESERVE: u64 = 8_000;
 fn max_tokens_for_model(model: &str) -> u32 {
     let model = model.to_ascii_lowercase();
     if model.starts_with("gpt-4o") {
@@ -4209,6 +4212,15 @@ impl BuiltRuntime {
         self
     }
 
+    fn with_context_checkpoint_tokens(mut self, threshold: usize) -> Self {
+        let runtime = self
+            .runtime
+            .take()
+            .expect("runtime should exist before installing context budget");
+        self.runtime = Some(runtime.with_context_checkpoint_tokens(threshold));
+        self
+    }
+
     fn shutdown_plugins(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.plugins_active {
             self.plugin_registry.shutdown()?;
@@ -5772,6 +5784,7 @@ impl LiveCli {
             runtime.with_repository_context(plan_text)
         }
         .with_writer_checkpoint_policy(writer_iteration_budget(self.task_plan.planning_mode()), 1)
+        .with_context_checkpoint_tokens(WRITER_CONTEXT_CHECKPOINT_TOKENS)
         .with_hook_abort_signal(hook_abort_signal.clone());
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
 
@@ -5827,6 +5840,9 @@ impl LiveCli {
                 }
                 if runtime.checkpoint_candidate_check_ran() {
                     benchmark_telemetry::writer_checkpoint_candidate_check();
+                    if let Some(reason) = runtime.checkpoint_reason() {
+                        benchmark_telemetry::writer_checkpoint_reason(reason);
+                    }
                     if let Some(event) = summary.auto_compaction {
                         benchmark_telemetry::writer_checkpoint_context(
                             event.before_estimated_tokens,
@@ -10348,6 +10364,7 @@ struct AnthropicRuntimeClient {
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
     reasoning_effort: Option<String>,
+    rate_limit_state: Arc<Mutex<Option<RateLimitState>>>,
 }
 
 impl AnthropicRuntimeClient {
@@ -10457,6 +10474,7 @@ impl AnthropicRuntimeClient {
             tool_registry,
             progress_reporter,
             reasoning_effort: None,
+            rate_limit_state: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -10692,6 +10710,20 @@ impl ApiClient for AnthropicRuntimeClient {
                         if should_retry_provider_turn(provider_recoveries, &error)
                             && attempt < max_attempts =>
                     {
+                        if error.is_provider_rate_limit() {
+                            let delay = self
+                                .rate_limit_state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .as_ref()
+                                .and_then(|state| state.token_reset_after_seconds)
+                                .unwrap_or(0)
+                                .min(15);
+                            if delay > 0 {
+                                benchmark_telemetry::provider_rate_limit_pacing(delay);
+                                tokio::time::sleep(Duration::from_secs(delay)).await;
+                            }
+                        }
                         provider_recoveries += 1;
                         if error.is_empty_provider_response() {
                             benchmark_telemetry::provider_empty_response_recovery();
@@ -10713,6 +10745,29 @@ impl ApiClient for AnthropicRuntimeClient {
             Err(RuntimeError::new("post-tool continuation nudge exhausted"))
         })
     }
+
+    fn checkpoint_reason(&self, request: &ApiRequest) -> Option<String> {
+        let estimated_tokens = runtime::estimate_api_request_tokens(request) as u64;
+        let state = self
+            .rate_limit_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        let remaining = state.token_remaining?;
+        benchmark_telemetry::writer_request_resource_estimate(
+            estimated_tokens,
+            state.token_limit,
+            state.token_remaining,
+            state.token_reset_after_seconds,
+        );
+        let required = estimated_tokens.saturating_add(WRITER_PROVIDER_HEADROOM_RESERVE);
+        (remaining < required).then(|| {
+            format!(
+                "provider_token_headroom:estimated={estimated_tokens},remaining={remaining},reset_after_seconds={}",
+                state.token_reset_after_seconds.unwrap_or(0)
+            )
+        })
+    }
 }
 
 impl AnthropicRuntimeClient {
@@ -10729,6 +10784,19 @@ impl AnthropicRuntimeClient {
             .stream_message(message_request)
             .await
             .map_err(|error| runtime_error_from_api_error(&self.session_id, &error))?;
+        if let Some(rate_limit_state) = stream.rate_limit_state() {
+            *self
+                .rate_limit_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(rate_limit_state.clone());
+            benchmark_telemetry::writer_request_resource_estimate(
+                0,
+                rate_limit_state.token_limit,
+                rate_limit_state.token_remaining,
+                rate_limit_state.token_reset_after_seconds,
+            );
+        }
         if let Some(request_id) = stream.request_id() {
             benchmark_telemetry::provider_request_id(request_id);
         }
@@ -10955,6 +11023,12 @@ fn runtime_error_from_api_error(session_id: &str, error: &api::ApiError) -> Runt
             if response.kind == api::ResponseOutcomeKind::Empty
     ) {
         RuntimeError::empty_provider_response(message)
+    } else if matches!(
+        error,
+        api::ApiError::NonActionableResponse(response)
+            if response.failure_class == Some(api::ProviderFailureClass::RateLimit)
+    ) {
+        RuntimeError::provider_rate_limit(message)
     } else if matches!(
         error,
         api::ApiError::NonActionableResponse(response)
@@ -12181,7 +12255,9 @@ const MAX_PROVIDER_TURN_RECOVERIES: usize = 1;
 
 fn should_retry_provider_turn(recoveries: usize, error: &RuntimeError) -> bool {
     recoveries < MAX_PROVIDER_TURN_RECOVERIES
-        && (error.is_empty_provider_response() || error.is_transient_provider_failure())
+        && (error.is_empty_provider_response()
+            || error.is_transient_provider_failure()
+            || error.is_provider_rate_limit())
 }
 
 #[cfg(test)]

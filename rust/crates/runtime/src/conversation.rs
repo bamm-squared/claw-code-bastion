@@ -29,6 +29,14 @@ pub struct ApiRequest {
     pub messages: Vec<ConversationMessage>,
 }
 
+/// Conservative request-size estimate used only for scheduling checkpoints.
+/// Provider billing and trusted validation remain authoritative elsewhere.
+#[must_use]
+pub fn estimate_api_request_tokens(request: &ApiRequest) -> usize {
+    let system_bytes = request.system_prompt.iter().map(String::len).sum::<usize>();
+    (system_bytes + format!("{:?}", request.messages).len()) / 4
+}
+
 /// Streamed events emitted while processing a single assistant turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssistantEvent {
@@ -56,6 +64,12 @@ pub struct PromptCacheEvent {
 /// Minimal streaming API contract required by [`ConversationRuntime`].
 pub trait ApiClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError>;
+
+    /// Optional provider/resource signal that should cause a writer checkpoint
+    /// before sending this request. This is advisory and never judges code.
+    fn checkpoint_reason(&self, _request: &ApiRequest) -> Option<String> {
+        None
+    }
 }
 
 /// Trait implemented by tool dispatchers that execute model-requested tools.
@@ -158,6 +172,7 @@ pub enum RuntimeErrorKind {
     Generic,
     EmptyProviderResponse,
     ProviderTransient,
+    ProviderRateLimit,
 }
 
 impl RuntimeError {
@@ -186,6 +201,14 @@ impl RuntimeError {
     }
 
     #[must_use]
+    pub fn provider_rate_limit(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: RuntimeErrorKind::ProviderRateLimit,
+        }
+    }
+
+    #[must_use]
     pub const fn is_empty_provider_response(&self) -> bool {
         matches!(self.kind, RuntimeErrorKind::EmptyProviderResponse)
     }
@@ -193,6 +216,11 @@ impl RuntimeError {
     #[must_use]
     pub const fn is_transient_provider_failure(&self) -> bool {
         matches!(self.kind, RuntimeErrorKind::ProviderTransient)
+    }
+
+    #[must_use]
+    pub const fn is_provider_rate_limit(&self) -> bool {
+        matches!(self.kind, RuntimeErrorKind::ProviderRateLimit)
     }
 }
 
@@ -236,8 +264,10 @@ pub struct ConversationRuntime<C, T> {
     configured_max_iterations: usize,
     checkpoint_finalization_turns: usize,
     checkpoint_turns_remaining: usize,
+    context_checkpoint_tokens: usize,
     checkpoint: Option<WriterCheckpoint>,
     checkpoint_candidate_check_ran: bool,
+    checkpoint_reason: Option<String>,
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
     auto_compaction_input_tokens_threshold: u32,
@@ -291,8 +321,10 @@ where
             configured_max_iterations: usize::MAX,
             checkpoint_finalization_turns: 0,
             checkpoint_turns_remaining: 0,
+            context_checkpoint_tokens: DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD as usize,
             checkpoint: None,
             checkpoint_candidate_check_ran: false,
+            checkpoint_reason: None,
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
             auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
@@ -330,6 +362,12 @@ where
     #[must_use]
     pub fn with_auto_compaction_input_tokens_threshold(mut self, threshold: u32) -> Self {
         self.auto_compaction_input_tokens_threshold = threshold;
+        self
+    }
+
+    #[must_use]
+    pub fn with_context_checkpoint_tokens(mut self, threshold: usize) -> Self {
+        self.context_checkpoint_tokens = threshold.max(1);
         self
     }
 
@@ -506,12 +544,40 @@ where
         self.checkpoint_turns_remaining = self.checkpoint_finalization_turns;
         self.checkpoint = None;
         self.checkpoint_candidate_check_ran = false;
+        self.checkpoint_reason = None;
         let mut checkpoint_compaction = None;
+        let mut checkpoint_prompted = false;
         let mut previous_tool_fingerprint = None;
         let mut identical_tool_iterations = 0;
 
         loop {
-            if iterations >= self.max_iterations && self.checkpoint_turns_remaining > 0 {
+            let mut system_prompt = self.system_prompt.clone();
+            if let Some(context) = &self.repository_context {
+                system_prompt.push(context.clone());
+            }
+            let request = ApiRequest {
+                system_prompt,
+                messages: self.session.messages.clone(),
+            };
+            let context_pressure =
+                estimate_api_request_tokens(&request) >= self.context_checkpoint_tokens;
+            let checkpoint_reason = if !checkpoint_prompted && self.checkpoint_turns_remaining > 0 {
+                if iterations >= self.max_iterations {
+                    Some("turn_budget".to_string())
+                } else if context_pressure {
+                    Some(format!(
+                        "context_budget:{}",
+                        estimate_api_request_tokens(&request)
+                    ))
+                } else {
+                    self.api_client.checkpoint_reason(&request)
+                }
+            } else {
+                None
+            };
+            if let Some(reason) = checkpoint_reason {
+                checkpoint_prompted = true;
+                self.checkpoint_reason = Some(reason.clone());
                 let candidate_check = self
                     .tool_executor
                     .run_checkpoint_candidate_checks()
@@ -527,7 +593,7 @@ where
                     .push_message(ConversationMessage {
                         role: MessageRole::User,
                         blocks: vec![ContentBlock::Text {
-                            text: format!("{checkpoint_evidence}The bounded writer budget has been reached. Use the candidate_checkpoint tool now with submit, blocked, or needs_user_input. If checks reported failures, make only targeted repairs before checkpointing. Do not begin broad new work; submit the best coherent candidate or state what prevents completion."),
+                            text: format!("{checkpoint_evidence}The bounded writer budget/resource boundary has been reached; the writer checkpoint was triggered by {reason}. Use the candidate_checkpoint tool now with submit, blocked, or needs_user_input. If checks reported failures, make only targeted repairs before checkpointing. Do not begin broad new work; submit the best coherent candidate or state what prevents completion."),
                         }],
                         usage: None,
                     })
@@ -535,12 +601,16 @@ where
                 if let Some(session_tracer) = &self.session_tracer {
                     session_tracer.record(
                         "writer_checkpoint_prompted",
-                        Map::from_iter([(
-                            "finalization_turns_remaining".to_string(),
-                            Value::from(self.checkpoint_turns_remaining as u64),
-                        )]),
+                        Map::from_iter([
+                            (
+                                "finalization_turns_remaining".to_string(),
+                                Value::from(self.checkpoint_turns_remaining as u64),
+                            ),
+                            ("reason".to_string(), Value::from(reason)),
+                        ]),
                     );
                 }
+                continue;
             }
             iterations += 1;
             if iterations > self.max_iterations {
@@ -551,14 +621,6 @@ where
                 return Err(error);
             }
 
-            let mut system_prompt = self.system_prompt.clone();
-            if let Some(context) = &self.repository_context {
-                system_prompt.push(context.clone());
-            }
-            let request = ApiRequest {
-                system_prompt,
-                messages: self.session.messages.clone(),
-            };
             let events = match self.api_client.stream(request) {
                 Ok(events) => events,
                 Err(error) => {
@@ -800,6 +862,11 @@ where
     #[must_use]
     pub fn checkpoint_candidate_check_ran(&self) -> bool {
         self.checkpoint_candidate_check_ran
+    }
+
+    #[must_use]
+    pub fn checkpoint_reason(&self) -> Option<&str> {
+        self.checkpoint_reason.as_deref()
     }
 
     pub fn apply_candidate_changes(

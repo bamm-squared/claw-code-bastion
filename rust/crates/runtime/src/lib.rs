@@ -77,9 +77,9 @@ pub use config_validate::{
     DiagnosticKind, ValidationResult,
 };
 pub use conversation::{
-    auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
-    ConversationRuntime, PromptCacheEvent, RuntimeError, RuntimeErrorKind, StaticToolExecutor,
-    ToolError, ToolExecutor, TurnSummary, WriterCheckpoint,
+    auto_compaction_threshold_from_env, estimate_api_request_tokens, ApiClient, ApiRequest,
+    AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
+    RuntimeErrorKind, StaticToolExecutor, ToolError, ToolExecutor, TurnSummary, WriterCheckpoint,
 };
 pub use file_ops::{
     EditFileOutput, FilesystemCapability, GlobSearchOutput, GrepSearchInput, GrepSearchOutput,

@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use reqwest::Response;
 use serde_json::{json, Value};
 
+use crate::client::RateLimitState;
 use crate::error::{ApiError, NonActionableResponse, ProviderFailureClass, ResponseOutcomeKind};
 use crate::http_client::build_http_client_or_default;
 use crate::types::{
@@ -173,6 +174,7 @@ impl ResponsesClient {
     ) -> Result<ResponsesStream, ApiError> {
         preflight_message_request(request)?;
         let response = self.post(&request.clone().with_streaming()).await?;
+        let rate_limit_state = RateLimitState::from_headers(response.headers());
         let request_id = response
             .headers()
             .get("x-request-id")
@@ -181,6 +183,7 @@ impl ResponsesClient {
             .map(ToOwned::to_owned);
         Ok(ResponsesStream {
             request_id: request_id.clone(),
+            rate_limit_state,
             response,
             buffer: Vec::new(),
             pending: Vec::new(),
@@ -211,6 +214,7 @@ impl Provider for ResponsesClient {
 #[derive(Debug)]
 pub struct ResponsesStream {
     request_id: Option<String>,
+    rate_limit_state: Option<RateLimitState>,
     response: Response,
     buffer: Vec<u8>,
     pending: Vec<StreamEvent>,
@@ -222,6 +226,11 @@ impl ResponsesStream {
     #[must_use]
     pub fn request_id(&self) -> Option<&str> {
         self.request_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn rate_limit_state(&self) -> Option<&RateLimitState> {
+        self.rate_limit_state.as_ref()
     }
 
     pub async fn next_event(&mut self) -> Result<Option<StreamEvent>, ApiError> {

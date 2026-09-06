@@ -13,11 +13,18 @@ pub struct Snapshot {
     pub provider_request_ids: Vec<String>,
     pub provider_empty_response_recoveries: u64,
     pub provider_transient_recoveries: u64,
+    pub provider_rate_limit_pacing_events: u64,
+    pub provider_rate_limit_pacing_seconds: u64,
     pub writer_checkpoint_candidate_checks: u64,
     pub writer_checkpoint_before_context_tokens: Option<u64>,
     pub writer_checkpoint_after_context_tokens: Option<u64>,
     pub writer_checkpoint_context_reduction_tokens: Option<u64>,
     pub writer_checkpoint_compacted_messages: Option<u64>,
+    pub writer_checkpoint_reason: Option<String>,
+    pub writer_request_estimate_tokens: Option<u64>,
+    pub writer_provider_token_limit: Option<u64>,
+    pub writer_provider_token_remaining: Option<u64>,
+    pub writer_provider_token_reset_after_seconds: Option<u64>,
     pub model_turns: u64,
     pub tool_bearing_turns: u64,
     pub tool_calls: BTreeMap<String, u64>,
@@ -289,6 +296,20 @@ pub fn provider_transient_recovery() {
     lifecycle_event("provider_transient_recovery");
 }
 
+pub fn provider_rate_limit_pacing(seconds: u64) {
+    with_state(|s| {
+        s.snapshot.provider_rate_limit_pacing_events = s
+            .snapshot
+            .provider_rate_limit_pacing_events
+            .saturating_add(1);
+        s.snapshot.provider_rate_limit_pacing_seconds = s
+            .snapshot
+            .provider_rate_limit_pacing_seconds
+            .saturating_add(seconds);
+    });
+    lifecycle_event("provider_rate_limit_pacing");
+}
+
 pub fn writer_checkpoint_candidate_check() {
     with_state(|s| {
         s.snapshot.writer_checkpoint_candidate_checks = s
@@ -312,6 +333,25 @@ pub fn writer_checkpoint_context(
         s.snapshot.writer_checkpoint_compacted_messages = Some(removed_messages as u64);
     });
     lifecycle_event("writer_checkpoint_context_compacted");
+}
+
+pub fn writer_checkpoint_reason(reason: &str) {
+    with_state(|s| s.snapshot.writer_checkpoint_reason = Some(reason.to_string()));
+    lifecycle_event("writer_checkpoint_resource_triggered");
+}
+
+pub fn writer_request_resource_estimate(
+    estimated_tokens: u64,
+    token_limit: Option<u64>,
+    token_remaining: Option<u64>,
+    reset_after_seconds: Option<u64>,
+) {
+    with_state(|s| {
+        s.snapshot.writer_request_estimate_tokens = Some(estimated_tokens);
+        s.snapshot.writer_provider_token_limit = token_limit;
+        s.snapshot.writer_provider_token_remaining = token_remaining;
+        s.snapshot.writer_provider_token_reset_after_seconds = reset_after_seconds;
+    });
 }
 
 pub fn model_turn() {

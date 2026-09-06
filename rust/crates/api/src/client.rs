@@ -6,6 +6,100 @@ use crate::providers::responses::ResponsesClient;
 use crate::providers::{self, ProviderKind};
 use crate::types::{EndpointCapabilities, MessageRequest, MessageResponse, StreamEvent};
 
+/// Optional provider rate-limit information observed on a response.
+/// Providers may omit any or all fields; callers must treat it as advisory.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RateLimitState {
+    pub token_limit: Option<u64>,
+    pub token_remaining: Option<u64>,
+    pub token_reset_after_seconds: Option<u64>,
+    pub request_limit: Option<u64>,
+    pub request_remaining: Option<u64>,
+    pub request_reset_after_seconds: Option<u64>,
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::RateLimitState;
+
+    #[test]
+    fn parses_optional_token_and_request_rate_limit_headers() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-ratelimit-limit-tokens", "500000".parse().unwrap());
+        headers.insert("x-ratelimit-remaining-tokens", "91000".parse().unwrap());
+        headers.insert("x-ratelimit-reset-tokens", "2.217s".parse().unwrap());
+        headers.insert("x-ratelimit-limit-requests", "100".parse().unwrap());
+        headers.insert("x-ratelimit-remaining-requests", "99".parse().unwrap());
+        let state = RateLimitState::from_headers(&headers).expect("metadata should be detected");
+        assert_eq!(state.token_limit, Some(500_000));
+        assert_eq!(state.token_remaining, Some(91_000));
+        assert_eq!(state.token_reset_after_seconds, Some(3));
+        assert_eq!(state.request_limit, Some(100));
+        assert_eq!(state.request_remaining, Some(99));
+    }
+
+    #[test]
+    fn absent_rate_limit_headers_are_optional() {
+        assert_eq!(
+            RateLimitState::from_headers(&reqwest::header::HeaderMap::new()),
+            None
+        );
+    }
+}
+
+impl RateLimitState {
+    #[must_use]
+    pub fn from_headers(headers: &reqwest::header::HeaderMap) -> Option<Self> {
+        let state = Self {
+            token_limit: header_u64(headers, "x-ratelimit-limit-tokens"),
+            token_remaining: header_u64(headers, "x-ratelimit-remaining-tokens"),
+            token_reset_after_seconds: header_duration_seconds(headers, "x-ratelimit-reset-tokens"),
+            request_limit: header_u64(headers, "x-ratelimit-limit-requests"),
+            request_remaining: header_u64(headers, "x-ratelimit-remaining-requests"),
+            request_reset_after_seconds: header_duration_seconds(
+                headers,
+                "x-ratelimit-reset-requests",
+            ),
+        };
+        (state.token_limit.is_some()
+            || state.token_remaining.is_some()
+            || state.token_reset_after_seconds.is_some()
+            || state.request_limit.is_some()
+            || state.request_remaining.is_some()
+            || state.request_reset_after_seconds.is_some())
+        .then_some(state)
+    }
+}
+
+fn header_value<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+fn header_u64(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u64> {
+    header_value(headers, name)?.trim().parse().ok()
+}
+
+#[allow(
+    clippy::cast_lossless,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn header_duration_seconds(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u64> {
+    let raw = header_value(headers, name)?.trim();
+    if let Ok(seconds) = raw.parse::<u64>() {
+        return Some(seconds);
+    }
+    let (number, multiplier) = if let Some(value) = raw.strip_suffix('m') {
+        (value, 60)
+    } else {
+        (raw.strip_suffix('s')?, 1)
+    };
+    number
+        .parse::<f64>()
+        .ok()
+        .map(|value| (value * multiplier as f64).ceil() as u64)
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum ProviderClient {
@@ -223,6 +317,14 @@ impl MessageStream {
             Self::Anthropic(stream) => stream.request_id(),
             Self::OpenAiCompat(stream) => stream.request_id(),
             Self::Responses(stream) => stream.request_id(),
+        }
+    }
+
+    #[must_use]
+    pub fn rate_limit_state(&self) -> Option<&RateLimitState> {
+        match self {
+            Self::Anthropic(_) | Self::OpenAiCompat(_) => None,
+            Self::Responses(stream) => stream.rate_limit_state(),
         }
     }
 
