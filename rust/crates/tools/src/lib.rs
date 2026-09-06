@@ -1209,7 +1209,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "candidate_check",
-            description: "Run a bounded named development check against the isolated candidate. This returns feedback only and never authorizes Review or Apply.",
+            description: "Run a bounded named development check against the isolated candidate after substantial edits or before candidate_checkpoint when useful. Supported checks are format, test, and clippy. It returns actionable feedback only, is candidate-only, and never authorizes Review or Apply.",
             input_schema: json!({
                 "type": "object",
                 "properties": {

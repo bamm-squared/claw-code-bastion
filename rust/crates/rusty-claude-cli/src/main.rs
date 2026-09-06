@@ -10660,7 +10660,8 @@ impl ApiClient for AnthropicRuntimeClient {
             // first stream event.  If the model does not respond within the
             // deadline we drop the stalled connection and re-send the request as
             // a continuation nudge (one retry only).
-            let max_attempts: usize = if is_post_tool { 2 } else { 1 };
+            let max_attempts: usize = if is_post_tool { 3 } else { 2 };
+            let mut empty_response_recoveries = 0;
 
             for attempt in 1..=max_attempts {
                 let result = self
@@ -10668,6 +10669,13 @@ impl ApiClient for AnthropicRuntimeClient {
                     .await;
                 match result {
                     Ok(events) => return Ok(events),
+                    Err(error)
+                        if should_retry_empty_response(empty_response_recoveries, &error)
+                            && attempt < max_attempts =>
+                    {
+                        empty_response_recoveries += 1;
+                        benchmark_telemetry::provider_empty_response_recovery();
+                    }
                     Err(error)
                         if error.to_string().contains("post-tool stall")
                             && attempt < max_attempts =>
@@ -10697,9 +10705,7 @@ impl AnthropicRuntimeClient {
             .client
             .stream_message(message_request)
             .await
-            .map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-            })?;
+            .map_err(|error| runtime_error_from_api_error(&self.session_id, &error))?;
         if let Some(request_id) = stream.request_id() {
             benchmark_telemetry::provider_request_id(request_id);
         }
@@ -10721,9 +10727,8 @@ impl AnthropicRuntimeClient {
         loop {
             let next = if apply_stall_timeout && !received_any_event {
                 match tokio::time::timeout(POST_TOOL_STALL_TIMEOUT, stream.next_event()).await {
-                    Ok(inner) => inner.map_err(|error| {
-                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                    })?,
+                    Ok(inner) => inner
+                        .map_err(|error| runtime_error_from_api_error(&self.session_id, &error))?,
                     Err(_elapsed) => {
                         return Err(RuntimeError::new(
                             "post-tool stall: model did not respond within timeout",
@@ -10731,9 +10736,10 @@ impl AnthropicRuntimeClient {
                     }
                 }
             } else {
-                stream.next_event().await.map_err(|error| {
-                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                })?
+                stream
+                    .next_event()
+                    .await
+                    .map_err(|error| runtime_error_from_api_error(&self.session_id, &error))?
             };
 
             let Some(event) = next else {
@@ -10880,9 +10886,7 @@ impl AnthropicRuntimeClient {
                 ..message_request.clone()
             })
             .await
-            .map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-            })?;
+            .map_err(|error| runtime_error_from_api_error(&self.session_id, &error))?;
         if let Some(request_id) = response.request_id.as_deref() {
             benchmark_telemetry::provider_request_id(request_id);
         }
@@ -10917,6 +10921,19 @@ fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> Str
         )
     } else {
         error.to_string()
+    }
+}
+
+fn runtime_error_from_api_error(session_id: &str, error: &api::ApiError) -> RuntimeError {
+    let message = format_user_visible_api_error(session_id, error);
+    if matches!(
+        error,
+        api::ApiError::NonActionableResponse(response)
+            if response.kind == api::ResponseOutcomeKind::Empty
+    ) {
+        RuntimeError::empty_provider_response(message)
+    } else {
+        RuntimeError::new(message)
     }
 }
 
@@ -12090,9 +12107,31 @@ impl CliToolExecutor {
 
 fn writer_iteration_budget(mode: task_plan::PlanningMode) -> usize {
     match mode {
-        task_plan::PlanningMode::Minimal => 48,
-        task_plan::PlanningMode::Standard => 96,
-        task_plan::PlanningMode::Milestone => 160,
+        task_plan::PlanningMode::Minimal => 24,
+        task_plan::PlanningMode::Standard => 48,
+        task_plan::PlanningMode::Milestone => 96,
+    }
+}
+
+const MAX_EMPTY_RESPONSE_RECOVERIES: usize = 1;
+
+fn should_retry_empty_response(recoveries: usize, error: &RuntimeError) -> bool {
+    error.is_empty_provider_response() && recoveries < MAX_EMPTY_RESPONSE_RECOVERIES
+}
+
+#[cfg(test)]
+mod empty_response_recovery_tests {
+    use super::{should_retry_empty_response, RuntimeError};
+
+    #[test]
+    fn recovery_is_bounded_and_only_applies_to_empty_provider_responses() {
+        let empty = RuntimeError::empty_provider_response("empty Responses output");
+        assert!(should_retry_empty_response(0, &empty));
+        assert!(!should_retry_empty_response(1, &empty));
+        assert!(!should_retry_empty_response(
+            0,
+            &RuntimeError::new("other failure")
+        ));
     }
 }
 

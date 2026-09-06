@@ -63,6 +63,42 @@ pub enum ApiError {
         attempt: u32,
         base_delay: Duration,
     },
+    NonActionableResponse(Box<NonActionableResponse>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseOutcomeKind {
+    Empty,
+    Refusal,
+    Incomplete,
+    Failed,
+    Cancelled,
+}
+
+impl Display for ResponseOutcomeKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Empty => "empty",
+            Self::Refusal => "refusal",
+            Self::Incomplete => "incomplete",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        };
+        f.write_str(name)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NonActionableResponse {
+    pub model: String,
+    pub response_id: Option<String>,
+    pub request_id: Option<String>,
+    pub status: Option<String>,
+    pub kind: ResponseOutcomeKind,
+    pub output_types: Vec<String>,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cached_input_tokens: u32,
 }
 
 impl ApiError {
@@ -130,6 +166,7 @@ impl ApiError {
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. } => false,
+            Self::NonActionableResponse(response) => response.kind == ResponseOutcomeKind::Empty,
         }
     }
 
@@ -137,6 +174,7 @@ impl ApiError {
     pub fn request_id(&self) -> Option<&str> {
         match self {
             Self::Api { request_id, .. } => request_id.as_deref(),
+            Self::NonActionableResponse(response) => response.request_id.as_deref(),
             Self::RetriesExhausted { last_error, .. } => last_error.request_id(),
             Self::MissingCredentials { .. }
             | Self::ContextWindowExceeded { .. }
@@ -171,6 +209,7 @@ impl ApiError {
             Self::Http(_) | Self::InvalidSseFrame(_) | Self::BackoffOverflow { .. } => {
                 "provider_transport"
             }
+            Self::NonActionableResponse(_) => "provider_protocol",
             Self::InvalidApiKeyEnv(_) | Self::Io(_) | Self::Json { .. } => "runtime_io",
         }
     }
@@ -194,7 +233,8 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
-            | Self::BackoffOverflow { .. } => false,
+            | Self::BackoffOverflow { .. }
+            | Self::NonActionableResponse(_) => false,
         }
     }
 
@@ -223,12 +263,14 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
-            | Self::BackoffOverflow { .. } => false,
+            | Self::BackoffOverflow { .. }
+            | Self::NonActionableResponse(_) => false,
         }
     }
 }
 
 impl Display for ApiError {
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingCredentials {
@@ -323,6 +365,19 @@ impl Display for ApiError {
             } => write!(
                 f,
                 "retry backoff overflowed on attempt {attempt} with base delay {base_delay:?}"
+            ),
+            Self::NonActionableResponse(response) => write!(
+                f,
+                "responses {} outcome for model {} (response_id={}, request_id={}, status={}, output_types={:?}, input_tokens={}, cached_input_tokens={}, output_tokens={})",
+                response.kind,
+                response.model,
+                response.response_id.as_deref().unwrap_or("none"),
+                response.request_id.as_deref().unwrap_or("none"),
+                response.status.as_deref().unwrap_or("unknown"),
+                response.output_types,
+                response.input_tokens,
+                response.cached_input_tokens,
+                response.output_tokens,
             ),
         }
     }

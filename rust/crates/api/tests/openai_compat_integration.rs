@@ -8,7 +8,7 @@ use api::{
     ApiError, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,
     ContentBlockStopEvent, EndpointCapabilities, InputContentBlock, InputMessage,
     MessageDeltaEvent, MessageRequest, OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock,
-    ProviderClient, ResponsesClient, StreamEvent, ToolChoice, ToolDefinition,
+    ProviderClient, ResponseOutcomeKind, ResponsesClient, StreamEvent, ToolChoice, ToolDefinition,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -115,6 +115,166 @@ async fn responses_transport_normalizes_tool_stream_and_uses_responses_endpoint(
     assert_eq!(body["model"], "grok-3");
     assert_eq!(body["tools"][0]["type"], "function");
     assert_eq!(body["max_output_tokens"], 64);
+}
+
+#[tokio::test]
+async fn responses_transport_accepts_text_only_streams() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"response\":{\"id\":\"resp_text\"},\"delta\":\"hello\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_text\",\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n"
+    );
+    let Some(server) = spawn_server(
+        state,
+        vec![http_response("200 OK", "text/event-stream", sse)],
+    )
+    .await
+    else {
+        return;
+    };
+    let client = ResponsesClient::new("responses-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let mut stream = client
+        .stream_message(&sample_request(true))
+        .await
+        .expect("responses request should succeed");
+    let mut events = Vec::new();
+    while let Some(event) = stream.next_event().await.expect("event should parse") {
+        events.push(event);
+    }
+    assert!(events.iter().any(|event| matches!(
+        event,
+        StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            delta: ContentBlockDelta::TextDelta { text },
+            ..
+        }) if text == "hello"
+    )));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, StreamEvent::MessageStop(_))));
+}
+
+#[tokio::test]
+async fn responses_transport_classifies_completed_empty_output_with_metadata() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_empty\",\"status\":\"completed\",\"output\":[{\"type\":\"reasoning\"}],\"usage\":{\"input_tokens\":7,\"output_tokens\":2,\"input_tokens_details\":{\"cached_tokens\":3}}}}\n\n";
+    let Some(server) = spawn_server(
+        state,
+        vec![http_response("200 OK", "text/event-stream", sse)],
+    )
+    .await
+    else {
+        return;
+    };
+    let client = ResponsesClient::new("responses-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let mut stream = client
+        .stream_message(&sample_request(true))
+        .await
+        .expect("responses request should succeed");
+    let error = loop {
+        match stream.next_event().await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("empty response should be classified as an error"),
+            Err(error) => break error,
+        }
+    };
+    match error {
+        ApiError::NonActionableResponse(response) => {
+            assert_eq!(response.response_id.as_deref(), Some("resp_empty"));
+            assert_eq!(response.kind, ResponseOutcomeKind::Empty);
+            assert_eq!(response.output_types, vec!["reasoning"]);
+            assert_eq!(response.input_tokens, 7);
+            assert_eq!(response.output_tokens, 2);
+            assert_eq!(response.cached_input_tokens, 3);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn responses_transport_does_not_retry_refusal_outcomes() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_refusal\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"cannot comply\"}]}]}}\n\n";
+    let Some(server) = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "text/event-stream", sse)],
+    )
+    .await
+    else {
+        return;
+    };
+    let client = ResponsesClient::new("responses-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let mut stream = client
+        .stream_message(&sample_request(true))
+        .await
+        .expect("responses request should succeed");
+    let error = loop {
+        match stream.next_event().await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("refusal should be classified as an error"),
+            Err(error) => break error,
+        }
+    };
+    match error {
+        ApiError::NonActionableResponse(response) => {
+            assert_eq!(response.kind, ResponseOutcomeKind::Refusal);
+            assert!(
+                !ApiError::NonActionableResponse(Box::new(api::NonActionableResponse {
+                    model: "model".to_string(),
+                    response_id: None,
+                    request_id: None,
+                    status: Some("completed".to_string()),
+                    kind: response.kind,
+                    output_types: vec!["message".to_string(), "refusal".to_string()],
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cached_input_tokens: 0,
+                }))
+                .is_retryable()
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert_eq!(state.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn responses_transport_rejects_partial_output_from_incomplete_response() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = concat!(
+        "data: {\"type\":\"response.output_text.delta\",\"response\":{\"id\":\"resp_incomplete\"},\"delta\":\"partial\"}\n\n",
+        "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_incomplete\",\"status\":\"incomplete\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n"
+    );
+    let Some(server) = spawn_server(
+        state,
+        vec![http_response("200 OK", "text/event-stream", sse)],
+    )
+    .await
+    else {
+        return;
+    };
+    let client = ResponsesClient::new("responses-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let mut stream = client
+        .stream_message(&sample_request(true))
+        .await
+        .expect("responses request should succeed");
+    let error = loop {
+        match stream.next_event().await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("incomplete response should be classified as an error"),
+            Err(error) => break error,
+        }
+    };
+    match error {
+        ApiError::NonActionableResponse(response) => {
+            assert_eq!(response.kind, ResponseOutcomeKind::Incomplete);
+            assert_eq!(response.status.as_deref(), Some("incomplete"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
 }
 
 #[test]

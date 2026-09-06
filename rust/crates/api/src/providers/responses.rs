@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use reqwest::Response;
 use serde_json::{json, Value};
 
-use crate::error::ApiError;
+use crate::error::{ApiError, NonActionableResponse, ResponseOutcomeKind};
 use crate::http_client::build_http_client_or_default;
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
@@ -180,11 +180,11 @@ impl ResponsesClient {
             .and_then(|value| value.to_str().ok())
             .map(ToOwned::to_owned);
         Ok(ResponsesStream {
-            request_id,
+            request_id: request_id.clone(),
             response,
             buffer: Vec::new(),
             pending: Vec::new(),
-            state: ResponseStreamState::new(request.model.clone()),
+            state: ResponseStreamState::new(request.model.clone(), request_id.clone()),
             done: false,
         })
     }
@@ -243,7 +243,7 @@ impl ResponsesStream {
                 self.pending.extend(parsed_events.into_iter().rev());
             } else {
                 self.done = true;
-                self.pending.extend(self.state.finish().into_iter().rev());
+                self.pending.extend(self.state.finish()?.into_iter().rev());
             }
         }
     }
@@ -252,6 +252,10 @@ impl ResponsesStream {
 #[derive(Debug)]
 struct ResponseStreamState {
     model: String,
+    request_id: Option<String>,
+    response_id: Option<String>,
+    status: Option<String>,
+    output_types: Vec<String>,
     started: bool,
     text_started: bool,
     tool_calls: BTreeMap<String, ToolState>,
@@ -269,9 +273,13 @@ struct ToolState {
 }
 
 impl ResponseStreamState {
-    fn new(model: String) -> Self {
+    fn new(model: String, request_id: Option<String>) -> Self {
         Self {
             model,
+            request_id,
+            response_id: None,
+            status: None,
+            output_types: Vec::new(),
             started: false,
             text_started: false,
             tool_calls: BTreeMap::new(),
@@ -283,6 +291,7 @@ impl ResponseStreamState {
 
     fn start(&mut self, id: &str) -> StreamEvent {
         self.started = true;
+        self.response_id = Some(id.to_string());
         StreamEvent::MessageStart(MessageStartEvent {
             message: MessageResponse {
                 id: id.to_string(),
@@ -342,6 +351,17 @@ impl ResponseStreamState {
             }
             "response.output_item.added" => {
                 let item = value.get("item").cloned().unwrap_or_default();
+                if let Some(item_type) = item.get("type").and_then(Value::as_str) {
+                    self.record_output_type(item_type);
+                    if let Some(contents) = item.get("content").and_then(Value::as_array) {
+                        for content in contents {
+                            if let Some(content_type) = content.get("type").and_then(Value::as_str)
+                            {
+                                self.record_output_type(content_type);
+                            }
+                        }
+                    }
+                }
                 if item.get("type").and_then(Value::as_str) == Some("function_call") {
                     let item_id = item.get("id").and_then(Value::as_str).unwrap_or("");
                     let call_id = item
@@ -429,6 +449,14 @@ impl ResponseStreamState {
             }
             "response.completed" => {
                 let response = value.get("response").cloned().unwrap_or_default();
+                self.record_response_metadata(&response);
+                self.usage = parse_usage(response.get("usage"));
+                self.completed = true;
+            }
+            "response.incomplete" | "response.failed" | "response.cancelled" => {
+                let response = value.get("response").cloned().unwrap_or_default();
+                self.record_response_metadata(&response);
+                self.status = Some(kind.strip_prefix("response.").unwrap_or(kind).to_string());
                 self.usage = parse_usage(response.get("usage"));
                 self.completed = true;
             }
@@ -437,33 +465,88 @@ impl ResponseStreamState {
         Ok(Some(events))
     }
 
-    fn finish(&mut self) -> Vec<StreamEvent> {
-        if !self.started || self.completed {
-            return if self.completed {
-                vec![
-                    StreamEvent::MessageDelta(MessageDeltaEvent {
-                        delta: MessageDelta {
-                            stop_reason: Some("end_turn".to_string()),
-                            stop_sequence: None,
-                        },
-                        usage: self.usage.clone(),
-                    }),
-                    StreamEvent::MessageStop(MessageStopEvent {}),
-                ]
-            } else {
-                Vec::new()
-            };
+    fn finish(&mut self) -> Result<Vec<StreamEvent>, ApiError> {
+        if !self.completed {
+            return Err(ApiError::InvalidSseFrame(
+                "responses stream ended before a terminal response event",
+            ));
         }
-        vec![
-            StreamEvent::MessageDelta(MessageDeltaEvent {
-                delta: MessageDelta {
-                    stop_reason: Some("end_turn".to_string()),
-                    stop_sequence: None,
-                },
-                usage: self.usage.clone(),
-            }),
-            StreamEvent::MessageStop(MessageStopEvent {}),
-        ]
+        if let Some(kind) = match self.status.as_deref() {
+            Some("incomplete") => Some(ResponseOutcomeKind::Incomplete),
+            Some("failed") => Some(ResponseOutcomeKind::Failed),
+            Some("cancelled" | "canceled") => Some(ResponseOutcomeKind::Cancelled),
+            _ => None,
+        } {
+            return Err(self.non_actionable_error(kind));
+        }
+        if self.text_started || self.tool_calls.values().any(|call| call.started) {
+            return Ok(vec![
+                StreamEvent::MessageDelta(MessageDeltaEvent {
+                    delta: MessageDelta {
+                        stop_reason: Some("end_turn".to_string()),
+                        stop_sequence: None,
+                    },
+                    usage: self.usage.clone(),
+                }),
+                StreamEvent::MessageStop(MessageStopEvent {}),
+            ]);
+        }
+        let kind = match self.status.as_deref() {
+            Some("incomplete") => ResponseOutcomeKind::Incomplete,
+            Some("failed") => ResponseOutcomeKind::Failed,
+            Some("cancelled" | "canceled") => ResponseOutcomeKind::Cancelled,
+            _ if self.output_types.iter().any(|kind| kind == "refusal") => {
+                ResponseOutcomeKind::Refusal
+            }
+            _ => ResponseOutcomeKind::Empty,
+        };
+        Err(self.non_actionable_error(kind))
+    }
+
+    fn non_actionable_error(&self, kind: ResponseOutcomeKind) -> ApiError {
+        ApiError::NonActionableResponse(Box::new(NonActionableResponse {
+            model: self.model.clone(),
+            response_id: self.response_id.clone(),
+            request_id: self.request_id.clone(),
+            status: self.status.clone(),
+            kind,
+            output_types: self.output_types.clone(),
+            input_tokens: self.usage.input_tokens,
+            output_tokens: self.usage.output_tokens,
+            cached_input_tokens: self.usage.cache_read_input_tokens,
+        }))
+    }
+
+    fn record_output_type(&mut self, output_type: &str) {
+        if !self.output_types.iter().any(|known| known == output_type) {
+            self.output_types.push(output_type.to_string());
+        }
+    }
+
+    fn record_response_metadata(&mut self, response: &Value) {
+        self.response_id = response
+            .get("id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| self.response_id.clone());
+        self.status = response
+            .get("status")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        if let Some(output) = response.get("output").and_then(Value::as_array) {
+            for item in output {
+                if let Some(item_type) = item.get("type").and_then(Value::as_str) {
+                    self.record_output_type(item_type);
+                }
+                if let Some(content) = item.get("content").and_then(Value::as_array) {
+                    for block in content {
+                        if let Some(content_type) = block.get("type").and_then(Value::as_str) {
+                            self.record_output_type(content_type);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

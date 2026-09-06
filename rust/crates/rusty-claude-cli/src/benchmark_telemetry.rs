@@ -11,6 +11,7 @@ pub struct Snapshot {
     pub run_id: String,
     pub provider_calls: u64,
     pub provider_request_ids: Vec<String>,
+    pub provider_empty_response_recoveries: u64,
     pub model_turns: u64,
     pub tool_bearing_turns: u64,
     pub tool_calls: BTreeMap<String, u64>,
@@ -262,6 +263,16 @@ pub fn provider_request_id(request_id: &str) {
             }
         }
     });
+}
+
+pub fn provider_empty_response_recovery() {
+    with_state(|s| {
+        s.snapshot.provider_empty_response_recoveries = s
+            .snapshot
+            .provider_empty_response_recoveries
+            .saturating_add(1);
+    });
+    lifecycle_event("provider_empty_response_recovery");
 }
 pub fn model_turn() {
     with_state(|s| s.snapshot.model_turns += 1);

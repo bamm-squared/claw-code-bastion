@@ -136,6 +136,13 @@ impl std::error::Error for ToolError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeError {
     message: String,
+    kind: RuntimeErrorKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeErrorKind {
+    Generic,
+    EmptyProviderResponse,
 }
 
 impl RuntimeError {
@@ -143,7 +150,21 @@ impl RuntimeError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            kind: RuntimeErrorKind::Generic,
         }
+    }
+
+    #[must_use]
+    pub fn empty_provider_response(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: RuntimeErrorKind::EmptyProviderResponse,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_empty_provider_response(&self) -> bool {
+        matches!(self.kind, RuntimeErrorKind::EmptyProviderResponse)
     }
 }
 
