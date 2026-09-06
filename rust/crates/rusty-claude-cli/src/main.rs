@@ -5827,8 +5827,6 @@ impl LiveCli {
                 }
                 if runtime.checkpoint_candidate_check_ran() {
                     benchmark_telemetry::writer_checkpoint_candidate_check();
-                }
-                if summary.checkpoint.is_some() {
                     if let Some(event) = summary.auto_compaction {
                         benchmark_telemetry::writer_checkpoint_context(
                             event.before_estimated_tokens,

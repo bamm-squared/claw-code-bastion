@@ -2303,6 +2303,94 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_compacts_long_writer_history_before_wrap_up() {
+        struct CheckpointApi {
+            calls: usize,
+        }
+
+        impl ApiClient for CheckpointApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    return Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "work-1".to_string(),
+                            name: "echo".to_string(),
+                            input: "work".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                assert!(request.messages.iter().any(|message| {
+                    message.blocks.iter().any(|block| {
+                        matches!(block, ContentBlock::Text { text } if text.contains("candidate-development checks"))
+                    })
+                }));
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "checkpoint-1".to_string(),
+                        name: "candidate_checkpoint".to_string(),
+                        input: r#"{"status":"submit"}"#.to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        struct CheckpointExecutor {
+            checkpoint: bool,
+        }
+
+        impl ToolExecutor for CheckpointExecutor {
+            fn execute(&mut self, tool_name: &str, _input: &str) -> Result<String, ToolError> {
+                if tool_name == "candidate_checkpoint" {
+                    self.checkpoint = true;
+                }
+                Ok("accepted".to_string())
+            }
+
+            fn run_checkpoint_candidate_checks(&mut self) -> Result<Option<String>, ToolError> {
+                Ok(Some("format: passed; test: passed".to_string()))
+            }
+
+            fn take_checkpoint(&mut self) -> Option<WriterCheckpoint> {
+                self.checkpoint
+                    .then_some(WriterCheckpoint::Submit { message: None })
+            }
+        }
+
+        let mut session = Session::new();
+        for index in 0..40 {
+            session
+                .push_message(crate::session::ConversationMessage::user_text(format!(
+                    "historical repository evidence {index}: {}",
+                    "bounded context that can be re-queried through the repository tools "
+                        .repeat(8)
+                )))
+                .expect("history message should be valid");
+        }
+        let mut runtime = ConversationRuntime::new(
+            session,
+            CheckpointApi { calls: 0 },
+            CheckpointExecutor { checkpoint: false },
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_checkpoint_policy(1, 1);
+
+        let summary = runtime
+            .run_turn("work", None)
+            .expect("checkpoint should complete the turn");
+        let compaction = summary
+            .auto_compaction
+            .expect("checkpoint should compact long history");
+
+        assert!(compaction.removed_message_count > 0);
+        assert!(compaction.after_estimated_tokens < compaction.before_estimated_tokens);
+        assert!(runtime.checkpoint_candidate_check_ran());
+    }
+
+    #[test]
     fn run_turn_stops_repeated_identical_tool_results() {
         struct LoopingApi;
 
