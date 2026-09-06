@@ -8,7 +8,8 @@ use api::{
     ApiError, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,
     ContentBlockStopEvent, EndpointCapabilities, InputContentBlock, InputMessage,
     MessageDeltaEvent, MessageRequest, OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock,
-    ProviderClient, ResponseOutcomeKind, ResponsesClient, StreamEvent, ToolChoice, ToolDefinition,
+    ProviderClient, ProviderFailureClass, ResponseOutcomeKind, ResponsesClient, StreamEvent,
+    ToolChoice, ToolDefinition,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -231,6 +232,10 @@ async fn responses_transport_does_not_retry_refusal_outcomes() {
                     input_tokens: 0,
                     output_tokens: 0,
                     cached_input_tokens: 0,
+                    failure_class: None,
+                    provider_error_code: None,
+                    provider_error_message: None,
+                    incomplete_details: None,
                 }))
                 .is_retryable()
             );
@@ -238,6 +243,86 @@ async fn responses_transport_does_not_retry_refusal_outcomes() {
         other => panic!("unexpected error: {other:?}"),
     }
     assert_eq!(state.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn responses_transport_classifies_transient_failed_output_for_bounded_recovery() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"temporary upstream failure\"}}}\n\n";
+    let Some(server) = spawn_server(
+        state,
+        vec![http_response("200 OK", "text/event-stream", sse)],
+    )
+    .await
+    else {
+        return;
+    };
+    let client = ResponsesClient::new("responses-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let mut stream = client
+        .stream_message(&sample_request(true))
+        .await
+        .expect("responses request should succeed");
+    let error = loop {
+        match stream.next_event().await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("failed response should be classified as an error"),
+            Err(error) => break error,
+        }
+    };
+    let ApiError::NonActionableResponse(response) = error else {
+        panic!("unexpected error type")
+    };
+    assert_eq!(response.kind, ResponseOutcomeKind::Failed);
+    assert_eq!(response.response_id.as_deref(), Some("resp_failed"));
+    assert_eq!(
+        response.failure_class,
+        Some(ProviderFailureClass::Transient)
+    );
+    assert_eq!(
+        response.provider_error_code.as_deref(),
+        Some("server_error")
+    );
+    assert_eq!(
+        response.provider_error_message.as_deref(),
+        Some("temporary upstream failure")
+    );
+    assert!(ApiError::NonActionableResponse(response).is_retryable());
+}
+
+#[tokio::test]
+async fn responses_transport_does_not_retry_permanent_failed_output() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_invalid\",\"status\":\"failed\",\"error\":{\"code\":\"invalid_request_error\",\"message\":\"request is invalid\"}}}\n\n";
+    let Some(server) = spawn_server(
+        state,
+        vec![http_response("200 OK", "text/event-stream", sse)],
+    )
+    .await
+    else {
+        return;
+    };
+    let client = ResponsesClient::new("responses-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let mut stream = client
+        .stream_message(&sample_request(true))
+        .await
+        .expect("responses request should succeed");
+    let error = loop {
+        match stream.next_event().await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("failed response should be classified as an error"),
+            Err(error) => break error,
+        }
+    };
+    let ApiError::NonActionableResponse(response) = error else {
+        panic!("unexpected error type")
+    };
+    assert_eq!(
+        response.failure_class,
+        Some(ProviderFailureClass::Permanent)
+    );
+    assert!(!ApiError::NonActionableResponse(response).is_retryable());
 }
 
 #[tokio::test]

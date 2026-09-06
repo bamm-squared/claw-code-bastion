@@ -1033,28 +1033,52 @@ impl GlobalToolRegistry {
     }
 
     pub fn execute(&self, name: &str, input: &Value) -> Result<String, String> {
+        self.execute_with_permission(name, input, true)
+    }
+
+    pub fn execute_authorized(&self, name: &str, input: &Value) -> Result<String, String> {
+        self.execute_with_permission(name, input, false)
+    }
+
+    fn execute_with_permission(
+        &self,
+        name: &str,
+        input: &Value,
+        enforce_permission: bool,
+    ) -> Result<String, String> {
         let Some(enforcer) = self.enforcer.as_ref() else {
             return Err(String::from("tool execution requires a PermissionEnforcer"));
         };
         if mvp_tool_specs().iter().any(|spec| spec.name == name) {
             if name == "candidate_check" {
-                enforce_backend_permission(enforcer, name, input)?;
+                if enforce_permission {
+                    enforce_backend_permission(enforcer, name, input)?;
+                }
                 return self.candidate_development_check(input);
             }
             if !is_host_side_tool(name) {
                 if let Some(backend) = &self.execution_backend {
-                    enforce_backend_permission(enforcer, name, input)?;
+                    if enforce_permission {
+                        enforce_backend_permission(enforcer, name, input)?;
+                    }
                     return backend
                         .lock()
                         .map_err(|_| String::from("execution backend lock poisoned"))?
                         .execute(name, input);
                 }
             }
-            return execute_tool_with_enforcer(enforcer, &NetworkCapability::none(), name, input);
+            return execute_tool_with_enforcer(
+                enforce_permission.then_some(enforcer),
+                &NetworkCapability::none(),
+                name,
+                input,
+            );
         }
-        let result = enforcer.check(name, &input.to_string());
-        if let EnforcementResult::Denied { reason, .. } = result {
-            return Err(reason);
+        if enforce_permission {
+            let result = enforcer.check(name, &input.to_string());
+            if let EnforcementResult::Denied { reason, .. } = result {
+                return Err(reason);
+            }
         }
         let plugin = self
             .plugin_tools
@@ -1980,13 +2004,15 @@ pub fn enforce_permission_check(
 /// default policy. External MCP callers never receive the trusted test path.
 pub fn execute_mcp_tool(name: &str, input: &Value) -> Result<String, String> {
     let enforcer = PermissionEnforcer::new(PermissionPolicy::new(PermissionMode::WorkspaceWrite));
-    execute_tool_with_enforcer(&enforcer, &NetworkCapability::none(), name, input)
+    execute_tool_with_enforcer(Some(&enforcer), &NetworkCapability::none(), name, input)
 }
 
 #[cfg(test)]
 fn execute_trusted_tool(name: &str, input: &Value) -> Result<String, String> {
     execute_tool_with_enforcer(
-        &PermissionEnforcer::new(PermissionPolicy::new(PermissionMode::DangerFullAccess)),
+        Some(&PermissionEnforcer::new(PermissionPolicy::new(
+            PermissionMode::DangerFullAccess,
+        ))),
         &NetworkCapability::unrestricted(),
         name,
         input,
@@ -1995,7 +2021,7 @@ fn execute_trusted_tool(name: &str, input: &Value) -> Result<String, String> {
 
 #[allow(clippy::too_many_lines)]
 fn execute_tool_with_enforcer(
-    enforcer: &PermissionEnforcer,
+    enforcer: Option<&PermissionEnforcer>,
     network: &NetworkCapability,
     name: &str,
     input: &Value,
@@ -2013,46 +2039,46 @@ fn execute_tool_with_enforcer(
             // Parse input to get the command for permission classification
             let bash_input: BashCommandInput = from_value(input)?;
             let classified_mode = classify_bash_permission(&bash_input.command);
-            maybe_enforce_permission_check_with_mode(Some(enforcer), name, input, classified_mode)?;
+            maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
             run_bash(bash_input)
         }
         "read_file" => {
-            maybe_enforce_permission_check(Some(enforcer), name, input)?;
+            maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<ReadFileInput>(input).and_then(|value| run_read_file(value, &filesystem))
         }
         "write_file" => {
-            maybe_enforce_permission_check(Some(enforcer), name, input)?;
+            maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<WriteFileInput>(input).and_then(|value| run_write_file(value, &filesystem))
         }
         "edit_file" => {
-            maybe_enforce_permission_check(Some(enforcer), name, input)?;
+            maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<EditFileInput>(input).and_then(|value| run_edit_file(value, &filesystem))
         }
         "glob_search" => {
-            maybe_enforce_permission_check(Some(enforcer), name, input)?;
+            maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<GlobSearchInputValue>(input)
                 .and_then(|value| run_glob_search(value, &filesystem))
         }
         "grep_search" => {
-            maybe_enforce_permission_check(Some(enforcer), name, input)?;
+            maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<GrepSearchInput>(input)
                 .and_then(|value| run_grep_search(value, &filesystem))
         }
         "GitStatus" | "GitDiff" | "GitLog" | "GitShow" | "GitBlame" | "GitBranches"
         | "GitChangedFiles" => {
-            maybe_enforce_permission_check(Some(enforcer), name, input)?;
+            maybe_enforce_permission_check(enforcer, name, input)?;
             git_intelligence::execute(name, input)
         }
         "ContextSearch" => {
-            maybe_enforce_permission_check(Some(enforcer), name, input)?;
+            maybe_enforce_permission_check(enforcer, name, input)?;
             context_search::execute(input)
         }
         "WebFetch" => {
-            maybe_enforce_permission_check(Some(enforcer), name, input)?;
+            maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<WebFetchInput>(input).and_then(|value| run_web_fetch(value, network))
         }
         "WebSearch" => {
-            maybe_enforce_permission_check(Some(enforcer), name, input)?;
+            maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<WebSearchInput>(input).and_then(|value| run_web_search(value, network))
         }
         "TodoWrite" => from_value::<TodoWriteInput>(input).and_then(run_todo_write),
@@ -2076,7 +2102,7 @@ fn execute_tool_with_enforcer(
             // Parse input to get the command for permission classification
             let ps_input: PowerShellInput = from_value(input)?;
             let classified_mode = classify_powershell_permission(&ps_input.command);
-            maybe_enforce_permission_check_with_mode(Some(enforcer), name, input, classified_mode)?;
+            maybe_enforce_permission_check_with_mode(enforcer, name, input, classified_mode)?;
             run_powershell(ps_input)
         }
         "AskUserQuestion" => {
@@ -2129,7 +2155,7 @@ fn execute_local_tool(
     name: &str,
     input: &Value,
 ) -> Result<String, String> {
-    execute_tool_with_enforcer(enforcer, network, name, input)
+    execute_tool_with_enforcer(Some(enforcer), network, name, input)
 }
 
 fn enforce_backend_permission(
@@ -5736,7 +5762,7 @@ impl ToolExecutor for SubagentToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        execute_tool_with_enforcer(&self.enforcer, &self.network, tool_name, &value)
+        execute_tool_with_enforcer(Some(&self.enforcer), &self.network, tool_name, &value)
             .map_err(ToolError::new)
     }
 }
@@ -10520,6 +10546,31 @@ printf 'pwsh:%s' "$1"
             .expect_err("candidate checks need an isolated candidate");
 
         assert!(error.contains("isolated candidate backend"));
+    }
+
+    #[test]
+    fn approved_bash_dispatch_does_not_repeat_the_permission_decision() {
+        use runtime::permission_enforcer::PermissionEnforcer;
+        use runtime::PermissionPolicy;
+
+        let policy = mvp_tool_specs().into_iter().fold(
+            PermissionPolicy::new(runtime::PermissionMode::WorkspaceWrite),
+            |policy, spec| policy.with_tool_requirement(spec.name, spec.required_permission),
+        );
+        let mut registry = super::GlobalToolRegistry::builtin();
+        registry.set_enforcer(PermissionEnforcer::new(policy));
+        let input = json!({"command": "cd . && printf approved"});
+
+        registry
+            .execute("bash", &input)
+            .expect_err("the unapproved workspace-write request should be denied");
+        let output = registry
+            .execute_authorized("bash", &input)
+            .expect("the already-approved command should execute");
+        assert!(
+            output.contains("approved"),
+            "unexpected bash output: {output}"
+        );
     }
 
     #[test]

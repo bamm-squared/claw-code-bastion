@@ -5721,7 +5721,10 @@ impl LiveCli {
                 );
             }
         }
-        let plan_text = self.task_plan.render_for_writer();
+        let plan_text = format!(
+            "{}\n\n[Candidate development workflow]\nUse candidate_check for a bounded format, test, or clippy check after substantial edits or before candidate_checkpoint when useful. It runs only against the isolated candidate and provides development feedback; it never authorizes Review or Apply. Submit for trusted full validation when the candidate is coherent.",
+            self.task_plan.render_for_writer()
+        );
         let pending_rework = self.pending_rework.take();
         let plan_text = pending_rework
             .as_ref()
@@ -5818,9 +5821,14 @@ impl LiveCli {
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
+                if summary.iterations > writer_iteration_budget(self.task_plan.planning_mode()) {
+                    benchmark_telemetry::lifecycle_event("writer_soft_checkpoint_triggered");
+                }
                 if let Some(checkpoint) = runtime.take_checkpoint() {
                     match checkpoint {
-                        WriterCheckpoint::Submit { .. } => {}
+                        WriterCheckpoint::Submit { .. } => {
+                            benchmark_telemetry::lifecycle_event("writer_checkpoint_submit");
+                        }
                         WriterCheckpoint::Blocked { message }
                         | WriterCheckpoint::NeedsUserInput { message } => {
                             let _ = runtime.finish_candidate()?;
@@ -10661,7 +10669,7 @@ impl ApiClient for AnthropicRuntimeClient {
             // deadline we drop the stalled connection and re-send the request as
             // a continuation nudge (one retry only).
             let max_attempts: usize = if is_post_tool { 3 } else { 2 };
-            let mut empty_response_recoveries = 0;
+            let mut provider_recoveries = 0;
 
             for attempt in 1..=max_attempts {
                 let result = self
@@ -10670,11 +10678,15 @@ impl ApiClient for AnthropicRuntimeClient {
                 match result {
                     Ok(events) => return Ok(events),
                     Err(error)
-                        if should_retry_empty_response(empty_response_recoveries, &error)
+                        if should_retry_provider_turn(provider_recoveries, &error)
                             && attempt < max_attempts =>
                     {
-                        empty_response_recoveries += 1;
-                        benchmark_telemetry::provider_empty_response_recovery();
+                        provider_recoveries += 1;
+                        if error.is_empty_provider_response() {
+                            benchmark_telemetry::provider_empty_response_recovery();
+                        } else {
+                            benchmark_telemetry::provider_transient_recovery();
+                        }
                     }
                     Err(error)
                         if error.to_string().contains("post-tool stall")
@@ -10932,6 +10944,14 @@ fn runtime_error_from_api_error(session_id: &str, error: &api::ApiError) -> Runt
             if response.kind == api::ResponseOutcomeKind::Empty
     ) {
         RuntimeError::empty_provider_response(message)
+    } else if matches!(
+        error,
+        api::ApiError::NonActionableResponse(response)
+            if response
+                .failure_class
+                .is_some_and(api::ProviderFailureClass::is_retryable)
+    ) {
+        RuntimeError::transient_provider_failure(message)
     } else {
         RuntimeError::new(message)
     }
@@ -11983,6 +12003,21 @@ impl ToolExecutor for CliToolExecutor {
     }
 
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        self.execute_inner(tool_name, input, false)
+    }
+
+    fn execute_authorized(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        self.execute_inner(tool_name, input, true)
+    }
+}
+
+impl CliToolExecutor {
+    fn execute_inner(
+        &mut self,
+        tool_name: &str,
+        input: &str,
+        authorized: bool,
+    ) -> Result<String, ToolError> {
         if is_private_mode()
             && matches!(
                 tool_name,
@@ -12015,9 +12050,12 @@ impl ToolExecutor for CliToolExecutor {
         } else if self.tool_registry.has_runtime_tool(tool_name) {
             self.execute_runtime_tool(tool_name, value)
         } else {
-            self.tool_registry
-                .execute(tool_name, &value)
-                .map_err(ToolError::new)
+            let result = if authorized {
+                self.tool_registry.execute_authorized(tool_name, &value)
+            } else {
+                self.tool_registry.execute(tool_name, &value)
+            };
+            result.map_err(ToolError::new)
         };
         match result {
             Ok(output) => {
@@ -12107,30 +12145,35 @@ impl CliToolExecutor {
 
 fn writer_iteration_budget(mode: task_plan::PlanningMode) -> usize {
     match mode {
-        task_plan::PlanningMode::Minimal => 24,
-        task_plan::PlanningMode::Standard => 48,
-        task_plan::PlanningMode::Milestone => 96,
+        task_plan::PlanningMode::Minimal => 16,
+        task_plan::PlanningMode::Standard => 32,
+        task_plan::PlanningMode::Milestone => 64,
     }
 }
 
-const MAX_EMPTY_RESPONSE_RECOVERIES: usize = 1;
+const MAX_PROVIDER_TURN_RECOVERIES: usize = 1;
 
-fn should_retry_empty_response(recoveries: usize, error: &RuntimeError) -> bool {
-    error.is_empty_provider_response() && recoveries < MAX_EMPTY_RESPONSE_RECOVERIES
+fn should_retry_provider_turn(recoveries: usize, error: &RuntimeError) -> bool {
+    recoveries < MAX_PROVIDER_TURN_RECOVERIES
+        && (error.is_empty_provider_response() || error.is_transient_provider_failure())
 }
 
 #[cfg(test)]
 mod empty_response_recovery_tests {
-    use super::{should_retry_empty_response, RuntimeError};
+    use super::{should_retry_provider_turn, RuntimeError};
 
     #[test]
     fn recovery_is_bounded_and_only_applies_to_empty_provider_responses() {
         let empty = RuntimeError::empty_provider_response("empty Responses output");
-        assert!(should_retry_empty_response(0, &empty));
-        assert!(!should_retry_empty_response(1, &empty));
-        assert!(!should_retry_empty_response(
+        assert!(should_retry_provider_turn(0, &empty));
+        assert!(!should_retry_provider_turn(1, &empty));
+        assert!(!should_retry_provider_turn(
             0,
             &RuntimeError::new("other failure")
+        ));
+        assert!(should_retry_provider_turn(
+            0,
+            &RuntimeError::transient_provider_failure("server error")
         ));
     }
 }

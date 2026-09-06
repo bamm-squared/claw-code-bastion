@@ -62,6 +62,13 @@ pub trait ApiClient {
 pub trait ToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError>;
 
+    /// Execute the exact invocation after the conversation permission
+    /// prompter has approved it. Implementations must retain containment and
+    /// allowlist checks while avoiding a duplicate policy decision.
+    fn execute_authorized(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        self.execute(tool_name, input)
+    }
+
     /// Return a writer checkpoint requested through an explicit lifecycle tool.
     /// Checkpoints yield control to the orchestrator; they do not imply that
     /// the candidate is correct.
@@ -143,6 +150,7 @@ pub struct RuntimeError {
 pub enum RuntimeErrorKind {
     Generic,
     EmptyProviderResponse,
+    ProviderTransient,
 }
 
 impl RuntimeError {
@@ -163,8 +171,21 @@ impl RuntimeError {
     }
 
     #[must_use]
+    pub fn transient_provider_failure(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: RuntimeErrorKind::ProviderTransient,
+        }
+    }
+
+    #[must_use]
     pub const fn is_empty_provider_response(&self) -> bool {
         matches!(self.kind, RuntimeErrorKind::EmptyProviderResponse)
+    }
+
+    #[must_use]
+    pub const fn is_transient_provider_failure(&self) -> bool {
+        matches!(self.kind, RuntimeErrorKind::ProviderTransient)
     }
 }
 
@@ -613,11 +634,13 @@ where
                 let result_message = match permission_outcome {
                     PermissionOutcome::Allow => {
                         self.record_tool_started(iterations, &tool_name);
-                        let (mut output, mut is_error) =
-                            match self.tool_executor.execute(&tool_name, &effective_input) {
-                                Ok(output) => (output, false),
-                                Err(error) => (error.to_string(), true),
-                            };
+                        let (mut output, mut is_error) = match self
+                            .tool_executor
+                            .execute_authorized(&tool_name, &effective_input)
+                        {
+                            Ok(output) => (output, false),
+                            Err(error) => (error.to_string(), true),
+                        };
                         output = merge_hook_feedback(pre_hook_result.messages(), output, false);
 
                         let post_hook_result = if is_error {

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use reqwest::Response;
 use serde_json::{json, Value};
 
-use crate::error::{ApiError, NonActionableResponse, ResponseOutcomeKind};
+use crate::error::{ApiError, NonActionableResponse, ProviderFailureClass, ResponseOutcomeKind};
 use crate::http_client::build_http_client_or_default;
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
@@ -262,6 +262,10 @@ struct ResponseStreamState {
     item_to_call: BTreeMap<String, String>,
     usage: Usage,
     completed: bool,
+    failure_class: Option<ProviderFailureClass>,
+    provider_error_code: Option<String>,
+    provider_error_message: Option<String>,
+    incomplete_details: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -286,6 +290,10 @@ impl ResponseStreamState {
             item_to_call: BTreeMap::new(),
             usage: Usage::default(),
             completed: false,
+            failure_class: None,
+            provider_error_code: None,
+            provider_error_message: None,
+            incomplete_details: None,
         }
     }
 
@@ -514,6 +522,10 @@ impl ResponseStreamState {
             input_tokens: self.usage.input_tokens,
             output_tokens: self.usage.output_tokens,
             cached_input_tokens: self.usage.cache_read_input_tokens,
+            failure_class: self.failure_class,
+            provider_error_code: self.provider_error_code.clone(),
+            provider_error_message: self.provider_error_message.clone(),
+            incomplete_details: self.incomplete_details.clone(),
         }))
     }
 
@@ -533,6 +545,26 @@ impl ResponseStreamState {
             .get("status")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
+        if let Some(error) = response.get("error") {
+            self.provider_error_code = error
+                .get("code")
+                .and_then(Value::as_str)
+                .map(|value| value.chars().take(256).collect());
+            self.provider_error_message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .map(|value| value.chars().take(400).collect());
+            self.failure_class = self
+                .provider_error_code
+                .as_deref()
+                .map(classify_provider_failure);
+        }
+        self.incomplete_details = response.get("incomplete_details").map(|value| {
+            let detail = value
+                .as_str()
+                .map_or_else(|| value.to_string(), str::to_owned);
+            detail.chars().take(400).collect()
+        });
         if let Some(output) = response.get("output").and_then(Value::as_array) {
             for item in output {
                 if let Some(item_type) = item.get("type").and_then(Value::as_str) {
@@ -547,6 +579,36 @@ impl ResponseStreamState {
                 }
             }
         }
+    }
+}
+
+fn classify_provider_failure(code: &str) -> ProviderFailureClass {
+    let code = code.to_ascii_lowercase();
+    if code.contains("rate_limit") || code.contains("ratelimit") {
+        ProviderFailureClass::RateLimit
+    } else if [
+        "server_error",
+        "service_unavailable",
+        "temporarily_unavailable",
+        "timeout",
+        "overloaded",
+    ]
+    .iter()
+    .any(|marker| code.contains(marker))
+    {
+        ProviderFailureClass::Transient
+    } else if code.contains("policy") || code.contains("safety") || code.contains("content") {
+        ProviderFailureClass::Policy
+    } else if code.contains("auth")
+        || code.contains("credential")
+        || code.contains("api_key")
+        || code.contains("permission")
+    {
+        ProviderFailureClass::Authentication
+    } else if code.contains("invalid") || code.contains("context_length") {
+        ProviderFailureClass::Permanent
+    } else {
+        ProviderFailureClass::Unknown
     }
 }
 

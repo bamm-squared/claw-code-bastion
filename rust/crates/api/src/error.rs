@@ -75,6 +75,35 @@ pub enum ResponseOutcomeKind {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderFailureClass {
+    Transient,
+    RateLimit,
+    Permanent,
+    Policy,
+    Authentication,
+    Unknown,
+}
+
+impl ProviderFailureClass {
+    #[must_use]
+    pub const fn is_retryable(self) -> bool {
+        matches!(self, Self::Transient | Self::RateLimit)
+    }
+
+    #[must_use]
+    pub const fn safe_failure_class(self) -> &'static str {
+        match self {
+            Self::Transient => "provider_transient",
+            Self::RateLimit => "provider_rate_limit",
+            Self::Permanent => "provider_request",
+            Self::Policy => "provider_policy",
+            Self::Authentication => "provider_auth",
+            Self::Unknown => "provider_error",
+        }
+    }
+}
+
 impl Display for ResponseOutcomeKind {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let name = match self {
@@ -99,6 +128,10 @@ pub struct NonActionableResponse {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub cached_input_tokens: u32,
+    pub failure_class: Option<ProviderFailureClass>,
+    pub provider_error_code: Option<String>,
+    pub provider_error_message: Option<String>,
+    pub incomplete_details: Option<String>,
 }
 
 impl ApiError {
@@ -166,7 +199,12 @@ impl ApiError {
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
             | Self::BackoffOverflow { .. } => false,
-            Self::NonActionableResponse(response) => response.kind == ResponseOutcomeKind::Empty,
+            Self::NonActionableResponse(response) => {
+                response.kind == ResponseOutcomeKind::Empty
+                    || response
+                        .failure_class
+                        .is_some_and(ProviderFailureClass::is_retryable)
+            }
         }
     }
 
@@ -209,7 +247,10 @@ impl ApiError {
             Self::Http(_) | Self::InvalidSseFrame(_) | Self::BackoffOverflow { .. } => {
                 "provider_transport"
             }
-            Self::NonActionableResponse(_) => "provider_protocol",
+            Self::NonActionableResponse(response) => response.failure_class.map_or(
+                "provider_protocol",
+                ProviderFailureClass::safe_failure_class,
+            ),
             Self::InvalidApiKeyEnv(_) | Self::Io(_) | Self::Json { .. } => "runtime_io",
         }
     }
@@ -368,13 +409,19 @@ impl Display for ApiError {
             ),
             Self::NonActionableResponse(response) => write!(
                 f,
-                "responses {} outcome for model {} (response_id={}, request_id={}, status={}, output_types={:?}, input_tokens={}, cached_input_tokens={}, output_tokens={})",
+                "responses {} outcome for model {} (response_id={}, request_id={}, status={}, output_types={:?}, failure_class={}, provider_error_code={:?}, provider_error_message={:?}, incomplete_details={:?}, input_tokens={}, cached_input_tokens={}, output_tokens={})",
                 response.kind,
                 response.model,
                 response.response_id.as_deref().unwrap_or("none"),
                 response.request_id.as_deref().unwrap_or("none"),
                 response.status.as_deref().unwrap_or("unknown"),
                 response.output_types,
+                response
+                    .failure_class
+                    .map_or("none", ProviderFailureClass::safe_failure_class),
+                response.provider_error_code,
+                response.provider_error_message,
+                response.incomplete_details,
                 response.input_tokens,
                 response.cached_input_tokens,
                 response.output_tokens,
