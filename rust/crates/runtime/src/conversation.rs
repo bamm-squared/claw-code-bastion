@@ -62,6 +62,13 @@ pub trait ApiClient {
 pub trait ToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError>;
 
+    /// Run bounded, candidate-only development checks at a writer checkpoint.
+    /// Implementations may return diagnostics for the writer; this never
+    /// authorizes validation, evaluation, Review, or Apply.
+    fn run_checkpoint_candidate_checks(&mut self) -> Result<Option<String>, ToolError> {
+        Ok(None)
+    }
+
     /// Execute the exact invocation after the conversation permission
     /// prompter has approved it. Implementations must retain containment and
     /// allowlist checks while avoiding a duplicate policy decision.
@@ -213,6 +220,8 @@ pub struct TurnSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AutoCompactionEvent {
     pub removed_message_count: usize,
+    pub before_estimated_tokens: usize,
+    pub after_estimated_tokens: usize,
 }
 
 /// Coordinates the model loop, tool execution, hooks, and session updates.
@@ -228,6 +237,7 @@ pub struct ConversationRuntime<C, T> {
     checkpoint_finalization_turns: usize,
     checkpoint_turns_remaining: usize,
     checkpoint: Option<WriterCheckpoint>,
+    checkpoint_candidate_check_ran: bool,
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
     auto_compaction_input_tokens_threshold: u32,
@@ -282,6 +292,7 @@ where
             checkpoint_finalization_turns: 0,
             checkpoint_turns_remaining: 0,
             checkpoint: None,
+            checkpoint_candidate_check_ran: false,
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
             auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
@@ -494,18 +505,29 @@ where
         self.max_iterations = self.configured_max_iterations;
         self.checkpoint_turns_remaining = self.checkpoint_finalization_turns;
         self.checkpoint = None;
+        self.checkpoint_candidate_check_ran = false;
+        let mut checkpoint_compaction = None;
         let mut previous_tool_fingerprint = None;
         let mut identical_tool_iterations = 0;
 
         loop {
             if iterations >= self.max_iterations && self.checkpoint_turns_remaining > 0 {
+                let candidate_check = self
+                    .tool_executor
+                    .run_checkpoint_candidate_checks()
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                self.checkpoint_candidate_check_ran = candidate_check.is_some();
+                checkpoint_compaction = self.compact_for_checkpoint();
                 self.checkpoint_turns_remaining -= 1;
                 self.max_iterations = self.max_iterations.saturating_add(1);
+                let checkpoint_evidence = candidate_check.map_or_else(String::new, |diagnostics| {
+                    format!("[Checkpoint candidate-development checks]\n{diagnostics}\n\n")
+                });
                 self.session
                     .push_message(ConversationMessage {
                         role: MessageRole::User,
                         blocks: vec![ContentBlock::Text {
-                            text: "The bounded writer budget has been reached. Use the candidate_checkpoint tool now with submit, blocked, or needs_user_input. Do not begin broad new work; submit the best coherent candidate or state what prevents completion.".to_string(),
+                            text: format!("{checkpoint_evidence}The bounded writer budget has been reached. Use the candidate_checkpoint tool now with submit, blocked, or needs_user_input. If checks reported failures, make only targeted repairs before checkpointing. Do not begin broad new work; submit the best coherent candidate or state what prevents completion."),
                         }],
                         usage: None,
                     })
@@ -715,7 +737,7 @@ where
             }
         }
 
-        let auto_compaction = self.maybe_auto_compact();
+        let auto_compaction = checkpoint_compaction.or_else(|| self.maybe_auto_compact());
 
         let summary = TurnSummary {
             assistant_messages,
@@ -775,6 +797,11 @@ where
         self.checkpoint.take()
     }
 
+    #[must_use]
+    pub fn checkpoint_candidate_check_ran(&self) -> bool {
+        self.checkpoint_candidate_check_ran
+    }
+
     pub fn apply_candidate_changes(
         &mut self,
         changes: &CandidateChangeSet,
@@ -824,6 +851,7 @@ where
             return None;
         }
 
+        let before_estimated_tokens = estimate_session_tokens(&self.session);
         let result = compact_session(
             &self.session,
             CompactionConfig {
@@ -836,9 +864,33 @@ where
             return None;
         }
 
+        let after_estimated_tokens = estimate_session_tokens(&result.compacted_session);
         self.session = result.compacted_session;
         Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
+            before_estimated_tokens,
+            after_estimated_tokens,
+        })
+    }
+
+    fn compact_for_checkpoint(&mut self) -> Option<AutoCompactionEvent> {
+        let before_estimated_tokens = estimate_session_tokens(&self.session);
+        let result = compact_session(
+            &self.session,
+            CompactionConfig {
+                max_estimated_tokens: 0,
+                preserve_recent_messages: 12,
+            },
+        );
+        if result.removed_message_count == 0 {
+            return None;
+        }
+        let after_estimated_tokens = estimate_session_tokens(&result.compacted_session);
+        self.session = result.compacted_session;
+        Some(AutoCompactionEvent {
+            removed_message_count: result.removed_message_count,
+            before_estimated_tokens,
+            after_estimated_tokens,
         })
     }
 
@@ -1088,9 +1140,8 @@ impl ToolExecutor for StaticToolExecutor {
 mod tests {
     use super::{
         build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
-        AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
-        StaticToolExecutor, ToolExecutor, WriterCheckpoint,
-        DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        AssistantEvent, ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor,
+        ToolExecutor, WriterCheckpoint, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -1814,12 +1865,12 @@ mod tests {
             .run_turn("trigger", None)
             .expect("turn should succeed");
 
-        assert_eq!(
-            summary.auto_compaction,
-            Some(AutoCompactionEvent {
-                removed_message_count: 2,
-            })
-        );
+        let compaction = summary
+            .auto_compaction
+            .expect("the threshold should trigger compaction");
+        assert_eq!(compaction.removed_message_count, 2);
+        assert!(compaction.before_estimated_tokens > 0);
+        assert!(compaction.after_estimated_tokens > 0);
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);
     }
 
@@ -2170,6 +2221,84 @@ mod tests {
         assert!(matches!(
             summary.checkpoint,
             Some(WriterCheckpoint::Blocked { .. })
+        ));
+    }
+
+    #[test]
+    fn checkpoint_runs_candidate_checks_and_returns_diagnostics() {
+        struct CheckpointApi {
+            calls: usize,
+        }
+
+        impl ApiClient for CheckpointApi {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    return Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "work-1".to_string(),
+                            name: "echo".to_string(),
+                            input: "work".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]);
+                }
+                assert!(request.messages.iter().any(|message| {
+                    message.blocks.iter().any(|block| {
+                        matches!(block, ContentBlock::Text { text } if text.contains("candidate-development checks"))
+                    })
+                }));
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: "checkpoint-1".to_string(),
+                        name: "candidate_checkpoint".to_string(),
+                        input: r#"{"status":"submit"}"#.to_string(),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        struct CheckpointExecutor {
+            checkpoint: bool,
+        }
+
+        impl ToolExecutor for CheckpointExecutor {
+            fn execute(&mut self, tool_name: &str, _input: &str) -> Result<String, ToolError> {
+                assert!(matches!(tool_name, "echo" | "candidate_checkpoint"));
+                if tool_name == "candidate_checkpoint" {
+                    self.checkpoint = true;
+                }
+                Ok("accepted".to_string())
+            }
+
+            fn run_checkpoint_candidate_checks(&mut self) -> Result<Option<String>, ToolError> {
+                Ok(Some("format: failed; test: passed".to_string()))
+            }
+
+            fn take_checkpoint(&mut self) -> Option<WriterCheckpoint> {
+                self.checkpoint
+                    .then_some(WriterCheckpoint::Submit { message: None })
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            CheckpointApi { calls: 0 },
+            CheckpointExecutor { checkpoint: false },
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_checkpoint_policy(1, 1);
+
+        let summary = runtime
+            .run_turn("work", None)
+            .expect("checkpoint should complete the turn");
+
+        assert!(runtime.checkpoint_candidate_check_ran());
+        assert!(matches!(
+            summary.checkpoint,
+            Some(WriterCheckpoint::Submit { .. })
         ));
     }
 

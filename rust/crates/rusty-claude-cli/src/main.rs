@@ -5784,6 +5784,7 @@ impl LiveCli {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (_prompt, image_blocks) = self.prepare_user_turn(input)?;
         self.route_writer_for_current_task();
@@ -5823,6 +5824,18 @@ impl LiveCli {
             Ok(summary) => {
                 if summary.iterations > writer_iteration_budget(self.task_plan.planning_mode()) {
                     benchmark_telemetry::lifecycle_event("writer_soft_checkpoint_triggered");
+                }
+                if runtime.checkpoint_candidate_check_ran() {
+                    benchmark_telemetry::writer_checkpoint_candidate_check();
+                }
+                if summary.checkpoint.is_some() {
+                    if let Some(event) = summary.auto_compaction {
+                        benchmark_telemetry::writer_checkpoint_context(
+                            event.before_estimated_tokens,
+                            event.after_estimated_tokens,
+                            event.removed_message_count,
+                        );
+                    }
                 }
                 if let Some(checkpoint) = runtime.take_checkpoint() {
                     match checkpoint {
@@ -11957,6 +11970,21 @@ impl CliToolExecutor {
 }
 
 impl ToolExecutor for CliToolExecutor {
+    fn run_checkpoint_candidate_checks(&mut self) -> Result<Option<String>, ToolError> {
+        if self.candidate_review_roots().is_none() {
+            return Ok(None);
+        }
+        let input = json!({
+            "checks": ["format", "test", "clippy"],
+            "timeout_ms": 120_000,
+        });
+        let output = self
+            .tool_registry
+            .execute_authorized("candidate_check", &input)
+            .unwrap_or_else(|error| format!("candidate development checks unavailable: {error}"));
+        Ok(Some(output))
+    }
+
     fn take_checkpoint(&mut self) -> Option<WriterCheckpoint> {
         self.pending_checkpoint.take()
     }

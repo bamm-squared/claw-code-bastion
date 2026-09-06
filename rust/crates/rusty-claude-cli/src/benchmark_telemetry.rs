@@ -13,6 +13,11 @@ pub struct Snapshot {
     pub provider_request_ids: Vec<String>,
     pub provider_empty_response_recoveries: u64,
     pub provider_transient_recoveries: u64,
+    pub writer_checkpoint_candidate_checks: u64,
+    pub writer_checkpoint_before_context_tokens: Option<u64>,
+    pub writer_checkpoint_after_context_tokens: Option<u64>,
+    pub writer_checkpoint_context_reduction_tokens: Option<u64>,
+    pub writer_checkpoint_compacted_messages: Option<u64>,
     pub model_turns: u64,
     pub tool_bearing_turns: u64,
     pub tool_calls: BTreeMap<String, u64>,
@@ -283,6 +288,32 @@ pub fn provider_transient_recovery() {
     });
     lifecycle_event("provider_transient_recovery");
 }
+
+pub fn writer_checkpoint_candidate_check() {
+    with_state(|s| {
+        s.snapshot.writer_checkpoint_candidate_checks = s
+            .snapshot
+            .writer_checkpoint_candidate_checks
+            .saturating_add(1);
+    });
+    lifecycle_event("writer_checkpoint_candidate_check");
+}
+
+pub fn writer_checkpoint_context(
+    before_tokens: usize,
+    after_tokens: usize,
+    removed_messages: usize,
+) {
+    with_state(|s| {
+        s.snapshot.writer_checkpoint_before_context_tokens = Some(before_tokens as u64);
+        s.snapshot.writer_checkpoint_after_context_tokens = Some(after_tokens as u64);
+        s.snapshot.writer_checkpoint_context_reduction_tokens =
+            Some(before_tokens.saturating_sub(after_tokens) as u64);
+        s.snapshot.writer_checkpoint_compacted_messages = Some(removed_messages as u64);
+    });
+    lifecycle_event("writer_checkpoint_context_compacted");
+}
+
 pub fn model_turn() {
     with_state(|s| s.snapshot.model_turns += 1);
 }

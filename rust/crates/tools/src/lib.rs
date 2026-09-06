@@ -2790,12 +2790,47 @@ fn has_dangerous_paths(command: &str) -> bool {
     false
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn run_bash(input: BashCommandInput) -> Result<String, String> {
     if let Some(output) = workspace_test_branch_preflight(&input.command) {
         return serde_json::to_string_pretty(&output).map_err(|error| error.to_string());
     }
-    serde_json::to_string_pretty(&execute_bash(input).map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())
+    let mut output = execute_bash(input.clone()).map_err(|error| error.to_string())?;
+    if let Some(guidance) = development_check_guidance(&input.command, &output.stderr) {
+        let mut structured_content = output.structured_content.take().unwrap_or_default();
+        structured_content.push(guidance);
+        output.structured_content = Some(structured_content);
+    }
+    serde_json::to_string_pretty(&output).map_err(|error| error.to_string())
+}
+
+fn development_check_guidance(command: &str, stderr: &str) -> Option<Value> {
+    let missing_tool = stderr.contains("not found")
+        || stderr.contains("No such file or directory")
+        || stderr.contains("command not found");
+    if !missing_tool || !command.contains("cargo") {
+        return None;
+    }
+    let mut checks = Vec::new();
+    if command.contains("fmt") {
+        checks.push("format");
+    }
+    if command.contains("test") || command.contains("check") {
+        checks.push("test");
+    }
+    if command.contains("clippy") {
+        checks.push("clippy");
+    }
+    if checks.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "type": "candidate_development_guidance",
+        "preferred_tool": "candidate_check",
+        "checks": checks,
+        "reason": "the isolated worker does not provide the requested Cargo executable; use the contained candidate_check tool for development feedback",
+        "authoritative": false,
+    }))
 }
 
 fn workspace_test_branch_preflight(command: &str) -> Option<BashCommandOutput> {
@@ -10546,6 +10581,25 @@ printf 'pwsh:%s' "$1"
             .expect_err("candidate checks need an isolated candidate");
 
         assert!(error.contains("isolated candidate backend"));
+    }
+
+    #[test]
+    fn unavailable_cargo_feedback_points_to_candidate_check() {
+        let guidance = super::development_check_guidance(
+            "cd rust && cargo fmt --all && cargo test --workspace",
+            "sh: cargo: not found",
+        )
+        .expect("missing Cargo should produce structured guidance");
+
+        assert_eq!(guidance["type"], "candidate_development_guidance");
+        assert_eq!(guidance["preferred_tool"], "candidate_check");
+        assert_eq!(guidance["authoritative"], false);
+        assert!(guidance["checks"]
+            .as_array()
+            .is_some_and(|checks| checks.iter().any(|check| check == "format")));
+        assert!(guidance["checks"]
+            .as_array()
+            .is_some_and(|checks| checks.iter().any(|check| check == "test")));
     }
 
     #[test]
