@@ -37,6 +37,8 @@ fn rejects_values_above_limit() {
 }
 """
 
+CONFIG_BROKEN = CONFIG + "\nthis is not valid Rust\n"
+
 
 RETRY_CONFIG = """#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetryConfig {
@@ -415,6 +417,58 @@ def actions_for(
     completion_audit_test=False,
     completion_audit_followup=False,
 ):
+    if task == "config-threading" and (
+        ResponsesHandler.work_unit_lifecycle_test
+        or ResponsesHandler.work_unit_completion_stall_test
+    ):
+        if ResponsesHandler.work_unit_lifecycle_test and (
+            ResponsesHandler.evaluator_rework_test and ResponsesHandler.evaluator_calls > 0
+        ):
+            return [
+                ("write_file", {"path": "src/config.rs", "content": CONFIG}),
+                (
+                    "candidate_checkpoint",
+                    {"status": "unit_complete", "message": "targeted evaluator rework"},
+                ),
+                ("candidate_checkpoint", {"status": "submit", "message": "resubmit repaired candidate"}),
+            ]
+        if ResponsesHandler.work_unit_completion_stall_test:
+            return [
+                ("read_file", {"path": "src/config.rs"}),
+                ("write_file", {"path": "src/config.rs", "content": CONFIG_BROKEN}),
+                (
+                    "candidate_checkpoint",
+                    {"status": "unit_complete", "message": "attempt WU-1 completion"},
+                ),
+                (
+                    "candidate_checkpoint",
+                    {"status": "unit_complete", "message": "retry WU-1 completion"},
+                ),
+            ]
+        return [
+            ("read_file", {"path": "src/config.rs"}),
+            ("read_file", {"path": "tests/config.rs"}),
+            ("write_file", {"path": "src/config.rs", "content": CONFIG_BROKEN}),
+            (
+                "candidate_checkpoint",
+                {
+                    "status": "unit_complete",
+                    "message": "WU-1 implementation and initial development evidence",
+                },
+            ),
+            ("write_file", {"path": "src/config.rs", "content": CONFIG}),
+            ("write_file", {"path": "tests/config.rs", "content": TESTS}),
+            (
+                "candidate_checkpoint",
+                {"status": "unit_complete", "message": "WU-1 repaired and verified"},
+            ),
+            ("read_file", {"path": "tests/config.rs"}),
+            (
+                "candidate_checkpoint",
+                {"status": "unit_complete", "message": "WU-2 compatibility evidence"},
+            ),
+            ("candidate_checkpoint", {"status": "submit", "message": "submit whole candidate"}),
+        ]
     if task == "retry-policy":
         return [
             ("read_file", {"path": "Cargo.toml"}),
@@ -702,6 +756,8 @@ class ResponsesHandler(BaseHTTPRequestHandler):
     completion_audit_test = False
     completion_audit_followup_consumed = False
     completion_audit_stall_test = False
+    work_unit_lifecycle_test = False
+    work_unit_completion_stall_test = False
 
     def log_message(self, format_string, *args):
         print(f"fake-responses request={self.request_number} path={self.path}", flush=True)
@@ -821,6 +877,16 @@ def main():
         action="store_true",
         help="make the bounded completion-evidence follow-up make no edits",
     )
+    parser.add_argument(
+        "--work-unit-lifecycle-test",
+        action="store_true",
+        help="exercise real multi-unit completion rejection, repair, transition, and submission",
+    )
+    parser.add_argument(
+        "--work-unit-completion-stall-test",
+        action="store_true",
+        help="exercise bounded repeated work-unit completion rejection",
+    )
     args = parser.parse_args()
     ResponsesHandler.task = args.task
     ResponsesHandler.rework_test = args.rework_test
@@ -830,6 +896,8 @@ def main():
         args.completion_audit_test or args.completion_audit_stall_test
     )
     ResponsesHandler.completion_audit_stall_test = args.completion_audit_stall_test
+    ResponsesHandler.work_unit_lifecycle_test = args.work_unit_lifecycle_test
+    ResponsesHandler.work_unit_completion_stall_test = args.work_unit_completion_stall_test
     server = HTTPServer((args.host, args.port), ResponsesHandler)
     if args.port_file:
         args.port_file.write_text(str(server.server_address[1]) + "\n")

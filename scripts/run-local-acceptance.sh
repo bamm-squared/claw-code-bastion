@@ -9,12 +9,15 @@ VALIDATOR_IMAGE=${CLAW_ACCEPTANCE_VALIDATOR_IMAGE:-claw-bastion-validator-rust:0
 SETTINGS_PATH=${CLAW_ACCEPTANCE_SETTINGS_PATH:-"$ROOT/benchmarks/settings.local.json"}
 ARTIFACTS_DIR=${CLAW_ACCEPTANCE_ARTIFACTS_DIR:-"$ROOT/artifacts/acceptance/$(date -u +%Y%m%dT%H%M%SZ)-$$"}
 PROVIDER_FLAGS=()
+EXPECT_BOUNDED_FAILURE=false
 
 usage() {
     cat <<'EOF'
 Usage: scripts/run-local-acceptance.sh [--task ID] [--rework-test]
        [--evaluator-rework-test] [--evaluator-unavailable]
        [--completion-audit-test] [--completion-audit-stall-test]
+       [--work-unit-lifecycle-test]
+       [--work-unit-completion-stall-test]
        [--artifacts-dir PATH]
 
 Runs one repository-owned acceptance task against the loopback deterministic
@@ -35,8 +38,11 @@ while (($#)); do
             esac
             shift 2
             ;;
-        --rework-test|--evaluator-rework-test|--evaluator-unavailable|--completion-audit-test|--completion-audit-stall-test)
+        --rework-test|--evaluator-rework-test|--evaluator-unavailable|--completion-audit-test|--completion-audit-stall-test|--work-unit-lifecycle-test|--work-unit-completion-stall-test)
             PROVIDER_FLAGS+=("$1")
+            if [[ "$1" == "--work-unit-completion-stall-test" ]]; then
+                EXPECT_BOUNDED_FAILURE=true
+            fi
             shift
             ;;
         --artifacts-dir)
@@ -161,13 +167,14 @@ set +e
 runner_status=$?
 set -e
 
-python3 - "$RESULT_PATH" "$TELEMETRY_PATH" "$TASK_ID" <<'PY'
+CLAW_EXPECT_BOUNDED_FAILURE="$EXPECT_BOUNDED_FAILURE" python3 - "$RESULT_PATH" "$TELEMETRY_PATH" "$TASK_ID" <<'PY'
 import json
 import os
 import signal
 import sys
 
 result_path, telemetry_path, task_id = sys.argv[1:]
+expect_bounded_failure = os.environ.get("CLAW_EXPECT_BOUNDED_FAILURE") == "true"
 if not os.path.exists(result_path):
     raise SystemExit(f"missing benchmark result: {result_path}")
 with open(result_path, encoding="utf-8") as handle:
@@ -178,6 +185,26 @@ record = records[0]
 actual_task = record.get("task_id", record.get("task"))
 if actual_task != task_id:
     raise SystemExit(f"unexpected task in result: {actual_task}")
+if expect_bounded_failure:
+    if not os.path.exists(telemetry_path):
+        raise SystemExit(f"missing telemetry: {telemetry_path}")
+    with open(telemetry_path, encoding="utf-8") as handle:
+        telemetry = json.load(handle)
+    if telemetry.get("terminal_status") != "completed":
+        raise SystemExit(f"local acceptance terminal status: {telemetry.get('terminal_status')}")
+    events = telemetry.get("lifecycle_events", [])
+    required = "work_unit_completion_reconciliation_exhausted"
+    if required not in events:
+        raise SystemExit(f"missing bounded completion event: {required}")
+    forbidden = {"work_unit_advanced", "candidate_submitted", "validation_started", "review_ready"}
+    unexpected = sorted(forbidden.intersection(events))
+    if unexpected:
+        raise SystemExit(f"bounded completion escaped lifecycle: {unexpected}")
+    print("ACCEPTANCE: BOUNDED FAILURE PASS")
+    print(f"result: {result_path}")
+    print(f"telemetry: {telemetry_path}")
+    print(f"profile: {record.get('executed_profile')}")
+    sys.exit(0)
 if record.get("final_correctness") != "PASS":
     raise SystemExit(f"hidden oracle result: {record.get('final_correctness')}")
 if record.get("validation") not in ("completed", "PASS", "pass"):
