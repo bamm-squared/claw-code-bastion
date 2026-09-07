@@ -141,6 +141,7 @@ pub trait ToolExecutor {
 pub enum WriterCheckpoint {
     Submit { message: Option<String> },
     UnitComplete { message: Option<String> },
+    BoundedContinue { objective: String },
     Replan { message: String },
     Blocked { message: String },
     NeedsUserInput { message: String },
@@ -568,6 +569,8 @@ where
         let mut checkpoint_compaction = None;
         let mut checkpoint_prompted = false;
         let mut pre_candidate_continuation_used = false;
+        let mut finalization_only = false;
+        let mut finalization_followup_granted = false;
         let mut previous_tool_fingerprint = None;
         let mut identical_tool_iterations = 0;
 
@@ -612,6 +615,7 @@ where
                     checkpoint_prompted = true;
                     self.checkpoint_turns_remaining -= 1;
                     self.max_iterations = self.max_iterations.saturating_add(1);
+                    finalization_only = true;
                 }
                 let candidate_check = if pre_candidate {
                     None
@@ -630,7 +634,7 @@ where
                 } else if pre_candidate {
                     "The bounded pre-mutation continuation is exhausted and the isolated candidate is still unchanged. Do not use submit to mean no changes; use candidate_checkpoint with blocked or needs_user_input to end explicitly.\n\n"
                 } else {
-                    "The bounded writer budget/resource boundary has been reached. Use candidate_checkpoint with unit_complete when the current scheduled work unit is complete, submit only when all planned work units are complete, replan when a material assumption is invalid, or blocked/needs_user_input when work cannot continue. If checks reported failures, make only targeted repairs before checkpointing.\n\n"
+                    "The bounded writer budget/resource boundary has been reached. This is a lifecycle finalization turn: do not use repository or shell tools. Call candidate_checkpoint with unit_complete when the current scheduled work unit is complete, bounded_continue with one concrete remaining objective when a small continuation is justified, submit only when all planned work units are complete, replan when a material assumption is invalid, or blocked/needs_user_input when work cannot continue. If checks reported failures, make only targeted repairs before checkpointing.\n\n"
                 };
                 self.session
                     .push_message(ConversationMessage {
@@ -705,6 +709,27 @@ where
             assistant_messages.push(assistant_message);
 
             if pending_tool_uses.is_empty() {
+                if finalization_only {
+                    if !finalization_followup_granted {
+                        finalization_followup_granted = true;
+                        self.max_iterations = self.max_iterations.saturating_add(1);
+                        self.session
+                            .push_message(ConversationMessage {
+                                role: MessageRole::User,
+                                blocks: vec![ContentBlock::Text {
+                                    text: "Finalization requires one structured candidate_checkpoint outcome. Do not continue repository inspection; choose unit_complete, bounded_continue with a concrete objective, replan, blocked, or needs_user_input.".to_string(),
+                                }],
+                                usage: None,
+                            })
+                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        continue;
+                    }
+                    let error = RuntimeError::new(
+                        "writer finalization did not produce a lifecycle checkpoint",
+                    );
+                    self.record_turn_failed(iterations, &error);
+                    return Err(error);
+                }
                 break;
             }
 
@@ -719,7 +744,16 @@ where
                     pre_hook_result.permission_reason().map(ToOwned::to_owned),
                 );
 
-                let permission_outcome = if pre_hook_result.is_cancelled() {
+                let permission_outcome = if finalization_only && tool_name != "candidate_checkpoint"
+                {
+                    if !finalization_followup_granted {
+                        finalization_followup_granted = true;
+                        self.max_iterations = self.max_iterations.saturating_add(1);
+                    }
+                    PermissionOutcome::Deny {
+                        reason: "finalization only accepts candidate_checkpoint; choose a lifecycle outcome instead of another repository-tool call".to_string(),
+                    }
+                } else if pre_hook_result.is_cancelled() {
                     PermissionOutcome::Deny {
                         reason: format_hook_message(
                             &pre_hook_result,
@@ -2344,6 +2378,106 @@ mod tests {
             summary.checkpoint,
             Some(WriterCheckpoint::Blocked { .. })
         ));
+    }
+
+    #[test]
+    fn finalization_rejects_repository_tools_until_checkpoint_is_resolved() {
+        struct Api {
+            calls: usize,
+        }
+
+        impl ApiClient for Api {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "work-1".to_string(),
+                            name: "echo".to_string(),
+                            input: "first work".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        assert!(request.messages.iter().any(|message| {
+                            message.blocks.iter().any(|block| {
+                                matches!(block, ContentBlock::Text { text } if text.contains("lifecycle finalization"))
+                            })
+                        }));
+                        Ok(vec![
+                            AssistantEvent::ToolUse {
+                                id: "invalid-finalization-tool".to_string(),
+                                name: "echo".to_string(),
+                                input: "inspect again".to_string(),
+                            },
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    3 => {
+                        assert!(request.messages.iter().any(|message| {
+                            message.blocks.iter().any(|block| {
+                                matches!(block, ContentBlock::ToolResult { output, is_error: true, .. } if output.contains("finalization only accepts"))
+                            })
+                        }));
+                        Ok(vec![
+                            AssistantEvent::ToolUse {
+                                id: "checkpoint-1".to_string(),
+                                name: "candidate_checkpoint".to_string(),
+                                input: r#"{"status":"blocked","message":"bounded diagnostic complete"}"#.to_string(),
+                            },
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => panic!("unexpected provider call after finalization checkpoint"),
+                }
+            }
+        }
+
+        struct Executor {
+            checkpoint: bool,
+            executed_tools: Vec<String>,
+        }
+
+        impl ToolExecutor for Executor {
+            fn execute(&mut self, tool_name: &str, _input: &str) -> Result<String, ToolError> {
+                self.executed_tools.push(tool_name.to_string());
+                if tool_name == "candidate_checkpoint" {
+                    self.checkpoint = true;
+                }
+                Ok("accepted".to_string())
+            }
+
+            fn take_checkpoint(&mut self) -> Option<WriterCheckpoint> {
+                self.checkpoint.then_some(WriterCheckpoint::Blocked {
+                    message: "bounded diagnostic complete".to_string(),
+                })
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            Api { calls: 0 },
+            Executor {
+                checkpoint: false,
+                executed_tools: Vec::new(),
+            },
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_checkpoint_policy(1, 1);
+
+        let summary = runtime
+            .run_turn("work", None)
+            .expect("finalization should resolve through a lifecycle checkpoint");
+
+        assert!(matches!(
+            summary.checkpoint,
+            Some(WriterCheckpoint::Blocked { .. })
+        ));
+        assert_eq!(
+            runtime.tool_executor().executed_tools,
+            ["echo", "candidate_checkpoint"]
+        );
     }
 
     #[test]

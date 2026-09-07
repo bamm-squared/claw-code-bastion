@@ -441,9 +441,9 @@ impl TaskPlan {
                     .map(|contract| contract.expectation.clone())
                     .collect();
                 let objective = match index {
-                    0 => "Implement the core requested behavior and its public integration.".to_string(),
-                    1 => "Preserve compatibility, defaults, and explicit error behavior while integrating the change.".to_string(),
-                    _ => "Exercise the required behavioral boundaries and capture focused completion evidence.".to_string(),
+                    0 => "Deliver the first coherent implementation outcome for the requested behavior and public integration, preserving the task-wide contracts for downstream work.".to_string(),
+                    1 => "Integrate the remaining compatibility, default, and error-path behavior around the completed implementation without reopening unrelated scope.".to_string(),
+                    _ => "Close the remaining required behavioral boundaries with focused evidence and reconcile the complete candidate for submission.".to_string(),
                 };
                 let completion_evidence = if contracts.is_empty() {
                     "For this implementation unit, make a meaningful candidate change and obtain targeted development evidence for the requested behavior.".to_string()
@@ -1496,6 +1496,28 @@ mod tests {
         assert_eq!(plan.work_units[0].status, WorkUnitStatus::Completed);
         assert_ne!(plan.current_work_unit_id.as_deref(), Some(first.as_str()));
         assert!(plan.render_for_writer().contains("completed:"));
+    }
+
+    #[test]
+    fn dependency_work_units_reach_whole_candidate_submission_state() {
+        let mut plan = TaskPlan::from_request(
+            "Implement the API behavior. Preserve compatibility. Handle errors. Add integration tests.",
+            Some("src/api.rs\nsrc/error.rs\ntests/api.rs"),
+        );
+        let mut completed = Vec::new();
+
+        while let Some(unit) = plan.current_work_unit_id.clone() {
+            completed.push(unit.clone());
+            let evidence = format!("{unit} mutation and evidence");
+            let next = plan.complete_current_work_unit(&evidence);
+            if next.is_none() {
+                break;
+            }
+        }
+
+        assert!(completed.len() >= 2);
+        assert!(plan.all_work_units_resolved());
+        assert!(plan.current_work_unit_id.is_none());
     }
 
     #[test]

@@ -1288,13 +1288,13 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "candidate_checkpoint",
-            description: "Yield the writer to the orchestrator with unit_complete, submit, replan, blocked, or needs_user_input. unit_complete advances the current scheduled work unit; submit is for the coherent whole candidate. This is a lifecycle handoff, not a correctness claim.",
+            description: "Yield the writer to the orchestrator with unit_complete, bounded_continue, submit, replan, blocked, or needs_user_input. unit_complete advances the current scheduled work unit; bounded_continue requests one small concrete continuation; submit is for the coherent whole candidate. This is a lifecycle handoff, not a correctness claim.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "status": {
                         "type": "string",
-                        "enum": ["unit_complete", "submit", "replan", "blocked", "needs_user_input"]
+                        "enum": ["unit_complete", "bounded_continue", "submit", "replan", "blocked", "needs_user_input"]
                     },
                     "message": { "type": "string", "maxLength": 4000 }
                 },

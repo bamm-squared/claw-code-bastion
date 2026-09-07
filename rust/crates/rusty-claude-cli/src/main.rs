@@ -4106,6 +4106,7 @@ struct LiveCli {
     repository_map_cache: Option<RepositoryMapCache>,
     checkpoint_store: runtime::CandidateCheckpointStore,
     work_unit_no_change_attempts: u8,
+    work_unit_continuation_objective: Option<String>,
 }
 
 #[derive(Clone)]
@@ -5260,6 +5261,7 @@ impl LiveCli {
             repository_map_cache: None,
             checkpoint_store,
             work_unit_no_change_attempts: 0,
+            work_unit_continuation_objective: None,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -5736,10 +5738,19 @@ impl LiveCli {
                 );
             }
         }
+        let continuation_objective = self.work_unit_continuation_objective.take();
+        let continuation_context = continuation_objective
+            .as_deref()
+            .map_or(String::new(), |objective| {
+                format!(
+                    "\n\n[Bounded work-unit continuation]\nExecute only this remaining objective before the next lifecycle checkpoint: {objective}\n"
+                )
+            });
         let plan_text = format!(
             "{}\n\n[Candidate development workflow]\nUse candidate_check for a bounded format, test, or clippy check after substantial edits or before candidate_checkpoint when useful. It runs only against the isolated candidate and provides development feedback; it never authorizes Review or Apply. Submit for trusted full validation when the candidate is coherent. If a check reports infrastructure_error, do not edit code to repair the environment.\n\n[Work-unit workflow]\nWork on the current executable work unit first. Use the supplied objective, scope, dependencies, and completion evidence as the unit contract. For an implementation unit, make a meaningful candidate mutation before requesting unit_complete; repeated repository inspection alone is not unit completion. When the objective and evidence are complete, use candidate_checkpoint with status unit_complete so the orchestrator can persist evidence, compact context, and advance to the next dependency-eligible unit. Use submit only when all planned work units are complete; use replan when a material assumption invalidates the current unit. Do not treat work-unit completion as semantic approval.",
             self.task_plan.render_for_writer()
         );
+        let plan_text = format!("{plan_text}{continuation_context}");
         benchmark_telemetry::work_unit_state(
             self.task_plan.work_units.len(),
             self.task_plan
@@ -5938,6 +5949,24 @@ impl LiveCli {
                                 return self.run_turn(input);
                             }
                             benchmark_telemetry::lifecycle_event("writer_checkpoint_submit");
+                        }
+                        WriterCheckpoint::BoundedContinue { objective } => {
+                            if objective.trim().is_empty() {
+                                let _ = runtime.finish_candidate()?;
+                                self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
+                                benchmark_telemetry::lifecycle_event(
+                                    "work_unit_continuation_rejected_without_objective",
+                                );
+                                self.replace_runtime(runtime)?;
+                                self.persist_session()?;
+                                return Ok(());
+                            }
+                            self.work_unit_continuation_objective = Some(objective);
+                            benchmark_telemetry::lifecycle_event(
+                                "work_unit_bounded_continuation_granted",
+                            );
+                            self.replace_runtime(runtime)?;
+                            return self.run_turn(input);
                         }
                         WriterCheckpoint::Replan { message } => {
                             self.work_unit_no_change_attempts = 0;
@@ -6665,6 +6694,7 @@ impl LiveCli {
                         match checkpoint {
                             WriterCheckpoint::Submit { .. }
                             | WriterCheckpoint::UnitComplete { .. }
+                            | WriterCheckpoint::BoundedContinue { .. }
                             | WriterCheckpoint::Replan { .. } => {}
                             WriterCheckpoint::Blocked { message }
                             | WriterCheckpoint::NeedsUserInput { message } => {
@@ -12345,6 +12375,7 @@ impl CliToolExecutor {
             "unit_complete" => WriterCheckpoint::UnitComplete {
                 message: (!message.is_empty()).then_some(message),
             },
+            "bounded_continue" => WriterCheckpoint::BoundedContinue { objective: message },
             "replan" => WriterCheckpoint::Replan {
                 message: if message.is_empty() {
                     "the current work-unit assumption needs to be revisited".to_string()
@@ -12380,6 +12411,7 @@ impl CliToolExecutor {
         let response_status = match &checkpoint {
             WriterCheckpoint::Submit { .. } => "submit",
             WriterCheckpoint::UnitComplete { .. } => "unit_complete",
+            WriterCheckpoint::BoundedContinue { .. } => "bounded_continue",
             WriterCheckpoint::Replan { .. } => "replan",
             WriterCheckpoint::Blocked { .. } => "blocked",
             WriterCheckpoint::NeedsUserInput { .. } => "needs_user_input",
