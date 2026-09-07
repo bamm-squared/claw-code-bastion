@@ -448,9 +448,18 @@ impl ExecutionBackend for IsolatedExecutionBackend {
                 .unwrap_or_else(|_| runtime::DEFAULT_RUNTIME_IMAGE.to_string()),
             ..runtime::PodmanValidatorBackend::default()
         };
-        let validation =
-            runtime::validator::ValidatorBackend::validate(&backend, &snapshot.input(), &plan)
-                .map_err(|error| format!("candidate development validator unavailable: {error}"))?;
+        let validation = match runtime::validator::ValidatorBackend::validate(
+            &backend,
+            &snapshot.input(),
+            &plan,
+        ) {
+            Ok(validation) => validation,
+            Err(error) => {
+                return development_check_infrastructure_error(&format!(
+                    "candidate development validator unavailable: {error}"
+                ));
+            }
+        };
         let checks = validation
             .checks
             .iter()
@@ -483,6 +492,7 @@ impl ExecutionBackend for IsolatedExecutionBackend {
             "status": status,
             "checks": checks,
             "authorizes_review": false,
+            "authoritative": false,
             "note": "Development feedback only; submit the candidate for independent trusted validation.",
         }))
         .map_err(|error| error.to_string())
@@ -686,6 +696,8 @@ fn development_check_infrastructure_error(message: &str) -> Result<String, Strin
         "status": "infrastructure_error",
         "checks": [],
         "authorizes_review": false,
+        "authoritative": false,
+        "code_failure": false,
         "error": message,
     }))
     .map_err(|error| error.to_string())
@@ -1254,7 +1266,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "candidate_check",
-            description: "Run a bounded named development check against the isolated candidate after substantial edits or before candidate_checkpoint when useful. Supported checks are format, test, and clippy. It returns actionable feedback only, is candidate-only, and never authorizes Review or Apply.",
+            description: "Run a bounded named development check against the isolated candidate after substantial edits or before candidate_checkpoint when useful. The orchestrator may also run it when an implementation work unit is completed. Supported checks are format, test, and clippy. It returns actionable feedback only, is candidate-only, and never authorizes Review or Apply.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -10621,6 +10633,17 @@ printf 'pwsh:%s' "$1"
         assert!(guidance["checks"]
             .as_array()
             .is_some_and(|checks| checks.iter().any(|check| check == "test")));
+    }
+
+    #[test]
+    fn candidate_check_infrastructure_diagnostic_is_not_a_code_failure() {
+        let output = super::development_check_infrastructure_error("validator image unavailable")
+            .expect("diagnostic should serialize");
+        let value: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+        assert_eq!(value["status"], "infrastructure_error");
+        assert_eq!(value["authoritative"], false);
+        assert_eq!(value["code_failure"], false);
+        assert_eq!(value["authorizes_review"], false);
     }
 
     #[test]

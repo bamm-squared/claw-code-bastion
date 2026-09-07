@@ -8,6 +8,10 @@ COPY rust/Cargo.toml /opt/claw-source/Cargo.toml
 COPY rust/Cargo.lock /opt/claw-source/Cargo.lock
 COPY rust/crates /opt/claw-source/crates
 RUN CARGO_NET_OFFLINE=false cargo fetch --locked --manifest-path /opt/claw-source/Cargo.toml
+# Cargo may preserve the image build user's restrictive umask for fetched
+# sources.  The validator runs with keep-id, so the unprivileged validation
+# user must be able to read the dependency cache.
+RUN chmod -R a+rX /usr/local/cargo/registry /usr/local/cargo/git 2>/dev/null || true
 
 ENV CARGO_TERM_COLOR=always \
     CARGO_NET_OFFLINE=true \

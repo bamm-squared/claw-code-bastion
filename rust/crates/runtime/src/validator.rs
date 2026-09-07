@@ -470,6 +470,7 @@ fn run_check(command: &[String], check: &ValidationCheck) -> io::Result<Validati
 }
 
 fn validator_startup_failure(exit_code: Option<i32>, stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
     exit_code == Some(127)
         || exit_code == Some(125)
         || [
@@ -480,7 +481,9 @@ fn validator_startup_failure(exit_code: Option<i32>, stderr: &str) -> bool {
             "no such image",
         ]
         .iter()
-        .any(|marker| stderr.to_ascii_lowercase().contains(marker))
+        .any(|marker| lower.contains(marker))
+        || (lower.contains("permission denied")
+            && (lower.contains("/usr/local/cargo/") || lower.contains("/usr/local/rustup/")))
 }
 
 fn wait_with_deadline(child: &mut Child, deadline: Instant) -> io::Result<bool> {
@@ -730,6 +733,18 @@ mod tests {
             "/bin/sh: cargo: not found"
         ));
         assert!(!validator_startup_failure(Some(1), "test assertion failed"));
+    }
+
+    #[test]
+    fn unreadable_validator_dependency_is_infrastructure_blocked() {
+        assert!(validator_startup_failure(
+            Some(1),
+            "couldn't read /usr/local/cargo/registry/src/index/fnv/lib.rs: Permission denied"
+        ));
+        assert!(!validator_startup_failure(
+            Some(1),
+            "test reported Permission denied"
+        ));
     }
 
     #[test]
