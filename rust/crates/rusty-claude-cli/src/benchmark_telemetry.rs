@@ -25,6 +25,11 @@ pub struct Snapshot {
     pub writer_provider_token_limit: Option<u64>,
     pub writer_provider_token_remaining: Option<u64>,
     pub writer_provider_token_reset_after_seconds: Option<u64>,
+    pub work_units_total: u64,
+    pub work_units_completed: u64,
+    pub work_unit_transitions: u64,
+    pub current_work_unit: Option<String>,
+    pub work_unit_replans: u64,
     pub model_turns: u64,
     pub tool_bearing_turns: u64,
     pub tool_calls: BTreeMap<String, u64>,
@@ -352,6 +357,31 @@ pub fn writer_request_resource_estimate(
         s.snapshot.writer_provider_token_remaining = token_remaining;
         s.snapshot.writer_provider_token_reset_after_seconds = reset_after_seconds;
     });
+}
+
+pub fn work_unit_state(total: usize, completed: usize, current: Option<&str>) {
+    with_state(|s| {
+        s.snapshot.work_units_total = total as u64;
+        s.snapshot.work_units_completed = completed as u64;
+        s.snapshot.current_work_unit = current.map(str::to_string);
+    });
+}
+
+pub fn work_unit_transition(completed: &str, next: Option<&str>) {
+    with_state(|s| {
+        s.snapshot.work_unit_transitions = s.snapshot.work_unit_transitions.saturating_add(1);
+        s.snapshot.work_units_completed = s.snapshot.work_units_completed.saturating_add(1);
+        s.snapshot.current_work_unit = next.map(str::to_string);
+    });
+    lifecycle_event(&format!("work_unit_completed:{completed}"));
+    lifecycle_event(next.map_or("work_unit_plan_complete", |_| "work_unit_advanced"));
+}
+
+pub fn work_unit_replanned() {
+    with_state(|s| {
+        s.snapshot.work_unit_replans = s.snapshot.work_unit_replans.saturating_add(1);
+    });
+    lifecycle_event("work_unit_replanned");
 }
 
 pub fn model_turn() {

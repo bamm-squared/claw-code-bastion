@@ -140,6 +140,8 @@ pub trait ToolExecutor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriterCheckpoint {
     Submit { message: Option<String> },
+    UnitComplete { message: Option<String> },
+    Replan { message: String },
     Blocked { message: String },
     NeedsUserInput { message: String },
 }
@@ -624,11 +626,11 @@ where
                     format!("[Checkpoint candidate-development checks]\n{diagnostics}\n\n")
                 });
                 let checkpoint_instruction = if pre_candidate && !finalization_checkpoint {
-                    "The isolated candidate is still unchanged from baseline. This is a context/resource checkpoint, not a submission. Do not submit an unchanged candidate or run project checks yet. Continue for only a short bounded window toward one concrete remaining implementation or discovery objective, then use candidate_checkpoint with submit after making a meaningful change, or blocked/needs_user_input if progress is not possible.\n\n"
+                    "The isolated candidate is still unchanged from baseline. This is a context/resource checkpoint, not a submission. Do not submit an unchanged candidate or run project checks yet. Continue for only a short bounded window toward one concrete remaining implementation or discovery objective, then use candidate_checkpoint with unit_complete when the current scheduled work unit is complete, submit only when all work units are resolved, or blocked/needs_user_input if progress is not possible.\n\n"
                 } else if pre_candidate {
                     "The bounded pre-mutation continuation is exhausted and the isolated candidate is still unchanged. Do not use submit to mean no changes; use candidate_checkpoint with blocked or needs_user_input to end explicitly.\n\n"
                 } else {
-                    "The bounded writer budget/resource boundary has been reached. Use the candidate_checkpoint tool now with submit, blocked, or needs_user_input. If checks reported failures, make only targeted repairs before checkpointing. Do not begin broad new work; submit the best coherent candidate or state what prevents completion.\n\n"
+                    "The bounded writer budget/resource boundary has been reached. Use candidate_checkpoint with unit_complete when the current scheduled work unit is complete, submit only when all planned work units are complete, replan when a material assumption is invalid, or blocked/needs_user_input when work cannot continue. If checks reported failures, make only targeted repairs before checkpointing.\n\n"
                 };
                 self.session
                     .push_message(ConversationMessage {
@@ -908,6 +910,12 @@ where
     #[must_use]
     pub fn checkpoint_reason(&self) -> Option<&str> {
         self.checkpoint_reason.as_deref()
+    }
+
+    /// Compact the persistent writer transcript at a completed work-unit
+    /// boundary without changing candidate or validation authority.
+    pub fn compact_for_work_unit(&mut self) -> Option<AutoCompactionEvent> {
+        self.compact_for_checkpoint()
     }
 
     pub fn apply_candidate_changes(

@@ -5686,6 +5686,7 @@ impl LiveCli {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn prepare_turn_runtime(
         &mut self,
         emit_output: bool,
@@ -5734,8 +5735,22 @@ impl LiveCli {
             }
         }
         let plan_text = format!(
-            "{}\n\n[Candidate development workflow]\nUse candidate_check for a bounded format, test, or clippy check after substantial edits or before candidate_checkpoint when useful. It runs only against the isolated candidate and provides development feedback; it never authorizes Review or Apply. Submit for trusted full validation when the candidate is coherent.",
+            "{}\n\n[Candidate development workflow]\nUse candidate_check for a bounded format, test, or clippy check after substantial edits or before candidate_checkpoint when useful. It runs only against the isolated candidate and provides development feedback; it never authorizes Review or Apply. Submit for trusted full validation when the candidate is coherent.\n\n[Work-unit workflow]\nWork on the current executable work unit first. When its objective and stated evidence are complete, use candidate_checkpoint with status unit_complete so the orchestrator can persist evidence, compact context, and advance to the next dependency-eligible unit. Use submit only when all planned work units are complete; use replan when a material assumption invalidates the current unit. Do not treat work-unit completion as semantic approval.",
             self.task_plan.render_for_writer()
+        );
+        benchmark_telemetry::work_unit_state(
+            self.task_plan.work_units.len(),
+            self.task_plan
+                .work_units
+                .iter()
+                .filter(|unit| {
+                    matches!(
+                        unit.status,
+                        task_plan::WorkUnitStatus::Completed | task_plan::WorkUnitStatus::Verified
+                    )
+                })
+                .count(),
+            self.task_plan.current_work_unit_id.as_deref(),
         );
         let pending_rework = self.pending_rework.take();
         let plan_text = pending_rework
@@ -5854,7 +5869,60 @@ impl LiveCli {
                 if let Some(checkpoint) = runtime.take_checkpoint() {
                     match checkpoint {
                         WriterCheckpoint::Submit { .. } => {
+                            if self.task_plan.has_unresolved_work_units() {
+                                self.task_plan.defer_submission_until_units_complete();
+                                benchmark_telemetry::lifecycle_event(
+                                    "work_unit_submission_deferred",
+                                );
+                                self.replace_runtime(runtime)?;
+                                return self.run_turn(input);
+                            }
                             benchmark_telemetry::lifecycle_event("writer_checkpoint_submit");
+                        }
+                        WriterCheckpoint::UnitComplete { message } => {
+                            let completed = self
+                                .task_plan
+                                .current_work_unit_id
+                                .clone()
+                                .unwrap_or_else(|| "unknown".to_string());
+                            let next = self.task_plan.complete_current_work_unit(
+                                message
+                                    .as_deref()
+                                    .unwrap_or("writer reported the work unit complete"),
+                            );
+                            benchmark_telemetry::work_unit_transition(&completed, next.as_deref());
+                            if self.task_plan.has_unresolved_work_units() {
+                                if let Some(compaction) = runtime.compact_for_work_unit() {
+                                    benchmark_telemetry::writer_checkpoint_context(
+                                        compaction.before_estimated_tokens,
+                                        compaction.after_estimated_tokens,
+                                        compaction.removed_message_count,
+                                    );
+                                }
+                                self.replace_runtime(runtime)?;
+                                return self.run_turn(input);
+                            }
+                            benchmark_telemetry::lifecycle_event("writer_checkpoint_submit");
+                        }
+                        WriterCheckpoint::Replan { message } => {
+                            if !self.task_plan.request_replan(&message) {
+                                let _ = runtime.finish_candidate()?;
+                                self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
+                                benchmark_telemetry::lifecycle_event("work_unit_replan_exhausted");
+                                self.replace_runtime(runtime)?;
+                                self.persist_session()?;
+                                return Ok(());
+                            }
+                            benchmark_telemetry::work_unit_replanned();
+                            if let Some(compaction) = runtime.compact_for_work_unit() {
+                                benchmark_telemetry::writer_checkpoint_context(
+                                    compaction.before_estimated_tokens,
+                                    compaction.after_estimated_tokens,
+                                    compaction.removed_message_count,
+                                );
+                            }
+                            self.replace_runtime(runtime)?;
+                            return self.run_turn(input);
                         }
                         WriterCheckpoint::Blocked { message }
                         | WriterCheckpoint::NeedsUserInput { message } => {
@@ -6308,6 +6376,7 @@ impl LiveCli {
                 &format!("{}: {}", finding.finding, finding.evidence),
             );
         }
+        self.task_plan.reconcile_work_units();
         self.record_requirement_coverage();
         println!("\nRequirement evaluation\n{}", active_evaluation.summary());
 
@@ -6341,7 +6410,10 @@ impl LiveCli {
             &active_evaluation,
         );
 
-        if !active_evaluation.allows_review() || !self.task_plan.all_contracts_verified() {
+        if !active_evaluation.allows_review()
+            || !self.task_plan.all_contracts_verified()
+            || !self.task_plan.all_work_units_resolved()
+        {
             let reason = if self.task_plan.all_contracts_verified() {
                 active_evaluation.error.as_deref().unwrap_or(
                     "independent semantic evaluation did not establish that all requirements are satisfied",
@@ -6555,7 +6627,9 @@ impl LiveCli {
                 Ok(_) => {
                     if let Some(checkpoint) = runtime.take_checkpoint() {
                         match checkpoint {
-                            WriterCheckpoint::Submit { .. } => {}
+                            WriterCheckpoint::Submit { .. }
+                            | WriterCheckpoint::UnitComplete { .. }
+                            | WriterCheckpoint::Replan { .. } => {}
                             WriterCheckpoint::Blocked { message }
                             | WriterCheckpoint::NeedsUserInput { message } => {
                                 let _ = runtime.finish_candidate()?;
@@ -12210,6 +12284,16 @@ impl CliToolExecutor {
             "submit" => WriterCheckpoint::Submit {
                 message: (!message.is_empty()).then_some(message),
             },
+            "unit_complete" => WriterCheckpoint::UnitComplete {
+                message: (!message.is_empty()).then_some(message),
+            },
+            "replan" => WriterCheckpoint::Replan {
+                message: if message.is_empty() {
+                    "the current work-unit assumption needs to be revisited".to_string()
+                } else {
+                    message
+                },
+            },
             "blocked" => WriterCheckpoint::Blocked {
                 message: if message.is_empty() {
                     "writer reported that the candidate is blocked".to_string()
@@ -12237,6 +12321,8 @@ impl CliToolExecutor {
         }
         let response_status = match &checkpoint {
             WriterCheckpoint::Submit { .. } => "submit",
+            WriterCheckpoint::UnitComplete { .. } => "unit_complete",
+            WriterCheckpoint::Replan { .. } => "replan",
             WriterCheckpoint::Blocked { .. } => "blocked",
             WriterCheckpoint::NeedsUserInput { .. } => "needs_user_input",
         };

@@ -13,6 +13,8 @@ const MAX_CONTRACTS: usize = 6;
 const MAX_IMPACT_LINES: usize = 4;
 const MAX_SCOPE_FILES: usize = 8;
 const MAX_SCOPE_GUIDANCE: usize = 8;
+const MAX_WORK_UNITS: usize = 5;
+const MAX_REPLANS: u8 = 2;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum PlanItemStatus {
@@ -138,6 +140,34 @@ pub enum PlanningMode {
     Milestone,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum WorkUnitStatus {
+    Pending,
+    Active,
+    Completed,
+    Blocked,
+    NeedsReplan,
+    Reopened,
+    Verified,
+    Dropped,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkUnit {
+    pub id: String,
+    pub objective: String,
+    pub contract_ids: Vec<String>,
+    pub fact_refs: Vec<String>,
+    pub likely_scope: Vec<String>,
+    pub dependencies: Vec<String>,
+    pub invariants: Vec<String>,
+    pub completion_evidence: String,
+    pub status: WorkUnitStatus,
+    pub provenance: String,
+    #[serde(default)]
+    pub evidence: String,
+}
+
 impl PlanningMode {
     #[must_use]
     pub fn label(self) -> &'static str {
@@ -168,6 +198,12 @@ pub struct TaskPlan {
     #[serde(default)]
     pub implementation_surface_guidance: Vec<String>,
     pub open_questions: Vec<String>,
+    #[serde(default)]
+    pub work_units: Vec<WorkUnit>,
+    #[serde(default)]
+    pub current_work_unit_id: Option<String>,
+    #[serde(default)]
+    pub replan_count: u8,
 }
 
 impl TaskPlan {
@@ -210,6 +246,20 @@ impl TaskPlan {
                 changed = true;
             }
         }
+        for unit in &mut self.work_units {
+            if matches!(
+                unit.status,
+                WorkUnitStatus::Completed | WorkUnitStatus::Verified
+            ) {
+                unit.status = WorkUnitStatus::Pending;
+                unit.evidence.clear();
+                unit.provenance =
+                    "candidate checkpoint restored; work-unit state must be reconfirmed"
+                        .to_string();
+                changed = true;
+            }
+        }
+        self.activate_next_work_unit();
         if changed {
             self.open_questions
                 .push("Reconfirm the plan against the restored candidate state.".to_string());
@@ -294,6 +344,11 @@ impl TaskPlan {
         } else {
             vec!["Confirm the selected repository relationships against exact source.".to_string()]
         };
+        self.repository_files.clear();
+        self.primary_repository_files.clear();
+        self.implementation_surface_guidance.clear();
+        self.replan_count = 0;
+        self.rebuild_work_units();
     }
 
     #[must_use]
@@ -344,6 +399,212 @@ impl TaskPlan {
             .take(MAX_SCOPE_GUIDANCE)
             .map(|line| truncate(line, MAX_STATEMENT_BYTES))
             .collect();
+        for unit in &mut self.work_units {
+            unit.fact_refs.clone_from(&self.repository_files);
+            unit.likely_scope = if self.primary_repository_files.is_empty() {
+                self.repository_files.clone()
+            } else {
+                self.primary_repository_files.clone()
+            };
+        }
+    }
+
+    fn rebuild_work_units(&mut self) {
+        let mut groups: Vec<Vec<&ExpectedContract>> = Vec::new();
+        if self.contracts.is_empty() {
+            groups.push(Vec::new());
+        } else if self.planning_mode() == PlanningMode::Minimal {
+            groups.push(self.contracts.iter().collect());
+        } else {
+            let mut grouped = vec![Vec::new(), Vec::new(), Vec::new()];
+            for contract in &self.contracts {
+                grouped[work_unit_group(&contract.verification_boundary)].push(contract);
+            }
+            groups.extend(grouped.into_iter().filter(|group| !group.is_empty()));
+        }
+
+        self.work_units = groups
+            .into_iter()
+            .take(MAX_WORK_UNITS)
+            .enumerate()
+            .map(|(index, contracts)| {
+                let id = format!("WU-{}", index + 1);
+                let contract_ids = contracts
+                    .iter()
+                    .map(|contract| contract.id.clone())
+                    .collect();
+                let invariants = contracts
+                    .iter()
+                    .filter(|contract| contract.basis != "user requirement")
+                    .map(|contract| contract.expectation.clone())
+                    .collect();
+                let objective = match index {
+                    0 => "Implement the core requested behavior and its public integration.".to_string(),
+                    1 => "Preserve compatibility, defaults, and explicit error behavior while integrating the change.".to_string(),
+                    _ => "Exercise the required behavioral boundaries and capture focused completion evidence.".to_string(),
+                };
+                let completion_evidence = if contracts.is_empty() {
+                    "A coherent candidate change and targeted development evidence for the requested behavior.".to_string()
+                } else {
+                    contracts
+                        .iter()
+                        .map(|contract| {
+                            format!(
+                                "{} at the {} boundary",
+                                contract.id,
+                                contract.verification_boundary.label()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                };
+                WorkUnit {
+                    id: id.clone(),
+                    objective,
+                    contract_ids,
+                    fact_refs: self.repository_files.clone(),
+                    likely_scope: if self.primary_repository_files.is_empty() {
+                        self.repository_files.clone()
+                    } else {
+                        self.primary_repository_files.clone()
+                    },
+                    dependencies: if index == 0 {
+                        Vec::new()
+                    } else {
+                        vec![format!("WU-{index}")]
+                    },
+                    invariants,
+                    completion_evidence,
+                    status: if index == 0 {
+                        WorkUnitStatus::Active
+                    } else {
+                        WorkUnitStatus::Pending
+                    },
+                    provenance: "derived from user contracts and deterministic repository map"
+                        .to_string(),
+                    evidence: String::new(),
+                }
+            })
+            .collect();
+        self.current_work_unit_id = self.work_units.first().map(|unit| unit.id.clone());
+    }
+
+    fn activate_next_work_unit(&mut self) -> Option<String> {
+        let next = self.work_units.iter().position(|unit| {
+            matches!(
+                unit.status,
+                WorkUnitStatus::Pending | WorkUnitStatus::Reopened
+            ) && unit.dependencies.iter().all(|dependency| {
+                self.work_units.iter().any(|candidate| {
+                    candidate.id == *dependency
+                        && matches!(
+                            candidate.status,
+                            WorkUnitStatus::Completed | WorkUnitStatus::Verified
+                        )
+                })
+            })
+        });
+        let Some(index) = next else {
+            self.current_work_unit_id = None;
+            return None;
+        };
+        self.work_units[index].status = WorkUnitStatus::Active;
+        self.current_work_unit_id = Some(self.work_units[index].id.clone());
+        Some(self.work_units[index].id.clone())
+    }
+
+    #[must_use]
+    pub fn current_work_unit(&self) -> Option<&WorkUnit> {
+        self.current_work_unit_id
+            .as_deref()
+            .and_then(|id| self.work_units.iter().find(|unit| unit.id == id))
+    }
+
+    #[must_use]
+    pub fn all_work_units_resolved(&self) -> bool {
+        self.work_units.is_empty()
+            || self.work_units.iter().all(|unit| {
+                matches!(
+                    unit.status,
+                    WorkUnitStatus::Completed | WorkUnitStatus::Verified | WorkUnitStatus::Dropped
+                )
+            })
+    }
+
+    #[must_use]
+    pub fn has_unresolved_work_units(&self) -> bool {
+        !self.all_work_units_resolved()
+    }
+
+    pub fn complete_current_work_unit(&mut self, evidence: &str) -> Option<String> {
+        let current_id = self.current_work_unit_id.clone()?;
+        let unit = self
+            .work_units
+            .iter_mut()
+            .find(|unit| unit.id == current_id)?;
+        unit.status = WorkUnitStatus::Completed;
+        unit.evidence = truncate(evidence, MAX_STATEMENT_BYTES);
+        unit.provenance =
+            "writer-reported work-unit completion; pending trusted whole-candidate review"
+                .to_string();
+        self.revision = self.revision.saturating_add(1);
+        self.activate_next_work_unit()
+    }
+
+    pub fn request_replan(&mut self, message: &str) -> bool {
+        if self.replan_count >= MAX_REPLANS {
+            return false;
+        }
+        self.replan_count = self.replan_count.saturating_add(1);
+        if let Some(id) = self.current_work_unit_id.clone() {
+            if let Some(unit) = self.work_units.iter_mut().find(|unit| unit.id == id) {
+                unit.status = WorkUnitStatus::NeedsReplan;
+                unit.provenance = truncate(message, MAX_STATEMENT_BYTES);
+            }
+        }
+        self.open_questions.push(format!(
+            "Work-unit replan {}: {}",
+            self.replan_count,
+            truncate(message, 160)
+        ));
+        self.open_questions.truncate(MAX_CONTRACTS);
+        if let Some(id) = self.current_work_unit_id.clone() {
+            if let Some(unit) = self.work_units.iter_mut().find(|unit| unit.id == id) {
+                unit.status = WorkUnitStatus::Active;
+            }
+        }
+        self.revision = self.revision.saturating_add(1);
+        true
+    }
+
+    pub fn defer_submission_until_units_complete(&mut self) {
+        self.open_questions.push(
+            "Writer requested whole-candidate submission before scheduled work units were resolved."
+                .to_string(),
+        );
+        self.open_questions.truncate(MAX_CONTRACTS);
+        self.revision = self.revision.saturating_add(1);
+    }
+
+    pub fn reconcile_work_units(&mut self) {
+        for unit in &mut self.work_units {
+            if !unit.contract_ids.is_empty()
+                && unit.contract_ids.iter().all(|id| {
+                    self.contracts.iter().any(|contract| {
+                        contract.id == *id && contract.status == ContractStatus::Verified
+                    })
+                })
+            {
+                unit.status = WorkUnitStatus::Verified;
+                if unit.evidence.is_empty() {
+                    unit.evidence =
+                        "All referenced requirement contracts independently verified.".to_string();
+                }
+            }
+        }
+        if self.all_work_units_resolved() {
+            self.current_work_unit_id = None;
+        }
     }
 
     pub fn record_candidate_evidence(&mut self, changed_paths: &[String]) {
@@ -420,6 +681,15 @@ impl TaskPlan {
             contract.status = ContractStatus::Unresolved;
             contract.evidence = truncate(&gap.reason, MAX_STATEMENT_BYTES);
         }
+        if let Some(unit) = self
+            .work_units
+            .iter_mut()
+            .find(|unit| unit.contract_ids.iter().any(|id| id == &gap.contract_id))
+        {
+            unit.status = WorkUnitStatus::Reopened;
+            unit.evidence = truncate(&gap.reason, MAX_STATEMENT_BYTES);
+            self.current_work_unit_id = Some(unit.id.clone());
+        }
         if !self
             .open_questions
             .iter()
@@ -495,6 +765,15 @@ impl TaskPlan {
             contract.status = ContractStatus::Unresolved;
             contract.evidence = truncate(reason, MAX_STATEMENT_BYTES);
         }
+        if let Some(unit) = self
+            .work_units
+            .iter_mut()
+            .find(|unit| unit.contract_ids.iter().any(|id| id == item_id))
+        {
+            unit.status = WorkUnitStatus::Reopened;
+            unit.evidence = truncate(reason, MAX_STATEMENT_BYTES);
+            self.current_work_unit_id = Some(unit.id.clone());
+        }
         self.open_questions.push(format!(
             "Evaluation follow-up for {item_id}: {}",
             truncate(reason, 160)
@@ -515,6 +794,13 @@ impl TaskPlan {
             contract.status = ContractStatus::Unresolved;
             contract.evidence = truncate(reason, MAX_STATEMENT_BYTES);
         }
+        for unit in &mut self.work_units {
+            if !matches!(unit.status, WorkUnitStatus::Dropped) {
+                unit.status = WorkUnitStatus::Reopened;
+                unit.evidence = truncate(reason, MAX_STATEMENT_BYTES);
+            }
+        }
+        self.current_work_unit_id = self.work_units.first().map(|unit| unit.id.clone());
         self.open_questions.push(format!(
             "Validation requires follow-up: {}",
             truncate(reason, 160)
@@ -571,6 +857,24 @@ impl TaskPlan {
                 output.push('\n');
             }
         }
+        if !self.work_units.is_empty() {
+            output.push_str("Executable work units:\n");
+            for unit in &self.work_units {
+                output.push_str("- ");
+                output.push_str(&unit.id);
+                output.push_str(": ");
+                output.push_str(&unit.objective);
+                output.push_str(" [");
+                output.push_str(work_unit_status_label(&unit.status));
+                output.push_str("]; contracts: ");
+                output.push_str(&unit.contract_ids.join(", "));
+                if !unit.dependencies.is_empty() {
+                    output.push_str("; depends on ");
+                    output.push_str(&unit.dependencies.join(", "));
+                }
+                output.push('\n');
+            }
+        }
         if !self.repository_files.is_empty() || !self.implementation_surface_guidance.is_empty() {
             output.push_str("Implementation scope hypothesis:\n");
             for path in &self.repository_files {
@@ -609,6 +913,7 @@ impl TaskPlan {
     /// evidence references while leaving exact source discovery to the normal
     /// repository tools.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn render_for_writer(&self) -> String {
         let mut output = String::from("[Task working map]\nMode: ");
         output.push_str(self.planning_mode().label());
@@ -637,6 +942,55 @@ impl TaskPlan {
             if !contract.evidence.is_empty() {
                 output.push_str("  evidence: ");
                 output.push_str(&contract.evidence);
+                output.push('\n');
+            }
+        }
+        if let Some(unit) = self.current_work_unit() {
+            output.push_str("Current executable work unit:\n");
+            output.push_str("- ");
+            output.push_str(&unit.id);
+            output.push_str(": ");
+            output.push_str(&unit.objective);
+            output.push_str(" [");
+            output.push_str(work_unit_status_label(&unit.status));
+            output.push_str("]\n  advances contracts: ");
+            output.push_str(&unit.contract_ids.join(", "));
+            output.push('\n');
+            if !unit.dependencies.is_empty() {
+                output.push_str("  completed dependencies: ");
+                output.push_str(&unit.dependencies.join(", "));
+                output.push('\n');
+            }
+            output.push_str("  completion evidence: ");
+            output.push_str(&unit.completion_evidence);
+            output.push('\n');
+            if !unit.likely_scope.is_empty() {
+                output.push_str("  likely scope: ");
+                output.push_str(&unit.likely_scope.join(", "));
+                output.push('\n');
+            }
+            if !unit.invariants.is_empty() {
+                output.push_str("  preserved invariants: ");
+                output.push_str(&unit.invariants.join("; "));
+                output.push('\n');
+            }
+        }
+        let completed = self
+            .work_units
+            .iter()
+            .filter(|unit| {
+                matches!(
+                    unit.status,
+                    WorkUnitStatus::Completed | WorkUnitStatus::Verified
+                )
+            })
+            .map(|unit| format!("{} completed: {}", unit.id, unit.evidence))
+            .collect::<Vec<_>>();
+        if !completed.is_empty() {
+            output.push_str("Completed work-unit summaries:\n");
+            for summary in completed.iter().take(MAX_WORK_UNITS) {
+                output.push_str("- ");
+                output.push_str(summary);
                 output.push('\n');
             }
         }
@@ -825,6 +1179,30 @@ fn status_label(status: &PlanItemStatus) -> &'static str {
     }
 }
 
+fn work_unit_status_label(status: &WorkUnitStatus) -> &'static str {
+    match status {
+        WorkUnitStatus::Pending => "pending",
+        WorkUnitStatus::Active => "active",
+        WorkUnitStatus::Completed => "completed, pending review",
+        WorkUnitStatus::Blocked => "blocked",
+        WorkUnitStatus::NeedsReplan => "replan required",
+        WorkUnitStatus::Reopened => "reopened",
+        WorkUnitStatus::Verified => "verified",
+        WorkUnitStatus::Dropped => "dropped",
+    }
+}
+
+fn work_unit_group(boundary: &VerificationBoundary) -> usize {
+    match boundary {
+        VerificationBoundary::Compatibility | VerificationBoundary::ErrorPath => 1,
+        VerificationBoundary::ProcessInteraction | VerificationBoundary::Persistence => 2,
+        VerificationBoundary::UnitBehavior
+        | VerificationBoundary::PublicApi
+        | VerificationBoundary::StateTransition
+        | VerificationBoundary::Integration => 0,
+    }
+}
+
 fn truncate(value: &str, limit: usize) -> String {
     value.chars().take(limit).collect()
 }
@@ -974,6 +1352,10 @@ mod tests {
         plan.reopen_for_completion_audit(&gaps[0]);
         assert_eq!(plan.contracts[0].status, ContractStatus::Unresolved);
         assert_eq!(plan.items[0].status, PlanItemStatus::NeedsResearch);
+        assert_eq!(
+            plan.current_work_unit().map(|unit| unit.status.clone()),
+            Some(WorkUnitStatus::Reopened)
+        );
         assert!(plan.render().contains("Completion evidence follow-up"));
     }
 
@@ -1053,5 +1435,79 @@ mod tests {
         assert_eq!(plan.contracts[0].status, ContractStatus::Unresolved);
         assert_eq!(plan.items[0].status, PlanItemStatus::NeedsResearch);
         assert_eq!(plan.items[0].provenance, "helper test only");
+    }
+
+    #[test]
+    fn small_task_uses_one_work_unit_without_decomposition() {
+        let plan = TaskPlan::from_request("Fix one local behavior.", None);
+        assert_eq!(plan.planning_mode(), PlanningMode::Minimal);
+        assert_eq!(plan.work_units.len(), 1);
+        assert_eq!(
+            plan.current_work_unit().map(|unit| unit.id.as_str()),
+            Some("WU-1")
+        );
+    }
+
+    #[test]
+    fn medium_task_groups_contracts_into_dependency_ordered_work_units() {
+        let plan = TaskPlan::from_request(
+            "Update the API. Preserve compatibility. Handle invalid input. Add integration tests.",
+            Some("src/api.rs\ntests/api.rs\nreferences: src/error.rs"),
+        );
+        assert!(plan.work_units.len() >= 2);
+        assert_eq!(plan.work_units[0].status, WorkUnitStatus::Active);
+        for pair in plan.work_units.windows(2) {
+            assert_eq!(pair[1].dependencies, vec![pair[0].id.clone()]);
+        }
+        assert!(plan
+            .render_for_writer()
+            .contains("Current executable work unit"));
+    }
+
+    #[test]
+    fn completing_a_unit_advances_without_rebuilding_candidate_plan() {
+        let mut plan = TaskPlan::from_request(
+            "Update the API. Preserve compatibility. Handle invalid input.",
+            Some("src/api.rs\ntests/api.rs\nreferences: src/error.rs"),
+        );
+        let first = plan.current_work_unit_id.clone().expect("first unit");
+        let next = plan.complete_current_work_unit("changed API implementation");
+        assert!(next.is_some());
+        assert_eq!(plan.work_units[0].status, WorkUnitStatus::Completed);
+        assert_ne!(plan.current_work_unit_id.as_deref(), Some(first.as_str()));
+        assert!(plan.render_for_writer().contains("completed:"));
+    }
+
+    #[test]
+    fn evaluator_finding_reopens_only_the_responsible_work_unit() {
+        let mut plan = TaskPlan::from_request(
+            "Update the API. Preserve compatibility. Handle invalid input.",
+            Some("src/api.rs\ntests/api.rs\nreferences: src/error.rs"),
+        );
+        let target = plan
+            .work_units
+            .iter()
+            .find(|unit| unit.contract_ids.iter().any(|id| id == "contract-2"))
+            .map(|unit| unit.id.clone())
+            .expect("compatibility unit");
+        plan.reopen_for_evaluation("contract-2", "legacy caller is not covered");
+        assert_eq!(plan.current_work_unit_id.as_deref(), Some(target.as_str()));
+        assert_eq!(
+            plan.work_units
+                .iter()
+                .find(|unit| unit.id == target)
+                .map(|unit| &unit.status),
+            Some(&WorkUnitStatus::Reopened)
+        );
+    }
+
+    #[test]
+    fn replan_is_bounded_and_does_not_drop_candidate_plan_state() {
+        let mut plan = TaskPlan::from_request("Update the API. Preserve compatibility.", None);
+        assert!(plan.request_replan("the selected implementation surface was a mirror"));
+        assert!(plan.request_replan("the dependency assumption was incomplete"));
+        assert!(!plan.request_replan("third replan would expand without bound"));
+        assert_eq!(plan.replan_count, 2);
+        assert!(!plan.work_units.is_empty());
     }
 }
