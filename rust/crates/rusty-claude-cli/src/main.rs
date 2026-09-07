@@ -4106,6 +4106,7 @@ struct LiveCli {
     repository_map_cache: Option<RepositoryMapCache>,
     checkpoint_store: runtime::CandidateCheckpointStore,
     work_unit_no_change_attempts: u8,
+    work_unit_completion_rejections: u8,
     work_unit_continuation_objective: Option<String>,
 }
 
@@ -4254,6 +4255,22 @@ impl BuiltRuntime {
         self.runtime
             .as_ref()
             .and_then(|runtime| runtime.tool_executor().candidate_review_roots())
+    }
+
+    fn set_work_unit_completion_context(&mut self, context: Option<String>) {
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime
+                .tool_executor_mut()
+                .set_work_unit_completion_context(context);
+        }
+    }
+
+    fn take_work_unit_completion_feedback(&mut self) -> Option<String> {
+        self.runtime.as_mut().and_then(|runtime| {
+            runtime
+                .tool_executor_mut()
+                .take_work_unit_completion_feedback()
+        })
     }
 }
 
@@ -5261,6 +5278,7 @@ impl LiveCli {
             repository_map_cache: None,
             checkpoint_store,
             work_unit_no_change_attempts: 0,
+            work_unit_completion_rejections: 0,
             work_unit_continuation_objective: None,
         };
         cli.persist_session()?;
@@ -5273,6 +5291,7 @@ impl LiveCli {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn route_writer_for_current_task(&mut self) {
         orchestration_trace("writer_routing_started");
         if let Some(profile) = self.rework_profile.clone() {
@@ -5284,6 +5303,28 @@ impl LiveCli {
             ));
             orchestration_trace(format!("writer_profile_selected profile={}", profile.id));
             return;
+        }
+        if !self.escalation_requested {
+            if let Some(profile) = self.selected_writer_profile.clone() {
+                self.model.clone_from(&profile.model);
+                self.last_routing_explanation = Some(format!(
+                    "Writer continuation reuses the selected profile {}.",
+                    profile.id
+                ));
+                orchestration_trace(format!("writer_profile_reused profile={}", profile.id));
+                return;
+            }
+        }
+        if !self.escalation_requested {
+            if let Some(profile) = self.selected_writer_profile.clone() {
+                self.model.clone_from(&profile.model);
+                self.last_routing_explanation = Some(format!(
+                    "Writer continuation reuses the selected profile {}.",
+                    profile.id
+                ));
+                orchestration_trace(format!("writer_profile_reused profile={}", profile.id));
+                return;
+            }
         }
         if self.routing_policy.disable_automatic
             && self.explicit_writer_profile.is_none()
@@ -5343,11 +5384,26 @@ impl LiveCli {
         self.last_routing_explanation = Some(decision.reason.clone());
         record_writer_routing(&decision);
         if decision.selected.is_none() {
-            self.rework_blocked = Some(if self.escalation_requested {
-                "REWORK REQUIRES STRONGER MODEL; NO ELIGIBLE CONFIGURED PROFILE AVAILABLE"
-                    .to_string()
-            } else {
+            let rejection_details = decision
+                .rejections
+                .iter()
+                .map(|rejection| format!("{}: {}", rejection.profile_id, rejection.reason))
+                .collect::<Vec<_>>();
+            let diagnostic = if rejection_details.is_empty() {
                 decision.reason.clone()
+            } else {
+                format!(
+                    "{} Considered profiles: {}",
+                    decision.reason,
+                    rejection_details.join("; ")
+                )
+            };
+            self.rework_blocked = Some(if self.escalation_requested {
+                format!(
+                    "REWORK REQUIRES STRONGER MODEL; NO ELIGIBLE CONFIGURED PROFILE AVAILABLE. {diagnostic}"
+                )
+            } else {
+                diagnostic
             });
             return;
         }
@@ -5608,12 +5664,16 @@ impl LiveCli {
     fn prepare_exploration(&mut self, input: &str) {
         orchestration_trace("exploration_started");
         if self.exploration_input.as_deref() != Some(input) && self.pending_rework.is_none() {
+            self.selected_writer_profile = None;
             self.selected_evaluator_profile = None;
             self.evaluator_routing_signals = None;
             self.completion_audit_cycles = 0;
             self.completion_audit_pending = false;
             self.completion_audit_candidate_id = None;
             self.repository_map_cache = None;
+            self.work_unit_no_change_attempts = 0;
+            self.work_unit_completion_rejections = 0;
+            self.work_unit_continuation_objective = None;
         }
         if self.exploration_input.as_deref() == Some(input) || self.pending_rework.is_some() {
             return;
@@ -5817,6 +5877,10 @@ impl LiveCli {
         )
         .with_context_checkpoint_tokens(WRITER_CONTEXT_CHECKPOINT_TOKENS)
         .with_hook_abort_signal(hook_abort_signal.clone());
+        let mut runtime = runtime;
+        runtime.set_work_unit_completion_context(
+            self.task_plan.current_work_unit_completion_context(),
+        );
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
 
         Ok((runtime, hook_abort_monitor))
@@ -5882,6 +5946,19 @@ impl LiveCli {
                 if runtime.checkpoint_candidate_check_ran() {
                     benchmark_telemetry::writer_checkpoint_candidate_check();
                 }
+                let completion_feedback_received =
+                    if let Some(feedback) = runtime.take_work_unit_completion_feedback() {
+                        self.task_plan
+                            .record_work_unit_completion_feedback(&feedback);
+                        self.work_unit_completion_rejections =
+                            self.work_unit_completion_rejections.saturating_add(1);
+                        benchmark_telemetry::lifecycle_event(
+                            "work_unit_completion_reconciliation_feedback",
+                        );
+                        true
+                    } else {
+                        false
+                    };
                 if let Some(checkpoint) = runtime.take_checkpoint() {
                     match checkpoint {
                         WriterCheckpoint::Submit { .. } => {
@@ -5905,8 +5982,8 @@ impl LiveCli {
                             if requires_candidate_change && !candidate_changed {
                                 self.work_unit_no_change_attempts =
                                     self.work_unit_no_change_attempts.saturating_add(1);
-                                self.task_plan.defer_current_work_unit_completion(
-                                    "unit_complete was requested before a meaningful candidate mutation",
+                                self.task_plan.record_work_unit_completion_feedback(
+                                    "status=incomplete; unresolved=[{category: candidate_mutation_missing, reason: unit_complete was requested before a meaningful candidate mutation}]",
                                 );
                                 benchmark_telemetry::lifecycle_event(
                                     "work_unit_completion_deferred_without_candidate",
@@ -5926,6 +6003,7 @@ impl LiveCli {
                                 return self.run_turn(input);
                             }
                             self.work_unit_no_change_attempts = 0;
+                            self.work_unit_completion_rejections = 0;
                             let completed = self
                                 .task_plan
                                 .current_work_unit_id
@@ -5936,6 +6014,8 @@ impl LiveCli {
                                     .as_deref()
                                     .unwrap_or("writer reported the work unit complete"),
                             );
+                            self.task_plan
+                                .clear_work_unit_completion_feedback(&completed);
                             benchmark_telemetry::work_unit_transition(&completed, next.as_deref());
                             if self.task_plan.has_unresolved_work_units() {
                                 if let Some(compaction) = runtime.compact_for_work_unit() {
@@ -5961,7 +6041,25 @@ impl LiveCli {
                                 self.persist_session()?;
                                 return Ok(());
                             }
-                            self.work_unit_continuation_objective = Some(objective);
+                            if completion_feedback_received
+                                && self.work_unit_completion_rejections >= 2
+                            {
+                                let _ = runtime.finish_candidate()?;
+                                self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
+                                benchmark_telemetry::lifecycle_event(
+                                    "work_unit_completion_reconciliation_exhausted",
+                                );
+                                self.replace_runtime(runtime)?;
+                                self.persist_session()?;
+                                return Ok(());
+                            }
+                            self.work_unit_continuation_objective = Some(
+                                if objective.trim().is_empty() {
+                                    "Resolve the structured completion deficiencies for the current work unit before reporting unit_complete again.".to_string()
+                                } else {
+                                    objective
+                                },
+                            );
                             benchmark_telemetry::lifecycle_event(
                                 "work_unit_bounded_continuation_granted",
                             );
@@ -6809,8 +6907,20 @@ impl LiveCli {
         }
         for finding in &evaluation.requirements {
             if finding.state != requirement_evaluator::RequirementState::Satisfied {
+                let responsible_unit = self
+                    .task_plan
+                    .work_units
+                    .iter()
+                    .find(|unit| unit.contract_ids.contains(&finding.requirement_id))
+                    .map(|unit| unit.id.clone());
                 self.task_plan
                     .reopen_for_evaluation(&finding.requirement_id, &finding.finding);
+                orchestration_trace(format!(
+                    "work_unit_reopened_for_evaluation:{}:{}",
+                    responsible_unit.as_deref().unwrap_or("unmapped"),
+                    finding.requirement_id
+                ));
+                benchmark_telemetry::lifecycle_event("work_unit_reopened_for_evaluation");
             }
         }
         self.rework_cycles = self.rework_cycles.saturating_add(1);
@@ -12080,6 +12190,8 @@ struct CliToolExecutor {
     tool_registry: GlobalToolRegistry,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     pending_checkpoint: Option<WriterCheckpoint>,
+    work_unit_completion_context: Option<String>,
+    work_unit_completion_feedback: Option<String>,
 }
 
 impl CliToolExecutor {
@@ -12096,7 +12208,17 @@ impl CliToolExecutor {
             tool_registry,
             mcp_state,
             pending_checkpoint: None,
+            work_unit_completion_context: None,
+            work_unit_completion_feedback: None,
         }
+    }
+
+    fn set_work_unit_completion_context(&mut self, context: Option<String>) {
+        self.work_unit_completion_context = context;
+    }
+
+    fn take_work_unit_completion_feedback(&mut self) -> Option<String> {
+        self.work_unit_completion_feedback.take()
     }
 
     fn execution_backend(&self) -> Option<Arc<Mutex<dyn ExecutionBackend>>> {
@@ -12334,6 +12456,7 @@ impl CliToolExecutor {
 }
 
 impl CliToolExecutor {
+    #[allow(clippy::too_many_lines)]
     fn execute_candidate_checkpoint(&mut self, value: &Value) -> Result<String, ToolError> {
         let status = value
             .get("status")
@@ -12363,9 +12486,50 @@ impl CliToolExecutor {
                             .and_then(Value::as_str)
                             .map(str::to_owned)
                     });
-            if check_status.as_deref() == Some("fail") {
+            if check_status.as_deref() != Some("pass") {
                 benchmark_telemetry::lifecycle_event("work_unit_completion_check_failed");
-                return Ok(diagnostics);
+                let category = serde_json::from_str::<Value>(&diagnostics).ok().map_or(
+                    "candidate_check_failure",
+                    |report| {
+                        let status = report.get("status").and_then(Value::as_str);
+                        let diagnostic = report
+                            .get("diagnostic")
+                            .and_then(Value::as_str)
+                            .or_else(|| report.get("message").and_then(Value::as_str));
+                        let infrastructure = status.is_some_and(|value| {
+                            matches!(value, "infrastructure_error" | "unavailable" | "timeout")
+                        }) || diagnostic.is_some_and(|value| {
+                            let value = value.to_ascii_lowercase();
+                            value.contains("infrastructure")
+                                || value.contains("unavailable")
+                                || value.contains("timed out")
+                        });
+                        if infrastructure {
+                            "infrastructure_evidence_unavailable"
+                        } else {
+                            "candidate_check_failure"
+                        }
+                    },
+                );
+                let feedback = json!({
+                    "work_unit": self
+                        .work_unit_completion_context
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                    "status": "incomplete",
+                    "unresolved": [{
+                        "id": "candidate-development-check",
+                        "category": category,
+                        "reason": "the declared unit completion evidence is not established by the candidate development check",
+                        "evidence": diagnostics,
+                    }],
+                })
+                .to_string();
+                self.work_unit_completion_feedback = Some(feedback.clone());
+                self.pending_checkpoint = Some(WriterCheckpoint::BoundedContinue {
+                    objective: "Resolve the structured completion deficiencies for the current work unit before reporting unit_complete again.".to_string(),
+                });
+                return Ok(feedback);
             }
         }
         let checkpoint = match status {

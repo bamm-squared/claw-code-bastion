@@ -564,6 +564,43 @@ impl TaskPlan {
         self.revision = self.revision.saturating_add(1);
     }
 
+    pub fn record_work_unit_completion_feedback(&mut self, feedback: &str) {
+        let unit_id = self
+            .current_work_unit_id
+            .as_deref()
+            .unwrap_or("unknown")
+            .to_string();
+        let prefix = format!("Work unit {unit_id} completion reconciliation:");
+        self.open_questions
+            .retain(|question| !question.starts_with(&prefix));
+        self.open_questions.push(format!(
+            "{prefix} {}",
+            truncate(feedback, MAX_STATEMENT_BYTES)
+        ));
+        self.open_questions.truncate(MAX_CONTRACTS);
+        self.revision = self.revision.saturating_add(1);
+    }
+
+    pub fn clear_work_unit_completion_feedback(&mut self, unit_id: &str) {
+        let prefix = format!("Work unit {unit_id} completion reconciliation:");
+        self.open_questions
+            .retain(|question| !question.starts_with(&prefix));
+    }
+
+    #[must_use]
+    pub fn current_work_unit_completion_context(&self) -> Option<String> {
+        let unit = self.current_work_unit()?;
+        Some(format!(
+            "work_unit={} objective={} contracts={:?} completion_evidence={} requires_candidate_change={} invariants={:?}",
+            unit.id,
+            unit.objective,
+            unit.contract_ids,
+            unit.completion_evidence,
+            unit.requires_candidate_change,
+            unit.invariants,
+        ))
+    }
+
     pub fn request_replan(&mut self, message: &str) -> bool {
         if self.replan_count >= MAX_REPLANS {
             return false;
@@ -992,6 +1029,17 @@ impl TaskPlan {
             if !unit.invariants.is_empty() {
                 output.push_str("  preserved invariants: ");
                 output.push_str(&unit.invariants.join("; "));
+                output.push('\n');
+            }
+            let prefix = format!("Work unit {} completion reconciliation:", unit.id);
+            if let Some(feedback) = self
+                .open_questions
+                .iter()
+                .rev()
+                .find(|question| question.starts_with(&prefix))
+            {
+                output.push_str("  unresolved completion feedback: ");
+                output.push_str(feedback);
                 output.push('\n');
             }
         }
@@ -1539,6 +1587,27 @@ mod tests {
             plan.current_work_unit().unwrap().status,
             WorkUnitStatus::Active
         );
+    }
+
+    #[test]
+    fn completion_reconciliation_feedback_is_visible_and_replaceable() {
+        let mut plan = TaskPlan::from_request(
+            "Implement the behavior. Preserve compatibility. Add focused tests.",
+            Some("src/lib.rs\ntests/lib.rs"),
+        );
+        plan.record_work_unit_completion_feedback(
+            r#"{"status":"incomplete","unresolved":[{"id":"candidate-development-check","category":"infrastructure_evidence_unavailable"}]}"#,
+        );
+        let packet = plan.render_for_writer();
+        assert!(packet.contains("unresolved completion feedback"));
+        assert!(packet.contains("infrastructure_evidence_unavailable"));
+
+        plan.record_work_unit_completion_feedback(
+            r#"{"status":"incomplete","unresolved":[{"id":"focused-test","category":"candidate_check_failure"}]}"#,
+        );
+        let packet = plan.render_for_writer();
+        assert!(!packet.contains("infrastructure_evidence_unavailable"));
+        assert!(packet.contains("candidate_check_failure"));
     }
 
     #[test]
