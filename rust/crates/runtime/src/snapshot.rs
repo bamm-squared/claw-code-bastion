@@ -589,7 +589,7 @@ fn build_manifest(root: &Path) -> io::Result<BaselineManifest> {
             .strip_prefix(root)
             .map_err(io::Error::other)?
             .to_path_buf();
-        if relative.as_os_str().is_empty() || is_git_path(&relative) {
+        if relative.as_os_str().is_empty() || is_ignored_snapshot_path(&relative) {
             continue;
         }
         let entry = entry_for(item.path(), &relative)?;
@@ -646,7 +646,7 @@ fn copy_tree(source: &Path, destination: &Path, root: &Path) -> io::Result<()> {
     for item in WalkDir::new(source).follow_links(false) {
         let item = item.map_err(|e| io::Error::other(e.to_string()))?;
         let relative = item.path().strip_prefix(source).map_err(io::Error::other)?;
-        if relative.as_os_str().is_empty() || is_git_path(relative) {
+        if relative.as_os_str().is_empty() || is_ignored_snapshot_path(relative) {
             continue;
         }
         copy_entry(item.path(), &destination.join(relative), root)?;
@@ -714,6 +714,28 @@ fn is_git_path(path: &Path) -> bool {
     path.components()
         .next()
         .is_some_and(|component| matches!(component, Component::Normal(value) if value == ".git"))
+}
+
+fn is_ignored_snapshot_path(path: &Path) -> bool {
+    is_git_path(path)
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::Normal(value)
+                    if matches!(
+                        value.to_str(),
+                        Some(
+                            ".claw"
+                            | ".local"
+                            | ".acceptance-config"
+                            | "target"
+                            | "node_modules"
+                            | "__pycache__"
+                            | ".pytest_cache",
+                        )
+                    )
+            )
+        })
 }
 fn unique_stamp() -> u128 {
     SystemTime::now()
@@ -811,6 +833,23 @@ mod tests {
         let changes = task.scan().unwrap();
         assert_eq!(changes.changes.len(), 1);
         assert_eq!(changes.changes[0].path(), Path::new("a.txt"));
+        task.discard().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn operational_candidate_artifacts_are_not_product_changes() {
+        let root = temp("operational-artifacts");
+        fs::write(root.join("a.txt"), "a").unwrap();
+        let task = create_disposable_snapshot(&root).unwrap();
+        fs::create_dir_all(task.candidate.root.join("target/debug")).unwrap();
+        fs::write(task.candidate.root.join("target/debug/generated"), "build").unwrap();
+        fs::create_dir_all(task.candidate.root.join(".claw")).unwrap();
+        fs::write(task.candidate.root.join(".claw/session.json"), "runtime").unwrap();
+
+        let changes = task.scan().unwrap();
+
+        assert!(changes.changes.is_empty());
         task.discard().unwrap();
         fs::remove_dir_all(root).unwrap();
     }
