@@ -4105,6 +4105,7 @@ struct LiveCli {
     exploration_context: Option<String>,
     repository_map_cache: Option<RepositoryMapCache>,
     checkpoint_store: runtime::CandidateCheckpointStore,
+    work_unit_no_change_attempts: u8,
 }
 
 #[derive(Clone)]
@@ -5258,6 +5259,7 @@ impl LiveCli {
             exploration_context: None,
             repository_map_cache: None,
             checkpoint_store,
+            work_unit_no_change_attempts: 0,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -5735,7 +5737,7 @@ impl LiveCli {
             }
         }
         let plan_text = format!(
-            "{}\n\n[Candidate development workflow]\nUse candidate_check for a bounded format, test, or clippy check after substantial edits or before candidate_checkpoint when useful. It runs only against the isolated candidate and provides development feedback; it never authorizes Review or Apply. Submit for trusted full validation when the candidate is coherent.\n\n[Work-unit workflow]\nWork on the current executable work unit first. When its objective and stated evidence are complete, use candidate_checkpoint with status unit_complete so the orchestrator can persist evidence, compact context, and advance to the next dependency-eligible unit. Use submit only when all planned work units are complete; use replan when a material assumption invalidates the current unit. Do not treat work-unit completion as semantic approval.",
+            "{}\n\n[Candidate development workflow]\nUse candidate_check for a bounded format, test, or clippy check after substantial edits or before candidate_checkpoint when useful. It runs only against the isolated candidate and provides development feedback; it never authorizes Review or Apply. Submit for trusted full validation when the candidate is coherent. If a check reports infrastructure_error, do not edit code to repair the environment.\n\n[Work-unit workflow]\nWork on the current executable work unit first. Use the supplied objective, scope, dependencies, and completion evidence as the unit contract. For an implementation unit, make a meaningful candidate mutation before requesting unit_complete; repeated repository inspection alone is not unit completion. When the objective and evidence are complete, use candidate_checkpoint with status unit_complete so the orchestrator can persist evidence, compact context, and advance to the next dependency-eligible unit. Use submit only when all planned work units are complete; use replan when a material assumption invalidates the current unit. Do not treat work-unit completion as semantic approval.",
             self.task_plan.render_for_writer()
         );
         benchmark_telemetry::work_unit_state(
@@ -5798,7 +5800,10 @@ impl LiveCli {
         } else {
             runtime.with_repository_context(plan_text)
         }
-        .with_writer_checkpoint_policy(writer_iteration_budget(self.task_plan.planning_mode()), 1)
+        .with_writer_checkpoint_policy(
+            work_unit_iteration_budget(self.task_plan.planning_mode()),
+            1,
+        )
         .with_context_checkpoint_tokens(WRITER_CONTEXT_CHECKPOINT_TOKENS)
         .with_hook_abort_signal(hook_abort_signal.clone());
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
@@ -5880,6 +5885,36 @@ impl LiveCli {
                             benchmark_telemetry::lifecycle_event("writer_checkpoint_submit");
                         }
                         WriterCheckpoint::UnitComplete { message } => {
+                            let requires_candidate_change = self
+                                .task_plan
+                                .current_work_unit()
+                                .is_some_and(|unit| unit.requires_candidate_change);
+                            let candidate_changed =
+                                runtime.candidate_has_changes()?.unwrap_or(true);
+                            if requires_candidate_change && !candidate_changed {
+                                self.work_unit_no_change_attempts =
+                                    self.work_unit_no_change_attempts.saturating_add(1);
+                                self.task_plan.defer_current_work_unit_completion(
+                                    "unit_complete was requested before a meaningful candidate mutation",
+                                );
+                                benchmark_telemetry::lifecycle_event(
+                                    "work_unit_completion_deferred_without_candidate",
+                                );
+                                if self.work_unit_no_change_attempts >= 2 {
+                                    let _ = runtime.finish_candidate()?;
+                                    self.candidate_state =
+                                        CandidateLifecycleState::EvaluationBlocked;
+                                    benchmark_telemetry::lifecycle_event(
+                                        "work_unit_completion_blocked_without_candidate",
+                                    );
+                                    self.replace_runtime(runtime)?;
+                                    self.persist_session()?;
+                                    return Ok(());
+                                }
+                                self.replace_runtime(runtime)?;
+                                return self.run_turn(input);
+                            }
+                            self.work_unit_no_change_attempts = 0;
                             let completed = self
                                 .task_plan
                                 .current_work_unit_id
@@ -5905,6 +5940,7 @@ impl LiveCli {
                             benchmark_telemetry::lifecycle_event("writer_checkpoint_submit");
                         }
                         WriterCheckpoint::Replan { message } => {
+                            self.work_unit_no_change_attempts = 0;
                             if !self.task_plan.request_replan(&message) {
                                 let _ = runtime.finish_candidate()?;
                                 self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
@@ -12280,6 +12316,28 @@ impl CliToolExecutor {
             .chars()
             .take(4_000)
             .collect::<String>();
+        if status == "unit_complete" && self.candidate_review_roots().is_some() {
+            let diagnostics = self
+                .tool_registry
+                .candidate_development_check(&json!({
+                    "checks": ["format", "test", "clippy"],
+                    "timeout_ms": 120_000_u64,
+                }))
+                .map_err(ToolError::new)?;
+            let check_status =
+                serde_json::from_str::<Value>(&diagnostics)
+                    .ok()
+                    .and_then(|report| {
+                        report
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    });
+            if check_status.as_deref() == Some("fail") {
+                benchmark_telemetry::lifecycle_event("work_unit_completion_check_failed");
+                return Ok(diagnostics);
+            }
+        }
         let checkpoint = match status {
             "submit" => WriterCheckpoint::Submit {
                 message: (!message.is_empty()).then_some(message),
@@ -12341,6 +12399,14 @@ fn writer_iteration_budget(mode: task_plan::PlanningMode) -> usize {
         task_plan::PlanningMode::Minimal => 12,
         task_plan::PlanningMode::Standard => 20,
         task_plan::PlanningMode::Milestone => 40,
+    }
+}
+
+fn work_unit_iteration_budget(mode: task_plan::PlanningMode) -> usize {
+    match mode {
+        task_plan::PlanningMode::Minimal => 8,
+        task_plan::PlanningMode::Standard => 10,
+        task_plan::PlanningMode::Milestone => 12,
     }
 }
 

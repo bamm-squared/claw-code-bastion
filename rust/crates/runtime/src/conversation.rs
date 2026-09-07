@@ -897,6 +897,12 @@ where
             .map_err(|error| RuntimeError::new(error.to_string()))
     }
 
+    pub fn candidate_has_changes(&mut self) -> Result<Option<bool>, RuntimeError> {
+        self.tool_executor
+            .candidate_has_changes()
+            .map_err(|error| RuntimeError::new(error.to_string()))
+    }
+
     /// Take the explicit writer checkpoint captured during the last turn.
     pub fn take_checkpoint(&mut self) -> Option<WriterCheckpoint> {
         self.checkpoint.take()

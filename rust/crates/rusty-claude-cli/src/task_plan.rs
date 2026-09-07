@@ -162,6 +162,8 @@ pub struct WorkUnit {
     pub dependencies: Vec<String>,
     pub invariants: Vec<String>,
     pub completion_evidence: String,
+    #[serde(default)]
+    pub requires_candidate_change: bool,
     pub status: WorkUnitStatus,
     pub provenance: String,
     #[serde(default)]
@@ -444,7 +446,7 @@ impl TaskPlan {
                     _ => "Exercise the required behavioral boundaries and capture focused completion evidence.".to_string(),
                 };
                 let completion_evidence = if contracts.is_empty() {
-                    "A coherent candidate change and targeted development evidence for the requested behavior.".to_string()
+                    "For this implementation unit, make a meaningful candidate change and obtain targeted development evidence for the requested behavior.".to_string()
                 } else {
                     contracts
                         .iter()
@@ -458,6 +460,7 @@ impl TaskPlan {
                         .collect::<Vec<_>>()
                         .join("; ")
                 };
+                let requires_candidate_change = true;
                 WorkUnit {
                     id: id.clone(),
                     objective,
@@ -475,6 +478,7 @@ impl TaskPlan {
                     },
                     invariants,
                     completion_evidence,
+                    requires_candidate_change,
                     status: if index == 0 {
                         WorkUnitStatus::Active
                     } else {
@@ -549,6 +553,15 @@ impl TaskPlan {
                 .to_string();
         self.revision = self.revision.saturating_add(1);
         self.activate_next_work_unit()
+    }
+
+    pub fn defer_current_work_unit_completion(&mut self, reason: &str) {
+        self.open_questions.push(format!(
+            "Current work unit completion deferred: {}",
+            truncate(reason, MAX_STATEMENT_BYTES)
+        ));
+        self.open_questions.truncate(MAX_CONTRACTS);
+        self.revision = self.revision.saturating_add(1);
     }
 
     pub fn request_replan(&mut self, message: &str) -> bool {
@@ -963,6 +976,13 @@ impl TaskPlan {
             }
             output.push_str("  completion evidence: ");
             output.push_str(&unit.completion_evidence);
+            output.push('\n');
+            output.push_str("  implementation evidence required: ");
+            output.push_str(if unit.requires_candidate_change {
+                "meaningful candidate mutation before unit_complete"
+            } else {
+                "a bounded repository fact or decision before unit_complete"
+            });
             output.push('\n');
             if !unit.likely_scope.is_empty() {
                 output.push_str("  likely scope: ");
@@ -1476,6 +1496,27 @@ mod tests {
         assert_eq!(plan.work_units[0].status, WorkUnitStatus::Completed);
         assert_ne!(plan.current_work_unit_id.as_deref(), Some(first.as_str()));
         assert!(plan.render_for_writer().contains("completed:"));
+    }
+
+    #[test]
+    fn implementation_unit_requires_candidate_evidence_and_can_defer_completion() {
+        let mut plan = TaskPlan::from_request(
+            "Implement the behavior. Preserve compatibility. Add focused tests.",
+            Some("src/lib.rs\ntests/lib.rs"),
+        );
+        assert!(
+            plan.current_work_unit()
+                .expect("active work unit")
+                .requires_candidate_change
+        );
+        plan.defer_current_work_unit_completion("writer only inspected the repository");
+        assert!(plan
+            .render_for_writer()
+            .contains("completion deferred: writer only inspected"));
+        assert_eq!(
+            plan.current_work_unit().unwrap().status,
+            WorkUnitStatus::Active
+        );
     }
 
     #[test]
