@@ -147,6 +147,10 @@ pub trait ExecutionBackend: Send + std::fmt::Debug {
         None
     }
 
+    fn candidate_has_changes(&mut self) -> Result<Option<bool>, String> {
+        Ok(None)
+    }
+
     fn execute_plugin(&mut self, _tool: &PluginTool, _input: &Value) -> Result<String, String> {
         Err(String::from(
             "plugin execution is unavailable through the selected execution backend",
@@ -353,6 +357,13 @@ impl ExecutionBackend for IsolatedExecutionBackend {
             self.workspace.baseline.root.clone(),
             self.workspace.candidate.root.clone(),
         ))
+    }
+
+    fn candidate_has_changes(&mut self) -> Result<Option<bool>, String> {
+        self.workspace
+            .scan()
+            .map(|changes| Some(!changes.changes.is_empty()))
+            .map_err(|error| format!("unable to inspect candidate state: {error}"))
     }
 
     fn execute(&mut self, tool_name: &str, input: &Value) -> Result<String, String> {
@@ -802,6 +813,16 @@ impl GlobalToolRegistry {
                 .ok()
                 .and_then(|backend| backend.candidate_review_roots())
         })
+    }
+
+    pub fn candidate_has_changes(&self) -> Result<Option<bool>, String> {
+        let Some(backend) = &self.execution_backend else {
+            return Ok(None);
+        };
+        backend
+            .lock()
+            .map_err(|_| String::from("execution backend lock poisoned"))?
+            .candidate_has_changes()
     }
 
     pub fn normalize_allowed_tools(

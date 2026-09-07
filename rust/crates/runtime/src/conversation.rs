@@ -76,6 +76,13 @@ pub trait ApiClient {
 pub trait ToolExecutor {
     fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError>;
 
+    /// Return whether the candidate differs from its trusted baseline.
+    /// `None` preserves compatibility with executors that cannot inspect
+    /// candidate state without finishing it.
+    fn candidate_has_changes(&mut self) -> Result<Option<bool>, ToolError> {
+        Ok(None)
+    }
+
     /// Run bounded, candidate-only development checks at a writer checkpoint.
     /// Implementations may return diagnostics for the writer; this never
     /// authorizes validation, evaluation, Review, or Apply.
@@ -264,6 +271,7 @@ pub struct ConversationRuntime<C, T> {
     configured_max_iterations: usize,
     checkpoint_finalization_turns: usize,
     checkpoint_turns_remaining: usize,
+    pre_candidate_continuation_turns: usize,
     context_checkpoint_tokens: usize,
     checkpoint: Option<WriterCheckpoint>,
     checkpoint_candidate_check_ran: bool,
@@ -321,6 +329,7 @@ where
             configured_max_iterations: usize::MAX,
             checkpoint_finalization_turns: 0,
             checkpoint_turns_remaining: 0,
+            pre_candidate_continuation_turns: 4,
             context_checkpoint_tokens: DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD as usize,
             checkpoint: None,
             checkpoint_candidate_check_ran: false,
@@ -368,6 +377,15 @@ where
     #[must_use]
     pub fn with_context_checkpoint_tokens(mut self, threshold: usize) -> Self {
         self.context_checkpoint_tokens = threshold.max(1);
+        self
+    }
+
+    /// Configure the short continuation granted when a resource checkpoint
+    /// finds no candidate mutation. This is separate from the normal writer
+    /// budget so discovery cannot restart an unrestricted loop.
+    #[must_use]
+    pub fn with_pre_candidate_continuation_turns(mut self, turns: usize) -> Self {
+        self.pre_candidate_continuation_turns = turns;
         self
     }
 
@@ -547,6 +565,7 @@ where
         self.checkpoint_reason = None;
         let mut checkpoint_compaction = None;
         let mut checkpoint_prompted = false;
+        let mut pre_candidate_continuation_used = false;
         let mut previous_tool_fingerprint = None;
         let mut identical_tool_iterations = 0;
 
@@ -576,24 +595,46 @@ where
                 None
             };
             if let Some(reason) = checkpoint_reason {
-                checkpoint_prompted = true;
                 self.checkpoint_reason = Some(reason.clone());
-                let candidate_check = self
+                let candidate_has_changes = self
                     .tool_executor
-                    .run_checkpoint_candidate_checks()
+                    .candidate_has_changes()
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
+                let pre_candidate = candidate_has_changes == Some(false);
+                let finalization_checkpoint = pre_candidate && pre_candidate_continuation_used;
+                if pre_candidate && !pre_candidate_continuation_used {
+                    pre_candidate_continuation_used = true;
+                    self.max_iterations =
+                        iterations.saturating_add(self.pre_candidate_continuation_turns);
+                } else {
+                    checkpoint_prompted = true;
+                    self.checkpoint_turns_remaining -= 1;
+                    self.max_iterations = self.max_iterations.saturating_add(1);
+                }
+                let candidate_check = if pre_candidate {
+                    None
+                } else {
+                    self.tool_executor
+                        .run_checkpoint_candidate_checks()
+                        .map_err(|error| RuntimeError::new(error.to_string()))?
+                };
                 self.checkpoint_candidate_check_ran = candidate_check.is_some();
                 checkpoint_compaction = self.compact_for_checkpoint();
-                self.checkpoint_turns_remaining -= 1;
-                self.max_iterations = self.max_iterations.saturating_add(1);
                 let checkpoint_evidence = candidate_check.map_or_else(String::new, |diagnostics| {
                     format!("[Checkpoint candidate-development checks]\n{diagnostics}\n\n")
                 });
+                let checkpoint_instruction = if pre_candidate && !finalization_checkpoint {
+                    "The isolated candidate is still unchanged from baseline. This is a context/resource checkpoint, not a submission. Do not submit an unchanged candidate or run project checks yet. Continue for only a short bounded window toward one concrete remaining implementation or discovery objective, then use candidate_checkpoint with submit after making a meaningful change, or blocked/needs_user_input if progress is not possible.\n\n"
+                } else if pre_candidate {
+                    "The bounded pre-mutation continuation is exhausted and the isolated candidate is still unchanged. Do not use submit to mean no changes; use candidate_checkpoint with blocked or needs_user_input to end explicitly.\n\n"
+                } else {
+                    "The bounded writer budget/resource boundary has been reached. Use the candidate_checkpoint tool now with submit, blocked, or needs_user_input. If checks reported failures, make only targeted repairs before checkpointing. Do not begin broad new work; submit the best coherent candidate or state what prevents completion.\n\n"
+                };
                 self.session
                     .push_message(ConversationMessage {
                         role: MessageRole::User,
                         blocks: vec![ContentBlock::Text {
-                            text: format!("{checkpoint_evidence}The bounded writer budget/resource boundary has been reached; the writer checkpoint was triggered by {reason}. Use the candidate_checkpoint tool now with submit, blocked, or needs_user_input. If checks reported failures, make only targeted repairs before checkpointing. Do not begin broad new work; submit the best coherent candidate or state what prevents completion."),
+                            text: format!("{checkpoint_evidence}{checkpoint_instruction}The writer checkpoint was triggered by {reason}."),
                         }],
                         usage: None,
                     })
@@ -2455,6 +2496,208 @@ mod tests {
         assert!(compaction.removed_message_count > 0);
         assert!(compaction.after_estimated_tokens < compaction.before_estimated_tokens);
         assert!(runtime.checkpoint_candidate_check_ran());
+    }
+
+    #[test]
+    fn pre_candidate_checkpoint_grants_short_continuation_without_checks() {
+        struct Api {
+            calls: usize,
+        }
+
+        impl ApiClient for Api {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "inspect-1".to_string(),
+                            name: "echo".to_string(),
+                            input: "repository discovery".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    2 => {
+                        assert!(request.messages.iter().any(|message| {
+                            message.blocks.iter().any(|block| {
+                                matches!(block, ContentBlock::Text { text } if text.contains("still unchanged"))
+                            })
+                        }));
+                        assert!(!request.messages.iter().any(|message| {
+                            message.blocks.iter().any(|block| {
+                                matches!(block, ContentBlock::Text { text } if text.contains("candidate-development checks"))
+                            })
+                        }));
+                        Ok(vec![
+                            AssistantEvent::ToolUse {
+                                id: "edit-1".to_string(),
+                                name: "edit".to_string(),
+                                input: "implement first workstream".to_string(),
+                            },
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    3 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: "checkpoint-1".to_string(),
+                            name: "candidate_checkpoint".to_string(),
+                            input: r#"{"status":"submit"}"#.to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    _ => panic!("unexpected provider call after candidate submission"),
+                }
+            }
+        }
+
+        struct Executor {
+            changed: bool,
+            checkpoint: bool,
+            checks: usize,
+        }
+
+        impl ToolExecutor for Executor {
+            fn execute(&mut self, tool_name: &str, _input: &str) -> Result<String, ToolError> {
+                match tool_name {
+                    "echo" => {}
+                    "edit" => self.changed = true,
+                    "candidate_checkpoint" => self.checkpoint = true,
+                    other => panic!("unexpected tool {other}"),
+                }
+                Ok("accepted".to_string())
+            }
+
+            fn candidate_has_changes(&mut self) -> Result<Option<bool>, ToolError> {
+                Ok(Some(self.changed))
+            }
+
+            fn run_checkpoint_candidate_checks(&mut self) -> Result<Option<String>, ToolError> {
+                self.checks += 1;
+                Ok(Some("format: passed".to_string()))
+            }
+
+            fn take_checkpoint(&mut self) -> Option<WriterCheckpoint> {
+                self.checkpoint
+                    .then_some(WriterCheckpoint::Submit { message: None })
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            Api { calls: 0 },
+            Executor {
+                changed: false,
+                checkpoint: false,
+                checks: 0,
+            },
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_checkpoint_policy(1, 1)
+        .with_pre_candidate_continuation_turns(2);
+
+        let summary = runtime
+            .run_turn("work", None)
+            .expect("bounded continuation should reach explicit submission");
+
+        assert!(!runtime.checkpoint_candidate_check_ran());
+        assert_eq!(runtime.tool_executor().checks, 0);
+        assert!(runtime.tool_executor().changed);
+        assert!(matches!(
+            summary.checkpoint,
+            Some(WriterCheckpoint::Submit { .. })
+        ));
+    }
+
+    #[test]
+    fn pre_candidate_continuation_exhaustion_returns_blocked_checkpoint() {
+        struct Api {
+            calls: usize,
+        }
+
+        impl ApiClient for Api {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                self.calls += 1;
+                match self.calls {
+                    1 | 2 => Ok(vec![
+                        AssistantEvent::ToolUse {
+                            id: format!("inspect-{}", self.calls),
+                            name: "echo".to_string(),
+                            input: "no new evidence".to_string(),
+                        },
+                        AssistantEvent::MessageStop,
+                    ]),
+                    3 => {
+                        assert!(request.messages.iter().any(|message| {
+                            message.blocks.iter().any(|block| {
+                                matches!(block, ContentBlock::Text { text } if text.contains("continuation is exhausted"))
+                            })
+                        }));
+                        Ok(vec![
+                            AssistantEvent::ToolUse {
+                                id: "checkpoint-1".to_string(),
+                                name: "candidate_checkpoint".to_string(),
+                                input: r#"{"status":"blocked","message":"no implementation path found"}"#.to_string(),
+                            },
+                            AssistantEvent::MessageStop,
+                        ])
+                    }
+                    _ => panic!("unexpected provider call after blocked checkpoint"),
+                }
+            }
+        }
+
+        struct Executor {
+            checkpoint: bool,
+            checks: usize,
+        }
+
+        impl ToolExecutor for Executor {
+            fn execute(&mut self, tool_name: &str, _input: &str) -> Result<String, ToolError> {
+                assert!(matches!(tool_name, "echo" | "candidate_checkpoint"));
+                if tool_name == "candidate_checkpoint" {
+                    self.checkpoint = true;
+                }
+                Ok("accepted".to_string())
+            }
+
+            fn candidate_has_changes(&mut self) -> Result<Option<bool>, ToolError> {
+                Ok(Some(false))
+            }
+
+            fn run_checkpoint_candidate_checks(&mut self) -> Result<Option<String>, ToolError> {
+                self.checks += 1;
+                Ok(Some("must not run without a candidate".to_string()))
+            }
+
+            fn take_checkpoint(&mut self) -> Option<WriterCheckpoint> {
+                self.checkpoint.then_some(WriterCheckpoint::Blocked {
+                    message: "no implementation path found".to_string(),
+                })
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            Api { calls: 0 },
+            Executor {
+                checkpoint: false,
+                checks: 0,
+            },
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_checkpoint_policy(1, 1)
+        .with_pre_candidate_continuation_turns(1);
+
+        let summary = runtime
+            .run_turn("work", None)
+            .expect("bounded continuation should terminate explicitly");
+
+        assert_eq!(runtime.tool_executor().checks, 0);
+        assert!(matches!(
+            summary.checkpoint,
+            Some(WriterCheckpoint::Blocked { .. })
+        ));
     }
 
     #[test]

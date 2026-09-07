@@ -5838,18 +5838,18 @@ impl LiveCli {
                 if summary.iterations > writer_iteration_budget(self.task_plan.planning_mode()) {
                     benchmark_telemetry::lifecycle_event("writer_soft_checkpoint_triggered");
                 }
+                if let Some(reason) = runtime.checkpoint_reason() {
+                    benchmark_telemetry::writer_checkpoint_reason(reason);
+                }
+                if let Some(event) = summary.auto_compaction {
+                    benchmark_telemetry::writer_checkpoint_context(
+                        event.before_estimated_tokens,
+                        event.after_estimated_tokens,
+                        event.removed_message_count,
+                    );
+                }
                 if runtime.checkpoint_candidate_check_ran() {
                     benchmark_telemetry::writer_checkpoint_candidate_check();
-                    if let Some(reason) = runtime.checkpoint_reason() {
-                        benchmark_telemetry::writer_checkpoint_reason(reason);
-                    }
-                    if let Some(event) = summary.auto_compaction {
-                        benchmark_telemetry::writer_checkpoint_context(
-                            event.before_estimated_tokens,
-                            event.after_estimated_tokens,
-                            event.removed_message_count,
-                        );
-                    }
                 }
                 if let Some(checkpoint) = runtime.take_checkpoint() {
                     match checkpoint {
@@ -6062,6 +6062,7 @@ impl LiveCli {
 
         if changes.changes.is_empty() {
             self.candidate_state = CandidateLifecycleState::Editing;
+            benchmark_telemetry::lifecycle_event("writer_checkpoint_empty_candidate");
             return Ok(false);
         }
 
@@ -12042,6 +12043,12 @@ impl CliToolExecutor {
 }
 
 impl ToolExecutor for CliToolExecutor {
+    fn candidate_has_changes(&mut self) -> Result<Option<bool>, ToolError> {
+        self.tool_registry
+            .candidate_has_changes()
+            .map_err(ToolError::new)
+    }
+
     fn run_checkpoint_candidate_checks(&mut self) -> Result<Option<String>, ToolError> {
         if self.candidate_review_roots().is_none() {
             return Ok(None);
