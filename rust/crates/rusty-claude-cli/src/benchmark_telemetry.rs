@@ -448,7 +448,7 @@ pub fn work_unit_checkpoint_runtime_state(used: usize, allowance: usize, continu
             record.remaining_turns = allowance.saturating_sub(used) as u64;
             record.continuation_grants = u64::from(continuation_grants);
             if record.work_unit.is_none() {
-                record.work_unit = s.snapshot.current_work_unit.clone();
+                record.work_unit.clone_from(&s.snapshot.current_work_unit);
             }
         }
     });
