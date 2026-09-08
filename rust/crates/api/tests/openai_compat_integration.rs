@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -7,9 +7,10 @@ use std::sync::{Mutex as StdMutex, OnceLock};
 use api::{
     ApiError, ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent,
     ContentBlockStopEvent, EndpointCapabilities, InputContentBlock, InputMessage,
-    MessageDeltaEvent, MessageRequest, OpenAiCompatClient, OpenAiCompatConfig, OutputContentBlock,
-    ProviderClient, ProviderFailureClass, ResponseOutcomeKind, ResponsesClient, StreamEvent,
-    ToolChoice, ToolDefinition,
+    MessageDeltaEvent, MessageRequest, OpenAiCompatClient, OpenAiCompatConfig, OpenAiCompatProfile,
+    OpenAiCompatProtocol, OutputContentBlock, ParameterCapabilities, ProviderAuthMode,
+    ProviderClient, ProviderConnectionConfig, ProviderFailureClass, ReasoningCapability,
+    ResponseOutcomeKind, ResponsesClient, StreamEvent, ToolChoice, ToolDefinition,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -66,6 +67,153 @@ async fn send_message_uses_openai_compatible_endpoint_and_auth() {
     assert_eq!(body["model"], json!("grok-3"));
     assert_eq!(body["messages"][0]["role"], json!("system"));
     assert_eq!(body["tools"][0]["type"], json!("function"));
+}
+
+#[tokio::test]
+async fn configured_chat_profile_uses_opaque_model_custom_auth_and_parameters() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = "{\"id\":\"chatcmpl_custom\",\"model\":\"vendor/model:v3\",\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"custom gateway\",\"tool_calls\":[]},\"finish_reason\":\"stop\"}]}";
+    let Some(server) = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await
+    else {
+        return;
+    };
+
+    let profile = OpenAiCompatProfile {
+        connection: ProviderConnectionConfig {
+            provider: Some("local-gateway".to_string()),
+            base_url: Some(server.base_url()),
+            auth: ProviderAuthMode::None,
+            headers: BTreeMap::from([("x-gateway-profile".to_string(), "fixture".to_string())]),
+            ..Default::default()
+        },
+        protocol: OpenAiCompatProtocol::ChatCompletions,
+        capabilities: EndpointCapabilities::default(),
+        reasoning: ReasoningCapability::default(),
+        parameters: ParameterCapabilities {
+            max_output_tokens_parameter: "max_completion_tokens".to_string(),
+            temperature: false,
+            ..Default::default()
+        },
+    };
+    let client = OpenAiCompatClient::from_profile(&profile)
+        .expect("custom profile should construct without credentials");
+    let mut request = sample_request(false);
+    request.model = "vendor/model:v3".to_string();
+    request.temperature = Some(0.2);
+    request.reasoning_effort = Some("high".to_string());
+    let response = client
+        .send_message(&request)
+        .await
+        .expect("custom profile request should succeed");
+    assert_eq!(response.model, "vendor/model:v3");
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("server should capture request");
+    assert_eq!(request.path, "/chat/completions");
+    assert!(!request.headers.contains_key("authorization"));
+    assert_eq!(
+        request.headers.get("x-gateway-profile").map(String::as_str),
+        Some("fixture")
+    );
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["model"], json!("vendor/model:v3"));
+    assert_eq!(body["max_completion_tokens"], json!(64));
+    assert!(body.get("max_tokens").is_none());
+    assert!(body.get("temperature").is_none());
+    assert!(body.get("reasoning_effort").is_none());
+}
+
+#[tokio::test]
+async fn configured_responses_profile_uses_custom_model_and_reasoning_policy() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = "{\"id\":\"resp_custom\",\"model\":\"edge/model@1\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"responses gateway\"}]}],\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}";
+    let Some(server) = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await
+    else {
+        return;
+    };
+
+    let profile = OpenAiCompatProfile {
+        connection: ProviderConnectionConfig {
+            provider: Some("third-party".to_string()),
+            base_url: Some(server.base_url()),
+            auth: ProviderAuthMode::None,
+            ..Default::default()
+        },
+        protocol: OpenAiCompatProtocol::Responses,
+        capabilities: EndpointCapabilities {
+            chat_completions: false,
+            responses: true,
+            ..EndpointCapabilities::default()
+        },
+        reasoning: ReasoningCapability {
+            supported: true,
+            default_effort: Some("low".to_string()),
+            allowed_efforts: vec!["low".to_string(), "high".to_string()],
+            ..Default::default()
+        },
+        parameters: ParameterCapabilities::default(),
+    };
+    let client =
+        ResponsesClient::from_profile(&profile).expect("custom Responses profile should construct");
+    let mut request = sample_request(false);
+    request.model = "edge/model@1".to_string();
+    request.reasoning_effort = Some("high".to_string());
+    let response = client
+        .send_message(&request)
+        .await
+        .expect("custom Responses request should succeed");
+    assert_eq!(response.model, "edge/model@1");
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("server should capture request");
+    assert_eq!(request.path, "/responses");
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["model"], json!("edge/model@1"));
+    assert_eq!(body["reasoning"]["effort"], json!("high"));
+}
+
+#[tokio::test]
+async fn chat_stream_retains_optional_rate_limit_metadata() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = "data: {\"id\":\"chatcmpl_limits\",\"model\":\"opaque\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    let Some(server) = spawn_server(
+        state,
+        vec![http_response_with_headers(
+            "200 OK",
+            "text/event-stream",
+            sse,
+            &[
+                ("x-ratelimit-limit-tokens", "500000"),
+                ("x-ratelimit-remaining-tokens", "490000"),
+                ("x-ratelimit-reset-tokens", "1.2s"),
+            ],
+        )],
+    )
+    .await
+    else {
+        return;
+    };
+
+    let client = OpenAiCompatClient::new("key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let stream = client
+        .stream_message(&sample_request(true))
+        .await
+        .expect("stream should start");
+    let limits = stream
+        .rate_limit_state()
+        .expect("optional rate-limit headers should be retained");
+    assert_eq!(limits.token_limit, Some(500_000));
+    assert_eq!(limits.token_remaining, Some(490_000));
+    assert_eq!(limits.token_reset_after_seconds, Some(2));
 }
 
 #[tokio::test]

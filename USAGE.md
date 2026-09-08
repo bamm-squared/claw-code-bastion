@@ -148,6 +148,56 @@ cd rust
 ./target/debug/claw --model "qwen2.5-coder" prompt "reply with the word ready"
 ```
 
+For endpoints that need explicit, provider-agnostic behavior, configure a
+`modelResources` profile instead of relying on the legacy model-name and
+environment detection. The profile can use any provider label and opaque
+model string:
+
+```json
+{
+  "modelResources": [
+    {
+      "id": "local-qwen",
+      "provider": "my-gateway",
+      "model": "vendor/qwen-coder:32b",
+      "privacy": "local",
+      "enabled": true,
+      "capability": {
+        "coding": 90,
+        "reasoning": 80,
+        "agent_tool_use": 90,
+        "planning": 75,
+        "evaluation": 70,
+        "context_window": 32768
+      },
+      "connection": {
+        "baseUrl": "http://127.0.0.1:8000/v1",
+        "auth": "none"
+      },
+      "protocol": "chat_completions",
+      "protocolCapabilities": {
+        "chatCompletions": true,
+        "responses": false,
+        "functionTools": true,
+        "reasoning": false,
+        "streaming": true
+      },
+      "reasoning": {"supported": false},
+      "parameterCapabilities": {
+        "maxOutputTokens": true,
+        "maxOutputTokensParameter": "max_tokens",
+        "temperature": true
+      }
+    }
+  ]
+}
+```
+
+See [OpenAI-compatible provider configuration](docs/openai-compatible-providers.md)
+for bearer credentials from a custom environment variable, custom headers,
+Responses profiles, pricing, context limits, unsupported parameters, and the
+compatibility contract.
+
 ### Ollama
 
 ```bash

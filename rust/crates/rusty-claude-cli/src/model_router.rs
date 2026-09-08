@@ -69,6 +69,10 @@ pub struct ModelProfile {
     #[serde(default)]
     pub protocol_capabilities: Option<api::EndpointCapabilities>,
     pub reasoning_profile: Option<String>,
+    /// Explicit OpenAI-compatible connection/protocol behavior. `None` keeps
+    /// legacy provider discovery for existing configurations.
+    #[serde(default)]
+    pub openai_compat: Option<api::OpenAiCompatProfile>,
     pub privacy: PrivacyClass,
     pub capability: Capability,
     pub pricing: Pricing,
@@ -92,6 +96,7 @@ impl ModelProfile {
             endpoint: None,
             protocol_capabilities: None,
             reasoning_profile: None,
+            openai_compat: None,
             privacy: PrivacyClass::Remote,
             capability: Capability {
                 context_window: 8_192,
@@ -118,6 +123,7 @@ impl ModelProfile {
             endpoint: None,
             protocol_capabilities: None,
             reasoning_profile: None,
+            openai_compat: None,
             privacy: if local {
                 PrivacyClass::Local
             } else {
@@ -140,6 +146,54 @@ impl ModelProfile {
             user_preference: 0,
             enabled: true,
         }
+    }
+
+    /// Resolve the configured reasoning policy without consulting the model
+    /// identifier. `default` delegates to the profile's endpoint policy.
+    pub fn reasoning_effort(&self) -> Result<Option<String>, String> {
+        let Some(compat) = self.openai_compat.as_ref() else {
+            return normalize_reasoning_profile(self.reasoning_profile.as_deref());
+        };
+        let requested = match self.reasoning_profile.as_deref() {
+            None | Some("default") => compat.reasoning.default_effort.clone(),
+            Some("none" | "off") => None,
+            Some(value) => Some(value.to_string()),
+        };
+        let Some(effort) = requested else {
+            return Ok(None);
+        };
+        if !compat.reasoning.supported {
+            return Ok(None);
+        }
+        if compat.reasoning.allowed_efforts.is_empty()
+            || compat
+                .reasoning
+                .allowed_efforts
+                .iter()
+                .any(|value| value == &effort)
+        {
+            Ok(Some(effort))
+        } else {
+            Err(format!(
+                "reasoning effort {effort:?} is not declared by profile {}",
+                self.id
+            ))
+        }
+    }
+
+    #[must_use]
+    pub fn openai_compat_profile(&self) -> Option<api::OpenAiCompatProfile> {
+        self.openai_compat.clone()
+    }
+}
+
+fn normalize_reasoning_profile(value: Option<&str>) -> Result<Option<String>, String> {
+    match value.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("default" | "none" | "off") => Ok(None),
+        Some("low" | "medium" | "high") => Ok(value.map(str::to_string)),
+        Some(other) => Err(format!(
+            "unsupported routed reasoning profile '{other}'; supported values are default, off, none, low, medium, and high"
+        )),
     }
 }
 
@@ -766,6 +820,8 @@ pub fn difficulty_bucket(estimate: DifficultyEstimate) -> u8 {
 pub struct Rejection {
     pub profile_id: String,
     pub reason: String,
+    pub capability: Capability,
+    pub required: CapabilityRequirement,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -868,27 +924,25 @@ impl ModelRouter {
         let mut rejections = Vec::new();
         for profile in &pool.profiles {
             if !profile.enabled {
-                rejections.push(reject(profile, "disabled by user configuration"));
+                rejections.push(reject(profile, "disabled by user configuration", estimate));
             } else if let Some(forced) = &policy.forced_profile {
                 if &profile.id != forced {
-                    rejections.push(reject(profile, "another profile is forced"));
+                    rejections.push(reject(profile, "another profile is forced", estimate));
                 } else if !policy_allows(profile, policy) {
                     rejections.push(reject(
                         profile,
                         "forced profile is ineligible under privacy policy",
+                        estimate,
                     ));
-                } else if !capable(profile, estimate) {
-                    rejections.push(reject(
-                        profile,
-                        "forced profile does not clear capability threshold",
-                    ));
+                } else if let Some(reason) = capability_rejection(profile, role, estimate) {
+                    rejections.push(reject(profile, reason, estimate));
                 } else {
                     eligible.push(profile);
                 }
             } else if !policy_allows(profile, policy) {
-                rejections.push(reject(profile, "ineligible under privacy policy"));
-            } else if !capable(profile, estimate) {
-                rejections.push(reject(profile, "below capability threshold"));
+                rejections.push(reject(profile, "ineligible under privacy policy", estimate));
+            } else if let Some(reason) = capability_rejection(profile, role, estimate) {
+                rejections.push(reject(profile, reason, estimate));
             } else {
                 eligible.push(profile);
             }
@@ -942,11 +996,24 @@ impl ModelRouter {
                 return None;
             }
             if !profile.enabled {
-                rejections.push(reject(profile, "disabled by user configuration"));
+                rejections.push(reject(profile, "disabled by user configuration", estimate));
                 return None;
             }
             if !policy_allows(profile, policy) {
-                rejections.push(reject(profile, "ineligible under privacy policy"));
+                rejections.push(reject(profile, "ineligible under privacy policy", estimate));
+                return None;
+            }
+            if role == ModelRole::Writer
+                && profile
+                    .openai_compat
+                    .as_ref()
+                    .is_some_and(|compat| !compat.capabilities.function_tools)
+            {
+                rejections.push(reject(
+                    profile,
+                    "declared model profile does not support required function tools",
+                    estimate,
+                ));
                 return None;
             }
             Some(profile.clone())
@@ -1002,10 +1069,12 @@ impl ModelRouter {
     }
 }
 
-fn reject(profile: &ModelProfile, reason: &str) -> Rejection {
+fn reject(profile: &ModelProfile, reason: &str, estimate: DifficultyEstimate) -> Rejection {
     Rejection {
         profile_id: profile.id.clone(),
         reason: reason.to_string(),
+        capability: profile.capability,
+        required: estimate.requirement,
     }
 }
 
@@ -1023,6 +1092,7 @@ fn string_field(settings: &serde_json::Map<String, Value>, name: &str) -> Option
         .map(str::to_string)
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_profile(value: &Value) -> Option<ModelProfile> {
     let object = value.as_object()?;
     let model = object.get("model")?.as_str()?.trim();
@@ -1031,6 +1101,79 @@ fn parse_profile(value: &Value) -> Option<ModelProfile> {
     }
     let capability = object.get("capability").and_then(Value::as_object);
     let pricing = object.get("pricing").and_then(Value::as_object);
+    let provider = object
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("configured")
+        .to_string();
+    let endpoint = object
+        .get("endpoint")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let protocol_capabilities: Option<api::EndpointCapabilities> = object
+        .get("protocolCapabilities")
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
+    let explicit_compat = object.contains_key("connection")
+        || object.contains_key("providerConnection")
+        || object.contains_key("protocol")
+        || object.contains_key("reasoning")
+        || object.contains_key("parameterCapabilities");
+    let openai_compat = explicit_compat.then(|| {
+        let mut connection = object
+            .get("connection")
+            .or_else(|| object.get("providerConnection"))
+            .and_then(|value| {
+                serde_json::from_value::<api::ProviderConnectionConfig>(value.clone()).ok()
+            })
+            .unwrap_or_default();
+        if connection.provider.is_none() {
+            connection.provider = Some(provider.clone());
+        }
+        if connection.base_url.is_none() {
+            connection.base_url.clone_from(&endpoint);
+        }
+        let protocol = object
+            .get("protocol")
+            .and_then(|value| {
+                serde_json::from_value::<api::OpenAiCompatProtocol>(value.clone()).ok()
+            })
+            .unwrap_or_else(|| {
+                protocol_capabilities
+                    .as_ref()
+                    .filter(|caps| caps.responses)
+                    .map_or(api::OpenAiCompatProtocol::ChatCompletions, |_| {
+                        api::OpenAiCompatProtocol::Responses
+                    })
+            });
+        let capabilities = protocol_capabilities.unwrap_or_default();
+        let reasoning = object
+            .get("reasoning")
+            .and_then(|value| {
+                serde_json::from_value::<api::ReasoningCapability>(value.clone()).ok()
+            })
+            .unwrap_or_else(|| api::ReasoningCapability {
+                supported: capabilities.reasoning,
+                default_effort: object
+                    .get("reasoningProfile")
+                    .and_then(Value::as_str)
+                    .filter(|value| !matches!(*value, "default" | "none" | "off"))
+                    .map(str::to_string),
+                ..Default::default()
+            });
+        let parameters = object
+            .get("parameterCapabilities")
+            .and_then(|value| {
+                serde_json::from_value::<api::ParameterCapabilities>(value.clone()).ok()
+            })
+            .unwrap_or_default();
+        api::OpenAiCompatProfile {
+            connection,
+            protocol,
+            capabilities,
+            reasoning,
+            parameters,
+        }
+    });
     let privacy = match object
         .get("privacy")
         .and_then(Value::as_str)
@@ -1048,23 +1191,15 @@ fn parse_profile(value: &Value) -> Option<ModelProfile> {
             .and_then(Value::as_str)
             .unwrap_or(model)
             .to_string(),
-        provider: object
-            .get("provider")
-            .and_then(Value::as_str)
-            .unwrap_or("configured")
-            .to_string(),
+        provider,
         model: model.to_string(),
-        endpoint: object
-            .get("endpoint")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        protocol_capabilities: object
-            .get("protocolCapabilities")
-            .and_then(|value| serde_json::from_value(value.clone()).ok()),
+        endpoint,
+        protocol_capabilities,
         reasoning_profile: object
             .get("reasoningProfile")
             .and_then(Value::as_str)
             .map(str::to_string),
+        openai_compat,
         privacy,
         capability: Capability {
             coding: number_field(capability, "coding", 50),
@@ -1160,6 +1295,22 @@ fn capable(profile: &ModelProfile, estimate: DifficultyEstimate) -> bool {
         && profile.capability.context_window >= required.context_window
 }
 
+fn capability_rejection(
+    profile: &ModelProfile,
+    role: ModelRole,
+    estimate: DifficultyEstimate,
+) -> Option<&'static str> {
+    if role == ModelRole::Writer
+        && profile
+            .openai_compat
+            .as_ref()
+            .is_some_and(|compat| !compat.capabilities.function_tools)
+    {
+        return Some("declared model profile does not support required function tools");
+    }
+    (!capable(profile, estimate)).then_some("below capability threshold")
+}
+
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
@@ -1227,6 +1378,7 @@ mod tests {
             endpoint: None,
             protocol_capabilities: None,
             reasoning_profile: Some("default".to_string()),
+            openai_compat: None,
             privacy,
             capability: Capability {
                 coding: capability,
@@ -1301,6 +1453,94 @@ mod tests {
         assert_eq!(pool.profiles[0].id, "qwen-local");
         assert_ne!(pool.profiles[0].id, "legacy-default");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn explicit_compatible_profile_preserves_custom_connection_and_opaque_model() {
+        let profile = parse_profile(&serde_json::json!({
+            "id": "edge-chat",
+            "provider": "third-party",
+            "model": "vendor/model@2026-09",
+            "privacy": "remote",
+            "enabled": true,
+            "capability": {
+                "coding": 100,
+                "reasoning": 100,
+                "agent_tool_use": 100,
+                "planning": 100,
+                "evaluation": 100,
+                "context_window": 32000
+            },
+            "connection": {
+                "baseUrl": "http://127.0.0.1:9011/v1",
+                "credentialEnv": "EDGE_GATEWAY_TOKEN",
+                "auth": "bearer",
+                "headerEnv": {"x-tenant": "EDGE_TENANT"}
+            },
+            "protocol": "chat_completions",
+            "protocolCapabilities": {
+                "chatCompletions": true,
+                "responses": false,
+                "functionTools": true,
+                "reasoning": true,
+                "streaming": true,
+                "typedImages": false
+            },
+            "reasoning": {
+                "supported": true,
+                "defaultEffort": "medium",
+                "allowedEfforts": ["low", "medium"],
+                "parameter": "thinking_level"
+            },
+            "parameterCapabilities": {
+                "maxOutputTokensParameter": "max_completion_tokens",
+                "temperature": false
+            }
+        }))
+        .expect("profile should parse");
+        assert_eq!(profile.model, "vendor/model@2026-09");
+        let compat = profile
+            .openai_compat
+            .as_ref()
+            .expect("explicit profile should be retained");
+        assert_eq!(compat.protocol, api::OpenAiCompatProtocol::ChatCompletions);
+        assert_eq!(
+            compat.connection.base_url.as_deref(),
+            Some("http://127.0.0.1:9011/v1")
+        );
+        assert_eq!(
+            compat.connection.credential_env.as_deref(),
+            Some("EDGE_GATEWAY_TOKEN")
+        );
+        assert_eq!(compat.reasoning.parameter, "thinking_level");
+        assert_eq!(
+            profile.reasoning_effort().unwrap(),
+            Some("medium".to_string())
+        );
+    }
+
+    #[test]
+    fn writer_routing_rejects_explicit_profile_without_tools() {
+        let mut profile = profile("no-tools", PrivacyClass::Local, 100, 0);
+        profile.openai_compat = Some(api::OpenAiCompatProfile {
+            capabilities: api::EndpointCapabilities {
+                function_tools: false,
+                ..api::EndpointCapabilities::default()
+            },
+            ..Default::default()
+        });
+        let decision = ModelRouter::route(
+            &ModelPool::one(profile),
+            ModelRole::Writer,
+            signals(),
+            &RoutingPolicy {
+                allow_remote: false,
+                allow_confidential: false,
+                ..RoutingPolicy::default()
+            },
+        );
+        assert!(decision.selected.is_none());
+        assert!(decision.rejections[0].reason.contains("function tools"));
     }
 
     #[test]

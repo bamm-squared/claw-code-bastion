@@ -106,6 +106,12 @@ pub struct ProviderCallRecord {
     pub profile: Option<String>,
     pub provider: Option<String>,
     pub protocol: Option<String>,
+    pub model: Option<String>,
+    pub endpoint: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub tools_supported: Option<bool>,
+    pub context_window: Option<u32>,
+    pub rate_limit: Option<api::RateLimitState>,
     pub request_ids: Vec<String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -182,6 +188,8 @@ pub struct RequirementCoverage {
 pub struct RoutingRejection {
     pub profile_id: String,
     pub reason: String,
+    pub capability: crate::model_router::Capability,
+    pub required: crate::model_router::CapabilityRequirement,
 }
 
 #[derive(Clone, Debug, Serialize, Default)]
@@ -205,6 +213,12 @@ struct ProviderContext {
     profile: Option<String>,
     provider: Option<String>,
     protocol: Option<String>,
+    model: Option<String>,
+    endpoint: Option<String>,
+    reasoning_effort: Option<String>,
+    tools_supported: Option<bool>,
+    context_window: Option<u32>,
+    rate_limit: Option<api::RateLimitState>,
     input_rate: Option<f64>,
     output_rate: Option<f64>,
     price_source: Option<String>,
@@ -272,6 +286,12 @@ pub fn provider_call() {
             profile: context.profile.clone(),
             provider: context.provider.clone(),
             protocol: context.protocol.clone(),
+            model: context.model.clone(),
+            endpoint: context.endpoint.clone(),
+            reasoning_effort: context.reasoning_effort.clone(),
+            tools_supported: context.tools_supported,
+            context_window: context.context_window,
+            rate_limit: context.rate_limit.clone(),
             price_source: context.price_source.clone(),
             ..ProviderCallRecord::default()
         });
@@ -297,6 +317,7 @@ pub fn set_provider_context(
             input_rate,
             output_rate,
             price_source: price_source.map(str::to_string),
+            ..ProviderContext::default()
         };
     });
 }
@@ -304,6 +325,34 @@ pub fn set_provider_context(
 pub fn set_provider_protocol(protocol: &str) {
     with_state(|s| {
         s.provider_context.protocol = Some(protocol.to_string());
+    });
+}
+
+/// Attach the effective, non-secret execution configuration to subsequent
+/// provider-call records. The endpoint is expected to be redacted by the
+/// caller before it reaches telemetry.
+pub fn set_provider_execution(
+    model: Option<&str>,
+    endpoint: Option<&str>,
+    reasoning_effort: Option<&str>,
+    tools_supported: Option<bool>,
+    context_window: Option<u32>,
+) {
+    with_state(|s| {
+        s.provider_context.model = model.map(str::to_string);
+        s.provider_context.endpoint = endpoint.map(str::to_string);
+        s.provider_context.reasoning_effort = reasoning_effort.map(str::to_string);
+        s.provider_context.tools_supported = tools_supported;
+        s.provider_context.context_window = context_window;
+    });
+}
+
+pub fn set_provider_rate_limit(state: Option<&api::RateLimitState>) {
+    with_state(|s| {
+        s.provider_context.rate_limit = state.cloned();
+        if let Some(index) = s.active_provider_record {
+            s.snapshot.provider_call_records[index].rate_limit = state.cloned();
+        }
     });
 }
 
@@ -1054,6 +1103,7 @@ mod tests {
             input_rate: Some(0.75),
             output_rate: Some(4.50),
             price_source: Some("explicit_profile".into()),
+            ..ProviderContext::default()
         };
         state.snapshot.provider_calls = 1;
         state

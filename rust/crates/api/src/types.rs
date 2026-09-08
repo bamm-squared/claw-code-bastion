@@ -1,6 +1,144 @@
 use runtime::{pricing_for_model, TokenUsage, UsageCostEstimate};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
+
+/// Wire protocol selected by a configured OpenAI-compatible endpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiCompatProtocol {
+    Responses,
+    #[default]
+    ChatCompletions,
+}
+
+/// Authentication behavior for a configured compatible connection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAuthMode {
+    #[default]
+    Bearer,
+    None,
+}
+
+/// Connection details are deliberately independent of a model profile. The
+/// same connection can therefore host several opaque model identifiers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderConnectionConfig {
+    pub id: Option<String>,
+    pub provider: Option<String>,
+    pub base_url: Option<String>,
+    pub base_url_env: Option<String>,
+    pub credential_env: Option<String>,
+    #[serde(default)]
+    pub auth: ProviderAuthMode,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub header_env: BTreeMap<String, String>,
+    pub timeout_ms: Option<u64>,
+    pub max_retries: Option<u32>,
+}
+
+/// Model-specific reasoning behavior. A missing/default effort is distinct
+/// from an explicit `none`: callers may intentionally delegate to the
+/// endpoint default or explicitly disable reasoning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningCapability {
+    #[serde(default)]
+    pub supported: bool,
+    pub default_effort: Option<String>,
+    #[serde(default)]
+    pub allowed_efforts: Vec<String>,
+    #[serde(default = "default_reasoning_parameter")]
+    pub parameter: String,
+    #[serde(default = "default_true")]
+    pub supports_with_tools: bool,
+}
+
+impl Default for ReasoningCapability {
+    fn default() -> Self {
+        Self {
+            supported: false,
+            default_effort: None,
+            allowed_efforts: Vec::new(),
+            parameter: default_reasoning_parameter(),
+            supports_with_tools: true,
+        }
+    }
+}
+
+fn default_reasoning_parameter() -> String {
+    "reasoning_effort".to_string()
+}
+
+fn default_max_output_parameter() -> String {
+    "max_tokens".to_string()
+}
+
+/// Optional request features are declared per model profile instead of being
+/// inferred from a model family or endpoint hostname.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParameterCapabilities {
+    #[serde(default = "default_true")]
+    pub max_output_tokens: bool,
+    #[serde(default = "default_max_output_parameter")]
+    pub max_output_tokens_parameter: String,
+    #[serde(default = "default_true")]
+    pub temperature: bool,
+    #[serde(default = "default_true")]
+    pub top_p: bool,
+    #[serde(default = "default_true")]
+    pub frequency_penalty: bool,
+    #[serde(default = "default_true")]
+    pub presence_penalty: bool,
+    #[serde(default = "default_true")]
+    pub stop: bool,
+    #[serde(default = "default_true")]
+    pub tool_choice: bool,
+    #[serde(default = "default_true")]
+    pub parallel_tool_calls: bool,
+    #[serde(default)]
+    pub structured_output: bool,
+    #[serde(default)]
+    pub stream_usage: bool,
+}
+
+impl Default for ParameterCapabilities {
+    fn default() -> Self {
+        Self {
+            max_output_tokens: true,
+            max_output_tokens_parameter: default_max_output_parameter(),
+            temperature: true,
+            top_p: true,
+            frequency_penalty: true,
+            presence_penalty: true,
+            stop: true,
+            tool_choice: true,
+            parallel_tool_calls: true,
+            structured_output: false,
+            stream_usage: false,
+        }
+    }
+}
+
+/// Complete model-side contract for the OpenAI-compatible transports.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenAiCompatProfile {
+    pub connection: ProviderConnectionConfig,
+    pub protocol: OpenAiCompatProtocol,
+    #[serde(default)]
+    pub capabilities: EndpointCapabilities,
+    #[serde(default)]
+    pub reasoning: ReasoningCapability,
+    #[serde(default)]
+    pub parameters: ParameterCapabilities,
+}
 
 /// Protocol and feature capabilities declared by an execution endpoint.
 /// Provider defaults may be used when this is absent, but an explicit profile

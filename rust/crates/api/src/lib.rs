@@ -12,7 +12,8 @@ pub use client::{
 };
 pub use error::{ApiError, NonActionableResponse, ProviderFailureClass, ResponseOutcomeKind};
 pub use http_client::{
-    build_http_client, build_http_client_or_default, build_http_client_with, ProxyConfig,
+    build_http_client, build_http_client_or_default, build_http_client_with,
+    build_http_client_with_timeout, ProxyConfig,
 };
 pub use prompt_cache::{
     CacheBreakEvent, PromptCache, PromptCacheConfig, PromptCachePaths, PromptCacheRecord,
@@ -29,8 +30,10 @@ pub use sse::{parse_frame, SseParser};
 pub use types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     EndpointCapabilities, InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent,
-    MessageRequest, MessageResponse, MessageStartEvent, MessageStopEvent, OutputContentBlock,
-    StreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
+    MessageRequest, MessageResponse, MessageStartEvent, MessageStopEvent, OpenAiCompatProfile,
+    OpenAiCompatProtocol, OutputContentBlock, ParameterCapabilities, ProviderAuthMode,
+    ProviderConnectionConfig, ReasoningCapability, StreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock, Usage,
 };
 
 pub use telemetry::{

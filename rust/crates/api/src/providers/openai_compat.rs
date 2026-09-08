@@ -1,17 +1,20 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::client::RateLimitState;
 use crate::error::ApiError;
 use crate::http_client::build_http_client_or_default;
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
-    MessageResponse, MessageStartEvent, MessageStopEvent, OutputContentBlock, StreamEvent,
-    ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
+    MessageResponse, MessageStartEvent, MessageStopEvent, OpenAiCompatProfile,
+    OpenAiCompatProtocol, OutputContentBlock, ProviderAuthMode, StreamEvent, ToolChoice,
+    ToolDefinition, ToolResultContentBlock, Usage,
 };
 
 use super::{preflight_message_request, Provider, ProviderFuture};
@@ -120,6 +123,11 @@ pub struct OpenAiCompatClient {
     api_key: String,
     config: OpenAiCompatConfig,
     base_url: String,
+    provider_name: String,
+    headers: BTreeMap<String, String>,
+    bearer_auth: bool,
+    profile: Option<OpenAiCompatProfile>,
+    last_rate_limit_state: Arc<StdMutex<Option<RateLimitState>>>,
     max_retries: u32,
     initial_backoff: Duration,
     max_backoff: Duration,
@@ -134,6 +142,14 @@ impl OpenAiCompatClient {
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
+
+    #[must_use]
+    pub fn last_rate_limit_state(&self) -> Option<RateLimitState> {
+        self.last_rate_limit_state
+            .lock()
+            .ok()
+            .and_then(|state| state.clone())
+    }
     #[must_use]
     pub fn new(api_key: impl Into<String>, config: OpenAiCompatConfig) -> Self {
         Self {
@@ -141,6 +157,11 @@ impl OpenAiCompatClient {
             api_key: api_key.into(),
             config,
             base_url: read_base_url(config),
+            provider_name: config.provider_name.to_string(),
+            headers: BTreeMap::new(),
+            bearer_auth: true,
+            profile: None,
+            last_rate_limit_state: Arc::new(StdMutex::new(None)),
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
@@ -155,6 +176,36 @@ impl OpenAiCompatClient {
             ));
         };
         Ok(Self::new(api_key, config))
+    }
+
+    /// Construct a client entirely from a user-declared compatible model
+    /// profile. No provider or model name is interpreted here.
+    pub fn from_profile(profile: &OpenAiCompatProfile) -> Result<Self, ApiError> {
+        if profile.protocol != OpenAiCompatProtocol::ChatCompletions {
+            return Err(ApiError::Auth(
+                "configured OpenAI-compatible profile selects Responses, not Chat Completions"
+                    .to_string(),
+            ));
+        }
+        let connection = resolve_profile_connection(&profile.connection)?;
+        let mut client = Self::new(
+            connection.api_key.unwrap_or_default(),
+            OpenAiCompatConfig::openai(),
+        );
+        client.base_url = connection.base_url;
+        client.provider_name = connection.provider_name;
+        client.headers = connection.headers;
+        client.bearer_auth = connection.bearer_auth;
+        client.profile = Some(profile.clone());
+        if let Some(timeout_ms) = profile.connection.timeout_ms {
+            client.http = crate::http_client::build_http_client_with_timeout(Some(
+                Duration::from_millis(timeout_ms),
+            ))?;
+        }
+        if let Some(max_retries) = profile.connection.max_retries {
+            client.max_retries = max_retries;
+        }
+        Ok(client)
     }
 
     #[must_use]
@@ -172,6 +223,11 @@ impl OpenAiCompatClient {
             api_key: "ollama".to_string(),
             config: OpenAiCompatConfig::ollama(),
             base_url,
+            provider_name: "Ollama".to_string(),
+            headers: BTreeMap::new(),
+            bearer_auth: true,
+            profile: None,
+            last_rate_limit_state: Arc::new(StdMutex::new(None)),
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
@@ -202,7 +258,10 @@ impl OpenAiCompatClient {
     /// that need a deterministic preflight or capture boundary.
     #[must_use]
     pub fn render_request_body(&self, request: &MessageRequest) -> Value {
-        build_chat_completion_request(request, self.config)
+        self.profile.as_ref().map_or_else(
+            || build_chat_completion_request(request, self.config),
+            |profile| build_chat_completion_request_with_profile(request, profile),
+        )
     }
 
     pub async fn send_message(
@@ -215,6 +274,16 @@ impl OpenAiCompatClient {
         };
         preflight_message_request(&request)?;
         let response = self.send_with_retry(&request).await?;
+        if let Ok(mut state) = self.last_rate_limit_state.lock() {
+            *state = RateLimitState::from_headers_with_identity(
+                response.headers(),
+                Some(&self.provider_name),
+                Some(&request.model),
+                self.profile
+                    .as_ref()
+                    .and_then(|profile| profile.connection.id.as_deref()),
+            );
+        }
         let request_id = request_id_from_headers(response.headers());
         let body = response.text().await.map_err(ApiError::from)?;
         // Some backends return {"error":{"message":"...","type":"...","code":...}}
@@ -247,7 +316,7 @@ impl OpenAiCompatClient {
             }
         }
         let payload = serde_json::from_str::<ChatCompletionResponse>(&body).map_err(|error| {
-            ApiError::json_deserialize(self.config.provider_name, &request.model, &body, error)
+            ApiError::json_deserialize(&self.provider_name, &request.model, &body, error)
         })?;
         let mut normalized = normalize_response(&request.model, payload)?;
         if normalized.request_id.is_none() {
@@ -266,8 +335,16 @@ impl OpenAiCompatClient {
             .await?;
         Ok(MessageStream {
             request_id: request_id_from_headers(response.headers()),
+            rate_limit_state: RateLimitState::from_headers_with_identity(
+                response.headers(),
+                Some(&self.provider_name),
+                Some(&request.model),
+                self.profile
+                    .as_ref()
+                    .and_then(|profile| profile.connection.id.as_deref()),
+            ),
             response,
-            parser: OpenAiSseParser::with_context(self.config.provider_name, request.model.clone()),
+            parser: OpenAiSseParser::with_context(&self.provider_name, request.model.clone()),
             pending: VecDeque::new(),
             done: false,
             state: StreamState::new(request.model.clone()),
@@ -327,12 +404,10 @@ impl OpenAiCompatClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let request_url = chat_completions_endpoint(&self.base_url);
-        let mut payload = build_chat_completion_request(request, self.config());
-        if request.tools.is_some() {
-            if let Some(object) = payload.as_object_mut() {
-                object.remove("reasoning_effort");
-            }
-        }
+        let payload = self.profile.as_ref().map_or_else(
+            || build_chat_completion_request(request, self.config()),
+            |profile| build_chat_completion_request_with_profile(request, profile),
+        );
         let attempt_id = HTTP_ATTEMPT_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
         provider_trace(format!(
             "request_ready logical_call={} http_attempt_id={} api=chat_completions path=/chat/completions model={} tools={} tool_count={} reasoning_field={} reasoning={} stream={} max_tokens={} messages={}",
@@ -347,15 +422,17 @@ impl OpenAiCompatClient {
             payload.get("max_tokens").and_then(Value::as_u64).unwrap_or(0),
             request.messages.len(),
         ));
-        let response = self
+        let mut builder = self
             .http
             .post(&request_url)
-            .header("content-type", "application/json")
-            .bearer_auth(&self.api_key)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(ApiError::from);
+            .header("content-type", "application/json");
+        if self.bearer_auth {
+            builder = builder.bearer_auth(&self.api_key);
+        }
+        for (name, value) in &self.headers {
+            builder = builder.header(name, value);
+        }
+        let response = builder.json(&payload).send().await.map_err(ApiError::from);
         match &response {
             Ok(response) => provider_trace(format!(
                 "http_response logical_call={} http_attempt_id={} status={} request_id={}",
@@ -458,6 +535,7 @@ impl Provider for OpenAiCompatClient {
 #[derive(Debug)]
 pub struct MessageStream {
     request_id: Option<String>,
+    rate_limit_state: Option<RateLimitState>,
     response: reqwest::Response,
     parser: OpenAiSseParser,
     pending: VecDeque<StreamEvent>,
@@ -469,6 +547,11 @@ impl MessageStream {
     #[must_use]
     pub fn request_id(&self) -> Option<&str> {
         self.request_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn rate_limit_state(&self) -> Option<&RateLimitState> {
+        self.rate_limit_state.as_ref()
     }
 
     pub async fn next_event(&mut self) -> Result<Option<StreamEvent>, ApiError> {
@@ -1056,6 +1139,166 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
     payload
 }
 
+fn build_chat_completion_request_with_profile(
+    request: &MessageRequest,
+    profile: &OpenAiCompatProfile,
+) -> Value {
+    let mut payload = build_chat_completion_request(request, OpenAiCompatConfig::openai());
+    let Some(object) = payload.as_object_mut() else {
+        return payload;
+    };
+    // A configured model identifier is opaque. Routing aliases are only
+    // stripped by the legacy compatibility builder above.
+    object.insert("model".to_string(), json!(request.model));
+    object.remove("max_tokens");
+    object.remove("max_completion_tokens");
+    if !profile.parameters.stream_usage {
+        object.remove("stream_options");
+    }
+    if profile.parameters.max_output_tokens {
+        object.insert(
+            profile.parameters.max_output_tokens_parameter.clone(),
+            json!(request.max_tokens),
+        );
+    }
+
+    if !profile.parameters.temperature {
+        object.remove("temperature");
+    } else if let Some(value) = request.temperature {
+        object.insert("temperature".to_string(), json!(value));
+    }
+    if !profile.parameters.top_p {
+        object.remove("top_p");
+    } else if let Some(value) = request.top_p {
+        object.insert("top_p".to_string(), json!(value));
+    }
+    if !profile.parameters.frequency_penalty {
+        object.remove("frequency_penalty");
+    } else if let Some(value) = request.frequency_penalty {
+        object.insert("frequency_penalty".to_string(), json!(value));
+    }
+    if !profile.parameters.presence_penalty {
+        object.remove("presence_penalty");
+    } else if let Some(value) = request.presence_penalty {
+        object.insert("presence_penalty".to_string(), json!(value));
+    }
+    if !profile.parameters.stop {
+        object.remove("stop");
+    } else if let Some(value) = request.stop.as_ref().filter(|value| !value.is_empty()) {
+        object.insert("stop".to_string(), json!(value));
+    }
+    if !profile.parameters.tool_choice {
+        object.remove("tool_choice");
+    }
+    if !profile.reasoning.supported
+        || (request.tools.is_some() && !profile.reasoning.supports_with_tools)
+    {
+        object.remove(&profile.reasoning.parameter);
+        object.remove("reasoning_effort");
+    } else if let Some(effort) = request.reasoning_effort.as_ref() {
+        object.remove("reasoning_effort");
+        object.insert(profile.reasoning.parameter.clone(), json!(effort));
+    }
+    payload
+}
+
+#[derive(Debug)]
+pub(crate) struct ResolvedConnection {
+    pub(crate) provider_name: String,
+    pub(crate) base_url: String,
+    pub(crate) api_key: Option<String>,
+    pub(crate) headers: BTreeMap<String, String>,
+    pub(crate) bearer_auth: bool,
+}
+
+pub(crate) fn resolve_profile_connection(
+    connection: &crate::types::ProviderConnectionConfig,
+) -> Result<ResolvedConnection, ApiError> {
+    let provider = connection
+        .provider
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("configured")
+        .to_string();
+    let (default_url, default_url_env, default_credential_env) =
+        match provider.to_ascii_lowercase().as_str() {
+            "openai" => (
+                Some(DEFAULT_OPENAI_BASE_URL),
+                Some("OPENAI_BASE_URL"),
+                Some("OPENAI_API_KEY"),
+            ),
+            "xai" => (
+                Some(DEFAULT_XAI_BASE_URL),
+                Some("XAI_BASE_URL"),
+                Some("XAI_API_KEY"),
+            ),
+            "dashscope" => (
+                Some(DEFAULT_DASHSCOPE_BASE_URL),
+                Some("DASHSCOPE_BASE_URL"),
+                Some("DASHSCOPE_API_KEY"),
+            ),
+            "ollama" => (Some(DEFAULT_OLLAMA_BASE_URL), Some("OLLAMA_HOST"), None),
+            _ => (None, None, None),
+        };
+    let base_url = connection
+        .base_url
+        .clone()
+        .or_else(|| {
+            connection
+                .base_url_env
+                .as_deref()
+                .and_then(|key| std::env::var(key).ok())
+        })
+        .or_else(|| default_url_env.and_then(|key| std::env::var(key).ok()))
+        .or_else(|| default_url.map(str::to_string))
+        .ok_or_else(|| {
+            ApiError::Auth(format!(
+                "configured provider {provider:?} has no baseUrl or baseUrlEnv"
+            ))
+        })?;
+    let credential_env = connection
+        .credential_env
+        .as_deref()
+        .or(default_credential_env);
+    let api_key = match connection.auth {
+        ProviderAuthMode::None => None,
+        ProviderAuthMode::Bearer => {
+            let Some(key_name) = credential_env else {
+                return Err(ApiError::Auth(format!(
+                    "configured provider {provider:?} uses bearer authentication but declares no credentialEnv"
+                )));
+            };
+            let key = read_env_non_empty(key_name)?.ok_or_else(|| {
+                ApiError::Auth(format!(
+                    "missing credentials for configured provider {provider:?}; set {key_name}"
+                ))
+            })?;
+            Some(key)
+        }
+    };
+    let mut headers = connection.headers.clone();
+    for (header, env_name) in &connection.header_env {
+        let value = read_env_non_empty(env_name)?.ok_or_else(|| {
+            ApiError::Auth(format!("missing configured header credential {env_name}"))
+        })?;
+        headers.insert(header.clone(), value);
+    }
+    for (name, value) in &headers {
+        if name.trim().is_empty() || name.contains(['\r', '\n']) || value.contains(['\r', '\n']) {
+            return Err(ApiError::Auth(
+                "configured provider header is invalid".to_string(),
+            ));
+        }
+    }
+    Ok(ResolvedConnection {
+        provider_name: provider,
+        base_url,
+        api_key,
+        headers,
+        bearer_auth: matches!(connection.auth, ProviderAuthMode::Bearer),
+    })
+}
+
 #[allow(clippy::single_match_else)]
 fn translate_message(message: &InputMessage) -> Vec<Value> {
     match message.role.as_str() {
@@ -1518,14 +1761,14 @@ impl StringExt for String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_chat_completion_request, chat_completions_endpoint, is_reasoning_model,
-        normalize_finish_reason, openai_tool_choice, parse_tool_arguments, OpenAiCompatClient,
-        OpenAiCompatConfig,
+        build_chat_completion_request, build_chat_completion_request_with_profile,
+        chat_completions_endpoint, is_reasoning_model, normalize_finish_reason, openai_tool_choice,
+        parse_tool_arguments, OpenAiCompatClient, OpenAiCompatConfig,
     };
     use crate::error::ApiError;
     use crate::types::{
-        InputContentBlock, InputMessage, MessageRequest, ToolChoice, ToolDefinition,
-        ToolResultContentBlock,
+        InputContentBlock, InputMessage, MessageRequest, OpenAiCompatProfile, OpenAiCompatProtocol,
+        ProviderConnectionConfig, ToolChoice, ToolDefinition, ToolResultContentBlock,
     };
     use serde_json::json;
     use std::sync::{Mutex, OnceLock};
@@ -1784,6 +2027,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn explicit_profile_resolves_custom_credential_and_header_environment() {
+        let _lock = env_lock();
+        let key_name = "CLAW_TEST_COMPAT_TOKEN";
+        let tenant_name = "CLAW_TEST_COMPAT_TENANT";
+        let old_key = std::env::var_os(key_name);
+        let old_tenant = std::env::var_os(tenant_name);
+        std::env::set_var(key_name, "gateway-token");
+        std::env::set_var(tenant_name, "tenant-a");
+        let profile = OpenAiCompatProfile {
+            connection: ProviderConnectionConfig {
+                provider: Some("fictional-gateway".to_string()),
+                base_url: Some("http://127.0.0.1:1/v1".to_string()),
+                credential_env: Some(key_name.to_string()),
+                header_env: std::collections::BTreeMap::from([(
+                    "x-tenant".to_string(),
+                    tenant_name.to_string(),
+                )]),
+                ..Default::default()
+            },
+            protocol: OpenAiCompatProtocol::ChatCompletions,
+            ..Default::default()
+        };
+        let client = OpenAiCompatClient::from_profile(&profile).expect("profile should resolve");
+        assert_eq!(client.api_key, "gateway-token");
+        assert_eq!(
+            client.headers.get("x-tenant").map(String::as_str),
+            Some("tenant-a")
+        );
+        if let Some(value) = old_key {
+            std::env::set_var(key_name, value);
+        } else {
+            std::env::remove_var(key_name);
+        }
+        if let Some(value) = old_tenant {
+            std::env::set_var(tenant_name, value);
+        } else {
+            std::env::remove_var(tenant_name);
+        }
+    }
+
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -1821,6 +2105,33 @@ mod tests {
         assert_eq!(payload["frequency_penalty"], 0.5);
         assert_eq!(payload["presence_penalty"], 0.3);
         assert_eq!(payload["stop"], json!(["\n"]));
+    }
+
+    #[test]
+    fn explicit_profile_does_not_infer_optional_parameters_from_model_name() {
+        let request = MessageRequest {
+            model: "o1-compatible-custom".to_string(),
+            max_tokens: 128,
+            messages: vec![],
+            temperature: Some(0.4),
+            reasoning_effort: Some("high".to_string()),
+            ..Default::default()
+        };
+        let payload = build_chat_completion_request_with_profile(
+            &request,
+            &OpenAiCompatProfile {
+                capabilities: crate::types::EndpointCapabilities {
+                    reasoning: false,
+                    ..Default::default()
+                },
+                reasoning: crate::types::ReasoningCapability::default(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(payload["model"], json!("o1-compatible-custom"));
+        assert_eq!(payload["max_tokens"], json!(128));
+        assert_eq!(payload["temperature"], json!(0.4));
+        assert!(payload.get("reasoning_effort").is_none());
     }
 
     #[test]

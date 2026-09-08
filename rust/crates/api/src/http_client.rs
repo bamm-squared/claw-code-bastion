@@ -1,4 +1,5 @@
 use crate::error::ApiError;
+use std::time::Duration;
 
 const HTTP_PROXY_KEYS: [&str; 2] = ["HTTP_PROXY", "http_proxy"];
 const HTTPS_PROXY_KEYS: [&str; 2] = ["HTTPS_PROXY", "https_proxy"];
@@ -81,7 +82,25 @@ pub fn build_http_client_or_default() -> reqwest::Client {
 /// and `https_proxy` fields and is registered as both an HTTP and HTTPS
 /// proxy so a single value can route every outbound request.
 pub fn build_http_client_with(config: &ProxyConfig) -> Result<reqwest::Client, ApiError> {
+    build_http_client_with_timeout_and_proxy(config, None)
+}
+
+/// Build the normal proxy-aware client with an optional request timeout.
+pub fn build_http_client_with_timeout(
+    timeout: Option<Duration>,
+) -> Result<reqwest::Client, ApiError> {
+    build_http_client_with_timeout_and_proxy(&ProxyConfig::from_env(), timeout)
+}
+
+fn build_http_client_with_timeout_and_proxy(
+    config: &ProxyConfig,
+    timeout: Option<Duration>,
+) -> Result<reqwest::Client, ApiError> {
     let mut builder = reqwest::Client::builder().no_proxy();
+
+    if let Some(timeout) = timeout {
+        builder = builder.timeout(timeout);
+    }
 
     let no_proxy = config
         .no_proxy

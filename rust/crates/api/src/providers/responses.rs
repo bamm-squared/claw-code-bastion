@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use reqwest::Response;
 use serde_json::{json, Value};
@@ -32,7 +34,12 @@ pub struct ResponsesClient {
     http: reqwest::Client,
     api_key: String,
     base_url: String,
-    provider_name: &'static str,
+    provider_name: String,
+    headers: std::collections::BTreeMap<String, String>,
+    bearer_auth: bool,
+    profile: Option<crate::types::OpenAiCompatProfile>,
+    max_retries: u32,
+    last_rate_limit_state: Arc<StdMutex<Option<RateLimitState>>>,
 }
 
 impl ResponsesClient {
@@ -42,7 +49,12 @@ impl ResponsesClient {
             http: build_http_client_or_default(),
             api_key: api_key.into(),
             base_url: read_base_url(config),
-            provider_name: config.provider_name,
+            provider_name: config.provider_name.to_string(),
+            headers: std::collections::BTreeMap::new(),
+            bearer_auth: true,
+            profile: None,
+            max_retries: 0,
+            last_rate_limit_state: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -65,6 +77,33 @@ impl ResponsesClient {
         Ok(Self::new(api_key, config))
     }
 
+    /// Construct a Responses transport from an explicit compatible profile.
+    pub fn from_profile(profile: &crate::types::OpenAiCompatProfile) -> Result<Self, ApiError> {
+        if profile.protocol != crate::types::OpenAiCompatProtocol::Responses {
+            return Err(ApiError::Auth(
+                "configured OpenAI-compatible profile selects Chat Completions, not Responses"
+                    .to_string(),
+            ));
+        }
+        let connection = super::openai_compat::resolve_profile_connection(&profile.connection)?;
+        let mut client = Self::new(
+            connection.api_key.unwrap_or_default(),
+            OpenAiCompatConfig::openai(),
+        );
+        client.base_url = connection.base_url;
+        client.provider_name = connection.provider_name;
+        client.headers = connection.headers;
+        client.bearer_auth = connection.bearer_auth;
+        client.profile = Some(profile.clone());
+        client.max_retries = profile.connection.max_retries.unwrap_or(0);
+        if let Some(timeout_ms) = profile.connection.timeout_ms {
+            client.http = crate::http_client::build_http_client_with_timeout(Some(
+                std::time::Duration::from_millis(timeout_ms),
+            ))?;
+        }
+        Ok(client)
+    }
+
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
@@ -74,6 +113,14 @@ impl ResponsesClient {
     #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    #[must_use]
+    pub fn last_rate_limit_state(&self) -> Option<RateLimitState> {
+        self.last_rate_limit_state
+            .lock()
+            .ok()
+            .and_then(|state| state.clone())
     }
 
     fn endpoint(&self) -> String {
@@ -86,6 +133,21 @@ impl ResponsesClient {
     }
 
     async fn post(&self, request: &MessageRequest) -> Result<Response, ApiError> {
+        let mut retries = 0;
+        loop {
+            match self.post_once(request).await {
+                Ok(response) => return Ok(response),
+                Err(error) if error.is_retryable() && retries < self.max_retries => {
+                    let delay_ms = 250_u64.saturating_mul(1_u64 << retries.min(4));
+                    retries = retries.saturating_add(1);
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn post_once(&self, request: &MessageRequest) -> Result<Response, ApiError> {
         let attempt_id = HTTP_ATTEMPT_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
         provider_trace(format!(
             "request_ready logical_call={} http_attempt_id={} api=responses path=/responses model={} tools={} tool_count={} reasoning_field={} reasoning={} stream={} max_output_tokens={} messages={}",
@@ -100,15 +162,21 @@ impl ResponsesClient {
             request.max_tokens,
             request.messages.len(),
         ));
-        let response = self
+        let mut builder = self
             .http
             .post(self.endpoint())
-            .header("content-type", "application/json")
-            .bearer_auth(&self.api_key)
-            .json(&build_responses_request(request))
-            .send()
-            .await
-            .map_err(ApiError::from)?;
+            .header("content-type", "application/json");
+        if self.bearer_auth {
+            builder = builder.bearer_auth(&self.api_key);
+        }
+        for (name, value) in &self.headers {
+            builder = builder.header(name, value);
+        }
+        let body = self.profile.as_ref().map_or_else(
+            || build_responses_request(request),
+            |profile| build_responses_request_with_profile(request, profile),
+        );
+        let response = builder.json(&body).send().await.map_err(ApiError::from)?;
         provider_trace(format!(
             "http_response logical_call={} http_attempt_id={} status={} request_id={}",
             request.provider_call_id.as_deref().unwrap_or("unassigned"),
@@ -138,7 +206,9 @@ impl ResponsesClient {
                 message: Some(body.clone()),
                 request_id,
                 body,
-                retryable: false,
+                retryable: status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status.is_server_error()
+                    || status == reqwest::StatusCode::REQUEST_TIMEOUT,
             })
         }
     }
@@ -153,6 +223,16 @@ impl ResponsesClient {
         };
         preflight_message_request(&request)?;
         let response = self.post(&request).await?;
+        if let Ok(mut state) = self.last_rate_limit_state.lock() {
+            *state = RateLimitState::from_headers_with_identity(
+                response.headers(),
+                Some(&self.provider_name),
+                Some(&request.model),
+                self.profile
+                    .as_ref()
+                    .and_then(|profile| profile.connection.id.as_deref()),
+            );
+        }
         let request_id = response
             .headers()
             .get("x-request-id")
@@ -161,7 +241,7 @@ impl ResponsesClient {
             .map(ToOwned::to_owned);
         let body = response.text().await.map_err(ApiError::from)?;
         let raw: Value = serde_json::from_str(&body).map_err(|error| {
-            ApiError::json_deserialize(self.provider_name, &request.model, &body, error)
+            ApiError::json_deserialize(&self.provider_name, &request.model, &body, error)
         })?;
         let mut normalized = normalize_response(&request.model, &raw);
         normalized.request_id = request_id;
@@ -174,7 +254,17 @@ impl ResponsesClient {
     ) -> Result<ResponsesStream, ApiError> {
         preflight_message_request(request)?;
         let response = self.post(&request.clone().with_streaming()).await?;
-        let rate_limit_state = RateLimitState::from_headers(response.headers());
+        let rate_limit_state = RateLimitState::from_headers_with_identity(
+            response.headers(),
+            Some(&self.provider_name),
+            Some(&request.model),
+            self.profile
+                .as_ref()
+                .and_then(|profile| profile.connection.id.as_deref()),
+        );
+        if let Ok(mut state) = self.last_rate_limit_state.lock() {
+            state.clone_from(&rate_limit_state);
+        }
         let request_id = response
             .headers()
             .get("x-request-id")
@@ -993,6 +1083,42 @@ fn build_responses_request(request: &MessageRequest) -> Value {
     }
     if let Some(effort) = request.reasoning_effort.as_ref() {
         payload["reasoning"] = json!({"effort": effort});
+    }
+    payload
+}
+
+fn build_responses_request_with_profile(
+    request: &MessageRequest,
+    profile: &crate::types::OpenAiCompatProfile,
+) -> Value {
+    let mut payload = build_responses_request(request);
+    let Some(object) = payload.as_object_mut() else {
+        return payload;
+    };
+    object.insert("model".to_string(), json!(request.model));
+    object.remove("max_output_tokens");
+    if profile.parameters.max_output_tokens {
+        let parameter = if profile.parameters.max_output_tokens_parameter == "max_tokens" {
+            "max_output_tokens"
+        } else {
+            profile.parameters.max_output_tokens_parameter.as_str()
+        };
+        object.insert(parameter.to_string(), json!(request.max_tokens));
+    }
+    if !profile.parameters.tool_choice {
+        object.remove("tool_choice");
+    }
+    if !profile.reasoning.supported
+        || (request.tools.is_some() && !profile.reasoning.supports_with_tools)
+    {
+        object.remove("reasoning");
+    } else if let Some(effort) = request.reasoning_effort.as_ref() {
+        if profile.reasoning.parameter == "reasoning_effort" {
+            object.insert("reasoning".to_string(), json!({"effort": effort}));
+        } else {
+            object.remove("reasoning");
+            object.insert(profile.reasoning.parameter.clone(), json!(effort));
+        }
     }
     payload
 }

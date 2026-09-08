@@ -4,11 +4,15 @@ use crate::providers::anthropic::{self, AnthropicClient, AuthSource};
 use crate::providers::openai_compat::{self, OpenAiCompatClient, OpenAiCompatConfig};
 use crate::providers::responses::ResponsesClient;
 use crate::providers::{self, ProviderKind};
-use crate::types::{EndpointCapabilities, MessageRequest, MessageResponse, StreamEvent};
+use crate::types::{
+    EndpointCapabilities, MessageRequest, MessageResponse, OpenAiCompatProfile, StreamEvent,
+};
+use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Optional provider rate-limit information observed on a response.
 /// Providers may omit any or all fields; callers must treat it as advisory.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RateLimitState {
     pub token_limit: Option<u64>,
     pub token_remaining: Option<u64>,
@@ -16,6 +20,10 @@ pub struct RateLimitState {
     pub request_limit: Option<u64>,
     pub request_remaining: Option<u64>,
     pub request_reset_after_seconds: Option<u64>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub profile_id: Option<String>,
+    pub observed_at_unix_seconds: Option<u64>,
 }
 
 #[cfg(test)]
@@ -50,6 +58,16 @@ mod rate_limit_tests {
 impl RateLimitState {
     #[must_use]
     pub fn from_headers(headers: &reqwest::header::HeaderMap) -> Option<Self> {
+        Self::from_headers_with_identity(headers, None, None, None)
+    }
+
+    #[must_use]
+    pub fn from_headers_with_identity(
+        headers: &reqwest::header::HeaderMap,
+        provider: Option<&str>,
+        model: Option<&str>,
+        profile_id: Option<&str>,
+    ) -> Option<Self> {
         let state = Self {
             token_limit: header_u64(headers, "x-ratelimit-limit-tokens"),
             token_remaining: header_u64(headers, "x-ratelimit-remaining-tokens"),
@@ -60,6 +78,13 @@ impl RateLimitState {
                 headers,
                 "x-ratelimit-reset-requests",
             ),
+            provider: provider.map(str::to_string),
+            model: model.map(str::to_string),
+            profile_id: profile_id.map(str::to_string),
+            observed_at_unix_seconds: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|duration| duration.as_secs()),
         };
         (state.token_limit.is_some()
             || state.token_remaining.is_some()
@@ -107,6 +132,8 @@ pub enum ProviderClient {
     Xai(OpenAiCompatClient),
     OpenAi(OpenAiCompatClient),
     OpenAiResponses(ResponsesClient),
+    ConfiguredOpenAi(OpenAiCompatClient),
+    ConfiguredOpenAiResponses(ResponsesClient),
 }
 
 impl ProviderClient {
@@ -229,12 +256,32 @@ impl ProviderClient {
         }
     }
 
+    /// Construct an OpenAI-compatible client from explicit connection and
+    /// model capability configuration. The model string is passed through
+    /// unchanged and never selects the provider or protocol.
+    pub fn from_openai_compat_profile(
+        _model: &str,
+        profile: &OpenAiCompatProfile,
+    ) -> Result<Self, ApiError> {
+        match profile.protocol {
+            crate::types::OpenAiCompatProtocol::Responses => Ok(Self::ConfiguredOpenAiResponses(
+                ResponsesClient::from_profile(profile)?,
+            )),
+            crate::types::OpenAiCompatProtocol::ChatCompletions => Ok(Self::ConfiguredOpenAi(
+                OpenAiCompatClient::from_profile(profile)?,
+            )),
+        }
+    }
+
     #[must_use]
     pub const fn provider_kind(&self) -> ProviderKind {
         match self {
             Self::Anthropic(_) => ProviderKind::Anthropic,
             Self::Xai(_) => ProviderKind::Xai,
-            Self::OpenAi(_) | Self::OpenAiResponses(_) => ProviderKind::OpenAi,
+            Self::OpenAi(_)
+            | Self::OpenAiResponses(_)
+            | Self::ConfiguredOpenAi(_)
+            | Self::ConfiguredOpenAiResponses(_) => ProviderKind::OpenAi,
         }
     }
 
@@ -242,8 +289,8 @@ impl ProviderClient {
     pub const fn protocol_name(&self) -> &'static str {
         match self {
             Self::Anthropic(_) => "anthropic",
-            Self::Xai(_) | Self::OpenAi(_) => "chat_completions",
-            Self::OpenAiResponses(_) => "responses",
+            Self::Xai(_) | Self::OpenAi(_) | Self::ConfiguredOpenAi(_) => "chat_completions",
+            Self::OpenAiResponses(_) | Self::ConfiguredOpenAiResponses(_) => "responses",
         }
     }
 
@@ -259,7 +306,11 @@ impl ProviderClient {
     pub fn prompt_cache_stats(&self) -> Option<PromptCacheStats> {
         match self {
             Self::Anthropic(client) => client.prompt_cache_stats(),
-            Self::Xai(_) | Self::OpenAi(_) | Self::OpenAiResponses(_) => None,
+            Self::Xai(_)
+            | Self::OpenAi(_)
+            | Self::OpenAiResponses(_)
+            | Self::ConfiguredOpenAi(_)
+            | Self::ConfiguredOpenAiResponses(_) => None,
         }
     }
 
@@ -267,7 +318,11 @@ impl ProviderClient {
     pub fn take_last_prompt_cache_record(&self) -> Option<PromptCacheRecord> {
         match self {
             Self::Anthropic(client) => client.take_last_prompt_cache_record(),
-            Self::Xai(_) | Self::OpenAi(_) | Self::OpenAiResponses(_) => None,
+            Self::Xai(_)
+            | Self::OpenAi(_)
+            | Self::OpenAiResponses(_)
+            | Self::ConfiguredOpenAi(_)
+            | Self::ConfiguredOpenAiResponses(_) => None,
         }
     }
 
@@ -277,8 +332,12 @@ impl ProviderClient {
     ) -> Result<MessageResponse, ApiError> {
         match self {
             Self::Anthropic(client) => client.send_message(request).await,
-            Self::Xai(client) | Self::OpenAi(client) => client.send_message(request).await,
-            Self::OpenAiResponses(client) => client.send_message(request).await,
+            Self::Xai(client) | Self::OpenAi(client) | Self::ConfiguredOpenAi(client) => {
+                client.send_message(request).await
+            }
+            Self::OpenAiResponses(client) | Self::ConfiguredOpenAiResponses(client) => {
+                client.send_message(request).await
+            }
         }
     }
 
@@ -291,14 +350,27 @@ impl ProviderClient {
                 .stream_message(request)
                 .await
                 .map(MessageStream::Anthropic),
-            Self::Xai(client) | Self::OpenAi(client) => client
+            Self::Xai(client) | Self::OpenAi(client) | Self::ConfiguredOpenAi(client) => client
                 .stream_message(request)
                 .await
                 .map(MessageStream::OpenAiCompat),
-            Self::OpenAiResponses(client) => client
+            Self::OpenAiResponses(client) | Self::ConfiguredOpenAiResponses(client) => client
                 .stream_message(request)
                 .await
                 .map(MessageStream::Responses),
+        }
+    }
+
+    #[must_use]
+    pub fn last_rate_limit_state(&self) -> Option<RateLimitState> {
+        match self {
+            Self::Anthropic(_) => None,
+            Self::Xai(client) | Self::OpenAi(client) | Self::ConfiguredOpenAi(client) => {
+                client.last_rate_limit_state()
+            }
+            Self::OpenAiResponses(client) | Self::ConfiguredOpenAiResponses(client) => {
+                client.last_rate_limit_state()
+            }
         }
     }
 }
@@ -323,7 +395,8 @@ impl MessageStream {
     #[must_use]
     pub fn rate_limit_state(&self) -> Option<&RateLimitState> {
         match self {
-            Self::Anthropic(_) | Self::OpenAiCompat(_) => None,
+            Self::Anthropic(_) => None,
+            Self::OpenAiCompat(stream) => stream.rate_limit_state(),
             Self::Responses(stream) => stream.rate_limit_state(),
         }
     }

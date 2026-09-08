@@ -1401,18 +1401,7 @@ fn execute_calibration_case(
     let started = Instant::now();
     let result = (|| -> Result<bool, String> {
         let resolved_model = api::resolve_model_alias(&profile.model);
-        enforce_private_provider(&resolved_model).map_err(|error| error.to_string())?;
-        let client = ApiProviderClient::from_model_with_profile_and_capabilities(
-            &resolved_model,
-            Some(&profile.provider),
-            (profile.provider.eq_ignore_ascii_case("anthropic"))
-                .then(resolve_cli_auth_source)
-                .transpose()
-                .map_err(|error| error.to_string())?,
-            profile.endpoint.as_deref(),
-            profile.protocol_capabilities,
-        )
-        .map_err(|error| error.to_string())?;
+        let client = client_for_model_profile(profile)?;
         let system = match case.role {
             model_router::ModelRole::Evaluator => {
                 "You are a calibration evaluator. Return only JSON: {\"result\":\"satisfied\"} or {\"result\":\"gap\"}."
@@ -1428,7 +1417,7 @@ fn execute_calibration_case(
             ))],
             system: Some(system.to_string()),
             stream: false,
-            reasoning_effort: normalize_profile_reasoning(profile.reasoning_profile.as_deref())?,
+            reasoning_effort: profile.reasoning_effort()?,
             ..Default::default()
         };
         let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
@@ -5897,9 +5886,7 @@ impl LiveCli {
             if let Some(inner) = runtime.runtime.as_mut() {
                 inner
                     .api_client_mut()
-                    .set_reasoning_effort(normalize_profile_reasoning(
-                        profile.reasoning_profile.as_deref(),
-                    )?);
+                    .set_reasoning_effort(profile.reasoning_effort()?);
             }
         }
         let runtime = if let Some(selection) = repository_context {
@@ -6613,6 +6600,8 @@ impl LiveCli {
                     .map(|rejection| benchmark_telemetry::RoutingRejection {
                         profile_id: rejection.profile_id.clone(),
                         reason: rejection.reason.clone(),
+                        capability: rejection.capability,
+                        required: rejection.required,
                     })
                     .collect(),
             );
@@ -8152,15 +8141,36 @@ impl LiveCli {
 
 fn set_provider_telemetry_context(role: &str, profile: &model_router::ModelProfile) {
     let pricing = model_router::actual_pricing_for_profile(profile);
+    let endpoint = profile
+        .openai_compat
+        .as_ref()
+        .and_then(|compat| compat.connection.base_url.as_deref())
+        .or(profile.endpoint.as_deref())
+        .map(redacted_provider_endpoint);
+    let protocol = profile.openai_compat.as_ref().map_or_else(
+        || {
+            if profile.protocol_capabilities.is_some() {
+                "configured".to_string()
+            } else {
+                "legacy".to_string()
+            }
+        },
+        |compat| match compat.protocol {
+            api::OpenAiCompatProtocol::Responses => "responses".to_string(),
+            api::OpenAiCompatProtocol::ChatCompletions => "chat_completions".to_string(),
+        },
+    );
     benchmark_telemetry::set_provider_context(
         role,
         Some(&profile.id),
-        Some(&profile.provider),
-        Some(if profile.protocol_capabilities.is_some() {
-            "configured"
-        } else {
-            "default"
-        }),
+        Some(
+            profile
+                .openai_compat
+                .as_ref()
+                .and_then(|compat| compat.connection.provider.as_deref())
+                .unwrap_or(profile.provider.as_str()),
+        ),
+        Some(&protocol),
         pricing.as_ref().map(|value| value.input_cost_per_million),
         pricing.as_ref().map(|value| value.output_cost_per_million),
         Some(if profile.pricing.actual_cost_known {
@@ -8168,6 +8178,17 @@ fn set_provider_telemetry_context(role: &str, profile: &model_router::ModelProfi
         } else {
             "resolved"
         }),
+    );
+    let reasoning = profile.reasoning_effort().ok().flatten();
+    benchmark_telemetry::set_provider_execution(
+        Some(&profile.model),
+        endpoint.as_deref(),
+        reasoning.as_deref(),
+        profile
+            .openai_compat
+            .as_ref()
+            .map(|compat| compat.capabilities.function_tools),
+        Some(profile.capability.context_window),
     );
 }
 
@@ -8184,6 +8205,8 @@ fn record_writer_routing(decision: &model_router::RouteDecision) {
             .map(|rejection| benchmark_telemetry::RoutingRejection {
                 profile_id: rejection.profile_id.clone(),
                 reason: rejection.reason.clone(),
+                capability: rejection.capability,
+                required: rejection.required,
             })
             .collect(),
         benchmark_telemetry::RoutingEstimate {
@@ -10595,9 +10618,7 @@ fn build_runtime_with_plugin_state_profile(
             allowed_tools.clone(),
             tool_registry.clone(),
             progress_reporter,
-            profile.map(|value| value.provider.as_str()),
-            profile.and_then(|value| value.endpoint.as_deref()),
-            profile.and_then(|value| value.protocol_capabilities),
+            profile,
         )?,
         CliToolExecutor::new(
             allowed_tools.clone(),
@@ -10753,9 +10774,7 @@ impl AnthropicRuntimeClient {
         allowed_tools: Option<AllowedToolSet>,
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
-        provider: Option<&str>,
-        endpoint: Option<&str>,
-        protocol_capabilities: Option<api::EndpointCapabilities>,
+        profile: Option<&model_router::ModelProfile>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Dispatch to the correct provider at construction time.
         // `ApiProviderClient` (exposed by the api crate as
@@ -10779,63 +10798,52 @@ impl AnthropicRuntimeClient {
         let resolved_model = api::resolve_model_alias(&model);
         enforce_private_provider(&resolved_model)?;
         provider_trace(format!(
-            "provider_constructor model={} provider_hint={} endpoint={} tools={} configured_model={}",
+            "provider_constructor model={} configured_profile={} tools={} configured_model={}",
             resolved_model,
-            provider.unwrap_or("none"),
-            endpoint.unwrap_or("env/default"),
+            profile.map_or("none", |value| value.id.as_str()),
             enable_tools,
             model
         ));
-        let client = match provider
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-            .and_then(|value| match value {
-                "anthropic" => Some(ProviderKind::Anthropic),
-                "xai" => Some(ProviderKind::Xai),
-                "openai" | "ollama" | "vllm" | "dashscope" => Some(ProviderKind::OpenAi),
-                _ => None,
-            })
-            .unwrap_or_else(|| detect_provider_kind(&resolved_model))
-        {
-            ProviderKind::Anthropic => {
+        let client = if let Some(profile) = profile {
+            if let Some(compat) = profile.openai_compat_profile() {
+                ApiProviderClient::from_openai_compat_profile(&resolved_model, &compat)?
+            } else if profile.provider.eq_ignore_ascii_case("anthropic") {
                 let auth = resolve_cli_auth_source()?;
-                let mut inner = AnthropicClient::from_auth(auth)
-                    .with_base_url(endpoint.map_or_else(api::read_base_url, str::to_string));
+                let mut inner =
+                    AnthropicClient::from_auth(auth).with_base_url(api::read_base_url());
                 if !is_private_mode() {
                     inner = inner.with_prompt_cache(PromptCache::new(session_id));
                 }
                 ApiProviderClient::Anthropic(inner)
-            }
-            ProviderKind::Xai | ProviderKind::OpenAi => {
-                // The api crate's `ProviderClient::from_model_with_anthropic_auth`
-                // with `None` for the anthropic auth routes via
-                // `detect_provider_kind` and builds an
-                // `OpenAiCompatClient::from_env` with the matching
-                // `OpenAiCompatConfig` (openai / xai / dashscope).
-                // That reads the correct API-key env var and BASE_URL
-                // override internally, so this one call covers OpenAI,
-                // OpenRouter, xAI, DashScope, Ollama, and any other
-                // OpenAI-compat endpoint users configure via
-                // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
-                let client = ApiProviderClient::from_model_with_profile_and_capabilities(
+            } else {
+                ApiProviderClient::from_model_with_profile_and_capabilities(
                     &resolved_model,
-                    provider,
+                    Some(&profile.provider),
                     None,
-                    endpoint,
-                    protocol_capabilities,
-                )?;
-                provider_trace(format!(
-                    "provider_selected kind={:?} model={} effective_endpoint={} api_client={}",
-                    client.provider_kind(),
-                    resolved_model,
-                    endpoint.unwrap_or("env/default"),
-                    match client.provider_kind() {
-                        ProviderKind::OpenAi => "openai_compat",
-                        ProviderKind::Xai => "xai_compat",
-                        ProviderKind::Anthropic => "anthropic",
+                    profile.endpoint.as_deref(),
+                    profile.protocol_capabilities,
+                )?
+            }
+        } else {
+            match detect_provider_kind(&resolved_model) {
+                ProviderKind::Anthropic => {
+                    let auth = resolve_cli_auth_source()?;
+                    let mut inner =
+                        AnthropicClient::from_auth(auth).with_base_url(api::read_base_url());
+                    if !is_private_mode() {
+                        inner = inner.with_prompt_cache(PromptCache::new(session_id));
                     }
-                ));
-                client
+                    ApiProviderClient::Anthropic(inner)
+                }
+                ProviderKind::Xai | ProviderKind::OpenAi => {
+                    ApiProviderClient::from_model_with_profile_and_capabilities(
+                        &resolved_model,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )?
+                }
             }
         };
         benchmark_telemetry::set_provider_protocol(client.protocol_name());
@@ -10867,14 +10875,16 @@ fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
     resolve_startup_auth_source(|| Ok(None))
 }
 
-fn execute_evaluator_profile(
+fn client_for_model_profile(
     profile: &model_router::ModelProfile,
-    request: &requirement_evaluator::EvaluationRequest,
-) -> Result<String, String> {
-    set_provider_telemetry_context("evaluator", profile);
+) -> Result<ApiProviderClient, String> {
     let resolved_model = api::resolve_model_alias(&profile.model);
     enforce_private_provider(&resolved_model).map_err(|error| error.to_string())?;
-    let client = ApiProviderClient::from_model_with_profile_and_capabilities(
+    if let Some(compat) = profile.openai_compat_profile() {
+        return ApiProviderClient::from_openai_compat_profile(&resolved_model, &compat)
+            .map_err(|error| error.to_string());
+    }
+    ApiProviderClient::from_model_with_profile_and_capabilities(
         &resolved_model,
         Some(&profile.provider),
         (profile.provider.eq_ignore_ascii_case("anthropic"))
@@ -10884,7 +10894,16 @@ fn execute_evaluator_profile(
         profile.endpoint.as_deref(),
         profile.protocol_capabilities,
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| error.to_string())
+}
+
+fn execute_evaluator_profile(
+    profile: &model_router::ModelProfile,
+    request: &requirement_evaluator::EvaluationRequest,
+) -> Result<String, String> {
+    set_provider_telemetry_context("evaluator", profile);
+    let resolved_model = api::resolve_model_alias(&profile.model);
+    let client = client_for_model_profile(profile)?;
     benchmark_telemetry::set_provider_protocol(client.protocol_name());
     let request_text = requirement_evaluator::RequirementEvaluator::render_request(request);
     let message_request = MessageRequest {
@@ -10896,7 +10915,7 @@ fn execute_evaluator_profile(
                 .to_string(),
         ),
         stream: false,
-        reasoning_effort: normalize_profile_reasoning(profile.reasoning_profile.as_deref())?,
+        reasoning_effort: profile.reasoning_effort()?,
         ..Default::default()
     };
     if let Ok(bytes) = serde_json::to_vec(&message_request) {
@@ -10942,18 +10961,7 @@ fn execute_explorer_profile(
 ) -> Result<Vec<exploration::ExplorerFinding>, String> {
     set_provider_telemetry_context("explorer", profile);
     let resolved_model = api::resolve_model_alias(&profile.model);
-    enforce_private_provider(&resolved_model).map_err(|error| error.to_string())?;
-    let client = ApiProviderClient::from_model_with_profile_and_capabilities(
-        &resolved_model,
-        Some(&profile.provider),
-        (profile.provider.eq_ignore_ascii_case("anthropic"))
-            .then(resolve_cli_auth_source)
-            .transpose()
-            .map_err(|error| error.to_string())?,
-        profile.endpoint.as_deref(),
-        profile.protocol_capabilities,
-    )
-    .map_err(|error| error.to_string())?;
+    let client = client_for_model_profile(profile)?;
     benchmark_telemetry::set_provider_protocol(client.protocol_name());
     let request_text = format!(
         "You are a bounded read-only repository explorer.\nQuestion: {}\nEvidence:\n{}\nReturn only JSON: {{\"findings\":[{{\"subject\":\"...\",\"claim\":\"...\",\"evidence\":\"...\",\"confidence\":0}}]}}. Do not suggest edits or claim certainty beyond evidence.",
@@ -10965,7 +10973,7 @@ fn execute_explorer_profile(
         messages: vec![InputMessage::user_text(request_text)],
         system: Some("Return compact structured findings only.".to_string()),
         stream: false,
-        reasoning_effort: normalize_profile_reasoning(profile.reasoning_profile.as_deref())?,
+        reasoning_effort: profile.reasoning_effort()?,
         ..Default::default()
     };
     if let Ok(bytes) = serde_json::to_vec(&message_request) {
@@ -11166,6 +11174,7 @@ impl AnthropicRuntimeClient {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                 Some(rate_limit_state.clone());
+            benchmark_telemetry::set_provider_rate_limit(Some(rate_limit_state));
             benchmark_telemetry::writer_request_resource_estimate(
                 0,
                 rate_limit_state.token_limit,
