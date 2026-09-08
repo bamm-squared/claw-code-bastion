@@ -435,6 +435,26 @@ pub fn work_unit_budget(used: usize, allowance: usize, continuation_grants: u8) 
     });
 }
 
+pub fn work_unit_checkpoint_runtime_state(used: usize, allowance: usize, continuation_grants: u8) {
+    with_state(|s| {
+        if let Some(record) = s
+            .snapshot
+            .work_unit_checkpoints
+            .last_mut()
+            .filter(|record| record.reconciliation_outcome.is_none())
+        {
+            record.writer_turns = used as u64;
+            record.turn_allowance = allowance as u64;
+            record.remaining_turns = allowance.saturating_sub(used) as u64;
+            record.continuation_grants = u64::from(continuation_grants);
+            if record.work_unit.is_none() {
+                record.work_unit = s.snapshot.current_work_unit.clone();
+            }
+        }
+    });
+    persist_snapshot();
+}
+
 pub fn work_unit_reconciliation_counters(rejections: u8, no_change_attempts: u8) {
     with_state(|s| {
         s.snapshot.work_unit_completion_rejections = u64::from(rejections);

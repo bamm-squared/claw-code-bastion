@@ -5976,6 +5976,11 @@ impl LiveCli {
                     self.work_unit_turn_allowance,
                     self.work_unit_continuation_grants,
                 );
+                benchmark_telemetry::work_unit_checkpoint_runtime_state(
+                    self.work_unit_writer_turns,
+                    self.work_unit_turn_allowance,
+                    self.work_unit_continuation_grants,
+                );
                 if summary.iterations > writer_iteration_budget(self.task_plan.planning_mode()) {
                     benchmark_telemetry::lifecycle_event("writer_soft_checkpoint_triggered");
                 }
