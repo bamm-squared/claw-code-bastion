@@ -464,14 +464,20 @@ impl ExecutionBackend for IsolatedExecutionBackend {
             .checks
             .iter()
             .map(|check| {
+                let stdout = truncate_development_output(&check.stdout, 4_000);
+                let stderr = truncate_development_output(&check.stderr, 8_000);
                 json!({
                     "name": check.name,
                     "command": check.command,
                     "status": format_validation_status(check.status),
+                    "classification": validation_check_classification(check.status).0,
+                    "code_failure": validation_check_classification(check.status).1,
                     "exit_code": check.exit_code,
-                    "stdout": truncate_development_output(&check.stdout, 4_000),
-                    "stderr": truncate_development_output(&check.stderr, 8_000),
-                    "truncated": check.truncated,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "truncated": check.truncated
+                        || check.stdout.chars().count() > 4_000
+                        || check.stderr.chars().count() > 8_000,
                 })
             })
             .collect::<Vec<_>>();
@@ -723,23 +729,39 @@ fn development_check_classification(
 fn development_check_diagnostic(
     validation: &runtime::validator::ValidationResult,
 ) -> Option<String> {
-    validation
+    let diagnostics = validation
         .checks
         .iter()
-        .find(|check| check.status != runtime::ValidationStatus::Pass)
+        .filter(|check| check.status != runtime::ValidationStatus::Pass)
         .map(|check| {
             let output = if check.stderr.trim().is_empty() {
                 check.stdout.trim()
             } else {
                 check.stderr.trim()
             };
+            let (classification, _) = validation_check_classification(check.status);
             format!(
-                "{} exit_code={:?}: {}",
+                "{} classification={} exit_code={:?}: {}",
                 check.name,
+                classification,
                 check.exit_code,
                 truncate_development_output(output, 8_000)
             )
         })
+        .collect::<Vec<_>>();
+    (!diagnostics.is_empty()).then(|| diagnostics.join("\n\n"))
+}
+
+fn validation_check_classification(status: runtime::ValidationStatus) -> (&'static str, bool) {
+    match status {
+        runtime::ValidationStatus::Pass => ("success", false),
+        runtime::ValidationStatus::Fail => ("candidate_failure", true),
+        runtime::ValidationStatus::Timeout => ("timeout", false),
+        runtime::ValidationStatus::Blocked | runtime::ValidationStatus::Error => {
+            ("infrastructure_failure", false)
+        }
+        runtime::ValidationStatus::Skipped => ("unavailable", false),
+    }
 }
 
 fn format_validation_status(status: runtime::ValidationStatus) -> &'static str {
@@ -754,9 +776,52 @@ fn format_validation_status(status: runtime::ValidationStatus) -> &'static str {
 }
 
 fn truncate_development_output(value: &str, limit: usize) -> String {
-    let mut output = value.chars().take(limit).collect::<String>();
-    if value.chars().count() > limit {
-        output.push_str("\n[development check output truncated]\n");
+    if value.chars().count() <= limit {
+        return value.to_string();
+    }
+
+    let head_budget = limit / 4;
+    let tail_budget = limit / 3;
+    let marker = "\n...\n";
+    let signal_budget = limit.saturating_sub(head_budget + tail_budget + 3 * marker.len() + 48);
+    let head = value.chars().take(head_budget).collect::<String>();
+    let tail = value
+        .chars()
+        .rev()
+        .take(tail_budget)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    let signals = value
+        .lines()
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("error")
+                || lower.contains("failed")
+                || lower.contains("failure")
+                || lower.contains("panicked")
+                || lower.contains("assert")
+                || lower.contains("test result")
+                || lower.contains("could not compile")
+                || line.contains(" --> ")
+        })
+        .scan(0usize, |used, line| {
+            let remaining = signal_budget.saturating_sub(*used);
+            if remaining == 0 {
+                return None;
+            }
+            let selected = line.chars().take(remaining).collect::<String>();
+            *used += selected.chars().count() + 1;
+            Some(selected)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut output =
+        format!("{head}{marker}{signals}{marker}{tail}\n[development check output truncated]\n");
+    if output.chars().count() > limit {
+        output = output.chars().take(limit).collect();
     }
     output
 }
@@ -10698,6 +10763,52 @@ printf 'pwsh:%s' "$1"
         assert_eq!(value["code_failure"], false);
         assert_eq!(value["authoritative"], false);
         assert_eq!(value["authorizes_review"], false);
+    }
+
+    #[test]
+    fn development_check_statuses_have_consistent_classifications() {
+        assert_eq!(
+            super::validation_check_classification(runtime::ValidationStatus::Pass),
+            ("success", false)
+        );
+        assert_eq!(
+            super::validation_check_classification(runtime::ValidationStatus::Fail),
+            ("candidate_failure", true)
+        );
+        assert_eq!(
+            super::validation_check_classification(runtime::ValidationStatus::Timeout),
+            ("timeout", false)
+        );
+        assert_eq!(
+            super::validation_check_classification(runtime::ValidationStatus::Error),
+            ("infrastructure_failure", false)
+        );
+        assert_eq!(
+            super::validation_check_classification(runtime::ValidationStatus::Skipped),
+            ("unavailable", false)
+        );
+    }
+
+    #[test]
+    fn bounded_development_diagnostics_keep_failure_signal_and_tail() {
+        let output = (0..400)
+            .map(|index| {
+                if index == 211 {
+                    "error[E0308]: mismatched types".to_string()
+                } else if index == 399 {
+                    "test result: FAILED. 1 failed".to_string()
+                } else {
+                    format!("noise line {index}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let bounded = super::truncate_development_output(&output, 1_000);
+
+        assert!(bounded.len() <= 1_000);
+        assert!(bounded.contains("error[E0308]"));
+        assert!(bounded.contains("test result: FAILED"));
+        assert!(bounded.contains("development check output truncated"));
     }
 
     #[test]

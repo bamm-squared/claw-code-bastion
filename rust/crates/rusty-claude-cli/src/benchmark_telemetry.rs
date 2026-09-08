@@ -156,6 +156,8 @@ pub struct WorkUnitCheckpoint {
     pub work_unit: Option<String>,
     pub writer_turns: u64,
     pub turn_allowance: u64,
+    pub productive_writer_turns: u64,
+    pub checkpoint_turn: bool,
     pub remaining_turns: u64,
     pub continuation_grants: u64,
     pub candidate_changed: Option<bool>,
@@ -445,6 +447,8 @@ pub fn work_unit_checkpoint_runtime_state(used: usize, allowance: usize, continu
         {
             record.writer_turns = used as u64;
             record.turn_allowance = allowance as u64;
+            record.productive_writer_turns = used.min(allowance) as u64;
+            record.checkpoint_turn = used > allowance;
             record.remaining_turns = allowance.saturating_sub(used) as u64;
             record.continuation_grants = u64::from(continuation_grants);
             if record.work_unit.is_none() {
@@ -481,11 +485,6 @@ pub fn candidate_check_result(raw: &str) {
             .and_then(Value::as_str)
             .unwrap_or("malformed")
             .to_string();
-        let default_code_failure = value
-            .as_ref()
-            .and_then(|value| value.get("code_failure"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
         let candidate_identity = value
             .as_ref()
             .and_then(|value| value.get("candidate_id"))
@@ -503,13 +502,7 @@ pub fn candidate_check_result(raw: &str) {
                     .and_then(Value::as_str)
                     .unwrap_or("malformed")
                     .to_string();
-                let classification = if status == "timeout" {
-                    "timeout"
-                } else if status == "unavailable" {
-                    "unavailable"
-                } else {
-                    default_classification.as_str()
-                };
+                let (classification, code_failure) = check_classification(check, &status);
                 let diagnostic = check
                     .get("stderr")
                     .and_then(Value::as_str)
@@ -532,8 +525,8 @@ pub fn candidate_check_result(raw: &str) {
                         .and_then(Value::as_str)
                         .unwrap_or("candidate_check")
                         .to_string(),
-                    classification: classification.to_string(),
-                    code_failure: default_code_failure && classification == "candidate_failure",
+                    classification,
+                    code_failure,
                     status,
                     exit_code: check
                         .get("exit_code")
@@ -560,8 +553,8 @@ pub fn candidate_check_result(raw: &str) {
                     .unwrap_or("candidate_check")
                     .to_string(),
                 command: "candidate_check".to_string(),
-                classification: default_classification,
-                code_failure: default_code_failure,
+                classification: default_classification.clone(),
+                code_failure: default_classification == "candidate_failure",
                 status: value
                     .as_ref()
                     .and_then(|value| value.get("status"))
@@ -622,6 +615,12 @@ pub fn work_unit_checkpoint_requested(requested_status: &str, candidate_changed:
             work_unit: s.snapshot.current_work_unit.clone(),
             writer_turns: s.snapshot.work_unit_writer_turns,
             turn_allowance: s.snapshot.work_unit_turn_allowance,
+            productive_writer_turns: s
+                .snapshot
+                .work_unit_writer_turns
+                .min(s.snapshot.work_unit_turn_allowance),
+            checkpoint_turn: s.snapshot.work_unit_writer_turns
+                > s.snapshot.work_unit_turn_allowance,
             remaining_turns: s
                 .snapshot
                 .work_unit_turn_allowance
@@ -789,6 +788,27 @@ fn add_usage(slot: &mut Option<u64>, value: u64) {
 
 fn bounded_diagnostic(value: &str) -> String {
     value.chars().take(8_000).collect()
+}
+
+fn classification_for_status(status: &str) -> &'static str {
+    match status {
+        "pass" => "success",
+        "fail" => "candidate_failure",
+        "timeout" => "timeout",
+        "blocked" | "error" | "infrastructure_error" => "infrastructure_failure",
+        "skipped" | "unavailable" => "unavailable",
+        _ => "malformed",
+    }
+}
+
+fn check_classification(check: &Value, status: &str) -> (String, bool) {
+    let classification = check
+        .get("classification")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| classification_for_status(status))
+        .to_string();
+    let code_failure = classification == "candidate_failure";
+    (classification, code_failure)
 }
 pub fn candidate_mutation() {
     with_state(record_candidate_mutation);
@@ -1135,5 +1155,55 @@ mod tests {
             Some(1)
         );
         assert!(state.snapshot.time_to_first_candidate_mutation_ms.is_some());
+    }
+
+    #[test]
+    fn per_check_status_does_not_inherit_mixed_aggregate_classification() {
+        assert_eq!(classification_for_status("pass"), "success");
+        assert_eq!(classification_for_status("fail"), "candidate_failure");
+        assert_eq!(classification_for_status("timeout"), "timeout");
+        assert_eq!(
+            classification_for_status("infrastructure_error"),
+            "infrastructure_failure"
+        );
+        assert_eq!(classification_for_status("skipped"), "unavailable");
+
+        let formatter = serde_json::json!({"status":"pass"});
+        let tests = serde_json::json!({"status":"fail"});
+        let clippy = serde_json::json!({"status":"fail"});
+        assert_eq!(
+            check_classification(&formatter, "pass"),
+            ("success".to_string(), false)
+        );
+        assert_eq!(
+            check_classification(&tests, "fail"),
+            ("candidate_failure".to_string(), true)
+        );
+        assert_eq!(
+            check_classification(&clippy, "fail"),
+            ("candidate_failure".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn checkpoint_telemetry_distinguishes_allowance_from_checkpoint_turn() {
+        let mut state = state();
+        state.snapshot.work_unit_writer_turns = 11;
+        state.snapshot.work_unit_turn_allowance = 10;
+        let record = WorkUnitCheckpoint {
+            writer_turns: state.snapshot.work_unit_writer_turns,
+            turn_allowance: state.snapshot.work_unit_turn_allowance,
+            productive_writer_turns: state
+                .snapshot
+                .work_unit_writer_turns
+                .min(state.snapshot.work_unit_turn_allowance),
+            checkpoint_turn: state.snapshot.work_unit_writer_turns
+                > state.snapshot.work_unit_turn_allowance,
+            ..WorkUnitCheckpoint::default()
+        };
+
+        assert_eq!(record.productive_writer_turns, 10);
+        assert!(record.checkpoint_turn);
+        assert_eq!(record.writer_turns, 11);
     }
 }
