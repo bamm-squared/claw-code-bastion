@@ -475,13 +475,10 @@ impl ExecutionBackend for IsolatedExecutionBackend {
                 })
             })
             .collect::<Vec<_>>();
-        let status = if validation.has_infrastructure_failure() {
+        let (classification, code_failure) = development_check_classification(&validation);
+        let status = if classification == "infrastructure_failure" {
             "infrastructure_error"
-        } else if validation
-            .checks
-            .iter()
-            .all(|check| check.status == runtime::ValidationStatus::Pass)
-        {
+        } else if classification == "success" {
             "pass"
         } else {
             "fail"
@@ -490,6 +487,9 @@ impl ExecutionBackend for IsolatedExecutionBackend {
             "kind": "candidate_development_check",
             "candidate_id": changes.id.to_string(),
             "status": status,
+            "classification": classification,
+            "code_failure": code_failure,
+            "diagnostic": development_check_diagnostic(&validation),
             "checks": checks,
             "authorizes_review": false,
             "authoritative": false,
@@ -694,6 +694,7 @@ fn development_check_infrastructure_error(message: &str) -> Result<String, Strin
     serde_json::to_string(&json!({
         "kind": "candidate_development_check",
         "status": "infrastructure_error",
+        "classification": "infrastructure_failure",
         "checks": [],
         "authorizes_review": false,
         "authoritative": false,
@@ -701,6 +702,44 @@ fn development_check_infrastructure_error(message: &str) -> Result<String, Strin
         "error": message,
     }))
     .map_err(|error| error.to_string())
+}
+
+fn development_check_classification(
+    validation: &runtime::validator::ValidationResult,
+) -> (&'static str, bool) {
+    if validation.has_infrastructure_failure() {
+        ("infrastructure_failure", false)
+    } else if validation
+        .checks
+        .iter()
+        .all(|check| check.status == runtime::ValidationStatus::Pass)
+    {
+        ("success", false)
+    } else {
+        ("candidate_failure", true)
+    }
+}
+
+fn development_check_diagnostic(
+    validation: &runtime::validator::ValidationResult,
+) -> Option<String> {
+    validation
+        .checks
+        .iter()
+        .find(|check| check.status != runtime::ValidationStatus::Pass)
+        .map(|check| {
+            let output = if check.stderr.trim().is_empty() {
+                check.stdout.trim()
+            } else {
+                check.stderr.trim()
+            };
+            format!(
+                "{} exit_code={:?}: {}",
+                check.name,
+                check.exit_code,
+                truncate_development_output(output, 8_000)
+            )
+        })
 }
 
 fn format_validation_status(status: runtime::ValidationStatus) -> &'static str {
@@ -10641,8 +10680,23 @@ printf 'pwsh:%s' "$1"
             .expect("diagnostic should serialize");
         let value: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
         assert_eq!(value["status"], "infrastructure_error");
+        assert_eq!(value["classification"], "infrastructure_failure");
         assert_eq!(value["authoritative"], false);
         assert_eq!(value["code_failure"], false);
+        assert_eq!(value["authorizes_review"], false);
+    }
+
+    #[test]
+    fn candidate_check_report_classifies_infrastructure_separately() {
+        let output = super::development_check_infrastructure_error(
+            "dependency cache is unavailable in the contained validator",
+        )
+        .expect("diagnostic should serialize");
+        let value: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+
+        assert_eq!(value["classification"], "infrastructure_failure");
+        assert_eq!(value["code_failure"], false);
+        assert_eq!(value["authoritative"], false);
         assert_eq!(value["authorizes_review"], false);
     }
 

@@ -479,9 +479,16 @@ fn validator_startup_failure(exit_code: Option<i32>, stderr: &str) -> bool {
             "rustc: not found",
             "unable to find image",
             "no such image",
+            "failed to download",
+            "failed to get",
+            "no matching package named",
+            "attempting to make an http request",
+            "offline mode",
+            "failed to load source",
         ]
         .iter()
         .any(|marker| lower.contains(marker))
+        || (lower.contains("source directory") && lower.contains("does not exist"))
         || (lower.contains("permission denied")
             && (lower.contains("/usr/local/cargo/") || lower.contains("/usr/local/rustup/")))
 }
@@ -500,26 +507,38 @@ fn wait_with_deadline(child: &mut Child, deadline: Instant) -> io::Result<bool> 
 
 fn read_bounded(mut reader: impl Read) -> io::Result<(String, bool)> {
     let mut bytes = Vec::new();
+    let mut tail = Vec::new();
+    let mut overflowed = false;
     let mut buffer = [0_u8; 8192];
-    let mut truncated = false;
     loop {
         let count = reader.read(&mut buffer)?;
         if count == 0 {
             break;
         }
-        if bytes.len() < MAX_OUTPUT_BYTES {
-            let remaining = MAX_OUTPUT_BYTES - bytes.len();
-            bytes.extend_from_slice(&buffer[..count.min(remaining)]);
+        if !overflowed && bytes.len().saturating_add(count) <= MAX_OUTPUT_BYTES {
+            bytes.extend_from_slice(&buffer[..count]);
+            continue;
         }
-        if bytes.len() >= MAX_OUTPUT_BYTES && count > MAX_OUTPUT_BYTES.saturating_sub(bytes.len()) {
-            truncated = true;
+        if !overflowed {
+            overflowed = true;
+            let split = MAX_OUTPUT_BYTES / 2;
+            tail.extend_from_slice(&bytes[split..]);
+            bytes.truncate(split);
         }
+        tail.extend_from_slice(&buffer[..count]);
+        let tail_limit = MAX_OUTPUT_BYTES / 2;
+        if tail.len() > tail_limit {
+            let remove = tail.len() - tail_limit;
+            tail.drain(..remove);
+        }
+    }
+    if !overflowed {
+        return Ok((String::from_utf8_lossy(&bytes).into_owned(), false));
     }
     let mut output = String::from_utf8_lossy(&bytes).into_owned();
-    if truncated {
-        output.push_str("\n[validator output truncated]\n");
-    }
-    Ok((output, truncated))
+    output.push_str("\n[validator output truncated; tail retained]\n");
+    output.push_str(&String::from_utf8_lossy(&tail));
+    Ok((output, true))
 }
 
 #[must_use]
@@ -745,6 +764,34 @@ mod tests {
             Some(1),
             "test reported Permission denied"
         ));
+    }
+
+    #[test]
+    fn unavailable_cargo_dependency_is_infrastructure_blocked() {
+        assert!(validator_startup_failure(
+            Some(101),
+            "error: no matching package named `fnv` found\nlocation searched: crates.io index\nAs a reminder, you're using offline mode (--offline)"
+        ));
+        assert!(validator_startup_failure(
+            Some(101),
+            "failed to download `serde` because attempting to make an HTTP request, but --offline was specified"
+        ));
+        assert!(!validator_startup_failure(
+            Some(101),
+            "error: test failed; assertion failed: expected state"
+        ));
+    }
+
+    #[test]
+    fn bounded_validator_output_retains_the_diagnostic_tail() {
+        let mut input = vec![b'a'; MAX_OUTPUT_BYTES];
+        input.extend_from_slice(b"\nfinal compiler diagnostic: expected item\n");
+
+        let (output, truncated) = read_bounded(std::io::Cursor::new(input)).unwrap();
+
+        assert!(truncated);
+        assert!(output.contains("validator output truncated; tail retained"));
+        assert!(output.contains("final compiler diagnostic: expected item"));
     }
 
     #[test]

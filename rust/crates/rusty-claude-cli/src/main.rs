@@ -4108,6 +4108,9 @@ struct LiveCli {
     work_unit_no_change_attempts: u8,
     work_unit_completion_rejections: u8,
     work_unit_continuation_objective: Option<String>,
+    work_unit_writer_turns: usize,
+    work_unit_turn_allowance: usize,
+    work_unit_continuation_grants: u8,
 }
 
 #[derive(Clone)]
@@ -5280,6 +5283,9 @@ impl LiveCli {
             work_unit_no_change_attempts: 0,
             work_unit_completion_rejections: 0,
             work_unit_continuation_objective: None,
+            work_unit_writer_turns: 0,
+            work_unit_turn_allowance: 0,
+            work_unit_continuation_grants: 0,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -5674,6 +5680,9 @@ impl LiveCli {
             self.work_unit_no_change_attempts = 0;
             self.work_unit_completion_rejections = 0;
             self.work_unit_continuation_objective = None;
+            self.work_unit_writer_turns = 0;
+            self.work_unit_turn_allowance = 0;
+            self.work_unit_continuation_grants = 0;
         }
         if self.exploration_input.as_deref() == Some(input) || self.pending_rework.is_some() {
             return;
@@ -5750,6 +5759,31 @@ impl LiveCli {
         }
     }
 
+    fn reset_work_unit_budget(&mut self) {
+        self.work_unit_writer_turns = 0;
+        self.work_unit_continuation_grants = 0;
+        self.work_unit_turn_allowance = self.task_plan.current_work_unit().map_or(0, |_| {
+            work_unit_iteration_budget(self.task_plan.planning_mode())
+        });
+    }
+
+    fn grant_work_unit_continuation(&mut self, objective: String) -> bool {
+        if self.task_plan.current_work_unit().is_none()
+            || self.work_unit_continuation_grants >= MAX_WORK_UNIT_CONTINUATIONS
+        {
+            return false;
+        }
+        self.work_unit_turn_allowance =
+            self.work_unit_turn_allowance
+                .saturating_add(work_unit_continuation_budget(
+                    self.task_plan.planning_mode(),
+                ));
+        self.work_unit_continuation_grants = self.work_unit_continuation_grants.saturating_add(1);
+        self.work_unit_continuation_objective = Some(objective);
+        benchmark_telemetry::lifecycle_event("work_unit_bounded_continuation_granted");
+        true
+    }
+
     #[allow(clippy::too_many_lines)]
     fn prepare_turn_runtime(
         &mut self,
@@ -5811,6 +5845,13 @@ impl LiveCli {
             self.task_plan.render_for_writer()
         );
         let plan_text = format!("{plan_text}{continuation_context}");
+        if self.work_unit_turn_allowance == 0 && self.task_plan.current_work_unit().is_some() {
+            self.reset_work_unit_budget();
+        }
+        let remaining_work_unit_turns = self
+            .work_unit_turn_allowance
+            .saturating_sub(self.work_unit_writer_turns)
+            .max(1);
         benchmark_telemetry::work_unit_state(
             self.task_plan.work_units.len(),
             self.task_plan
@@ -5871,10 +5912,7 @@ impl LiveCli {
         } else {
             runtime.with_repository_context(plan_text)
         }
-        .with_writer_checkpoint_policy(
-            work_unit_iteration_budget(self.task_plan.planning_mode()),
-            1,
-        )
+        .with_writer_checkpoint_policy(remaining_work_unit_turns, 1)
         .with_context_checkpoint_tokens(WRITER_CONTEXT_CHECKPOINT_TOKENS)
         .with_hook_abort_signal(hook_abort_signal.clone());
         let mut runtime = runtime;
@@ -5930,6 +5968,14 @@ impl LiveCli {
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
+                self.work_unit_writer_turns = self
+                    .work_unit_writer_turns
+                    .saturating_add(summary.iterations);
+                benchmark_telemetry::work_unit_budget(
+                    self.work_unit_writer_turns,
+                    self.work_unit_turn_allowance,
+                    self.work_unit_continuation_grants,
+                );
                 if summary.iterations > writer_iteration_budget(self.task_plan.planning_mode()) {
                     benchmark_telemetry::lifecycle_event("writer_soft_checkpoint_triggered");
                 }
@@ -5946,19 +5992,15 @@ impl LiveCli {
                 if runtime.checkpoint_candidate_check_ran() {
                     benchmark_telemetry::writer_checkpoint_candidate_check();
                 }
-                let completion_feedback_received =
-                    if let Some(feedback) = runtime.take_work_unit_completion_feedback() {
-                        self.task_plan
-                            .record_work_unit_completion_feedback(&feedback);
-                        self.work_unit_completion_rejections =
-                            self.work_unit_completion_rejections.saturating_add(1);
-                        benchmark_telemetry::lifecycle_event(
-                            "work_unit_completion_reconciliation_feedback",
-                        );
-                        true
-                    } else {
-                        false
-                    };
+                if let Some(feedback) = runtime.take_work_unit_completion_feedback() {
+                    self.task_plan
+                        .record_work_unit_completion_feedback(&feedback);
+                    self.work_unit_completion_rejections =
+                        self.work_unit_completion_rejections.saturating_add(1);
+                    benchmark_telemetry::lifecycle_event(
+                        "work_unit_completion_reconciliation_feedback",
+                    );
+                }
                 if let Some(checkpoint) = runtime.take_checkpoint() {
                     match checkpoint {
                         WriterCheckpoint::Submit { .. } => {
@@ -5967,6 +6009,18 @@ impl LiveCli {
                                 benchmark_telemetry::lifecycle_event(
                                     "work_unit_submission_deferred",
                                 );
+                                if !self.grant_work_unit_continuation(
+                                    "Resolve the active work unit before requesting whole-candidate submission.".to_string(),
+                                ) {
+                                    let _ = runtime.finish_candidate()?;
+                                    self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
+                                    benchmark_telemetry::lifecycle_event(
+                                        "work_unit_budget_exhausted",
+                                    );
+                                    self.replace_runtime(runtime)?;
+                                    self.persist_session()?;
+                                    return Ok(());
+                                }
                                 self.replace_runtime(runtime)?;
                                 return self.run_turn(input);
                             }
@@ -6017,6 +6071,7 @@ impl LiveCli {
                             self.task_plan
                                 .clear_work_unit_completion_feedback(&completed);
                             benchmark_telemetry::work_unit_transition(&completed, next.as_deref());
+                            self.reset_work_unit_budget();
                             if self.task_plan.has_unresolved_work_units() {
                                 if let Some(compaction) = runtime.compact_for_work_unit() {
                                     benchmark_telemetry::writer_checkpoint_context(
@@ -6041,9 +6096,12 @@ impl LiveCli {
                                 self.persist_session()?;
                                 return Ok(());
                             }
-                            if completion_feedback_received
-                                && self.work_unit_completion_rejections >= 2
-                            {
+                            let objective = if objective.trim().is_empty() {
+                                "Resolve the structured completion deficiencies for the current work unit before reporting unit_complete again.".to_string()
+                            } else {
+                                objective
+                            };
+                            if !self.grant_work_unit_continuation(objective) {
                                 let _ = runtime.finish_candidate()?;
                                 self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
                                 benchmark_telemetry::lifecycle_event(
@@ -6053,16 +6111,6 @@ impl LiveCli {
                                 self.persist_session()?;
                                 return Ok(());
                             }
-                            self.work_unit_continuation_objective = Some(
-                                if objective.trim().is_empty() {
-                                    "Resolve the structured completion deficiencies for the current work unit before reporting unit_complete again.".to_string()
-                                } else {
-                                    objective
-                                },
-                            );
-                            benchmark_telemetry::lifecycle_event(
-                                "work_unit_bounded_continuation_granted",
-                            );
                             self.replace_runtime(runtime)?;
                             return self.run_turn(input);
                         }
@@ -12470,66 +12518,73 @@ impl CliToolExecutor {
             .take(4_000)
             .collect::<String>();
         if status == "unit_complete" && self.candidate_review_roots().is_some() {
-            let diagnostics = self
+            let candidate_changed = self
                 .tool_registry
-                .candidate_development_check(&json!({
-                    "checks": ["format", "test", "clippy"],
-                    "timeout_ms": 120_000_u64,
-                }))
+                .candidate_has_changes()
+                .map(|changed| changed.unwrap_or(true))
                 .map_err(ToolError::new)?;
-            let check_status =
-                serde_json::from_str::<Value>(&diagnostics)
-                    .ok()
-                    .and_then(|report| {
-                        report
-                            .get("status")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
+            if candidate_changed {
+                let diagnostics = self
+                    .tool_registry
+                    .candidate_development_check(&json!({
+                        "checks": ["format", "test", "clippy"],
+                        "timeout_ms": 120_000_u64,
+                    }))
+                    .map_err(ToolError::new)?;
+                let report = serde_json::from_str::<Value>(&diagnostics).ok();
+                let check_status = report
+                    .as_ref()
+                    .and_then(|report| report.get("status"))
+                    .and_then(Value::as_str);
+                let classification = report
+                    .as_ref()
+                    .and_then(|report| report.get("classification"))
+                    .and_then(Value::as_str);
+                if classification == Some("infrastructure_failure")
+                    || check_status == Some("infrastructure_error")
+                {
+                    let checkpoint_message = if message.is_empty() {
+                        "unit implementation is complete; candidate verification is deferred to trusted validation because development-check infrastructure is unavailable".to_string()
+                    } else {
+                        format!(
+                            "{message}; candidate verification is deferred to trusted validation because development-check infrastructure is unavailable"
+                        )
+                    };
+                    self.pending_checkpoint = Some(WriterCheckpoint::UnitComplete {
+                        message: Some(checkpoint_message),
                     });
-            if check_status.as_deref() != Some("pass") {
-                benchmark_telemetry::lifecycle_event("work_unit_completion_check_failed");
-                let category = serde_json::from_str::<Value>(&diagnostics).ok().map_or(
-                    "candidate_check_failure",
-                    |report| {
-                        let status = report.get("status").and_then(Value::as_str);
-                        let diagnostic = report
-                            .get("diagnostic")
-                            .and_then(Value::as_str)
-                            .or_else(|| report.get("message").and_then(Value::as_str));
-                        let infrastructure = status.is_some_and(|value| {
-                            matches!(value, "infrastructure_error" | "unavailable" | "timeout")
-                        }) || diagnostic.is_some_and(|value| {
-                            let value = value.to_ascii_lowercase();
-                            value.contains("infrastructure")
-                                || value.contains("unavailable")
-                                || value.contains("timed out")
-                        });
-                        if infrastructure {
-                            "infrastructure_evidence_unavailable"
-                        } else {
-                            "candidate_check_failure"
-                        }
-                    },
-                );
-                let feedback = json!({
-                    "work_unit": self
-                        .work_unit_completion_context
-                        .as_deref()
-                        .unwrap_or("unknown"),
-                    "status": "incomplete",
-                    "unresolved": [{
-                        "id": "candidate-development-check",
-                        "category": category,
-                        "reason": "the declared unit completion evidence is not established by the candidate development check",
-                        "evidence": diagnostics,
-                    }],
-                })
-                .to_string();
-                self.work_unit_completion_feedback = Some(feedback.clone());
-                self.pending_checkpoint = Some(WriterCheckpoint::BoundedContinue {
-                    objective: "Resolve the structured completion deficiencies for the current work unit before reporting unit_complete again.".to_string(),
-                });
-                return Ok(feedback);
+                    return Ok(json!({
+                        "accepted": true,
+                        "status": "unit_complete",
+                        "verification": "deferred",
+                        "reason": "candidate development check infrastructure unavailable",
+                        "message": "The implementation unit may advance; trusted validation remains required.",
+                    })
+                    .to_string());
+                }
+                if check_status != Some("pass") {
+                    benchmark_telemetry::lifecycle_event("work_unit_completion_check_failed");
+                    let category = "candidate_check_failure";
+                    let feedback = json!({
+                        "work_unit": self
+                            .work_unit_completion_context
+                            .as_deref()
+                            .unwrap_or("unknown"),
+                        "status": "incomplete",
+                        "unresolved": [{
+                            "id": "candidate-development-check",
+                            "category": category,
+                            "reason": "the declared unit completion evidence is not established by the candidate development check",
+                            "evidence": diagnostics,
+                        }],
+                    })
+                    .to_string();
+                    self.work_unit_completion_feedback = Some(feedback.clone());
+                    self.pending_checkpoint = Some(WriterCheckpoint::BoundedContinue {
+                        objective: "Resolve the structured completion deficiencies for the current work unit before reporting unit_complete again.".to_string(),
+                    });
+                    return Ok(feedback);
+                }
             }
         }
         let checkpoint = match status {
@@ -12606,6 +12661,16 @@ fn work_unit_iteration_budget(mode: task_plan::PlanningMode) -> usize {
     }
 }
 
+const MAX_WORK_UNIT_CONTINUATIONS: u8 = 1;
+
+fn work_unit_continuation_budget(mode: task_plan::PlanningMode) -> usize {
+    match mode {
+        task_plan::PlanningMode::Minimal => 3,
+        task_plan::PlanningMode::Standard => 5,
+        task_plan::PlanningMode::Milestone => 8,
+    }
+}
+
 const MAX_PROVIDER_TURN_RECOVERIES: usize = 1;
 
 fn should_retry_provider_turn(recoveries: usize, error: &RuntimeError) -> bool {
@@ -12617,7 +12682,10 @@ fn should_retry_provider_turn(recoveries: usize, error: &RuntimeError) -> bool {
 
 #[cfg(test)]
 mod empty_response_recovery_tests {
-    use super::{should_retry_provider_turn, RuntimeError};
+    use super::{
+        should_retry_provider_turn, work_unit_continuation_budget, work_unit_iteration_budget,
+        RuntimeError, MAX_WORK_UNIT_CONTINUATIONS,
+    };
 
     #[test]
     fn recovery_is_bounded_and_only_applies_to_empty_provider_responses() {
@@ -12632,6 +12700,19 @@ mod empty_response_recovery_tests {
             0,
             &RuntimeError::transient_provider_failure("server error")
         ));
+    }
+
+    #[test]
+    fn work_unit_continuation_is_small_and_bounded() {
+        assert_eq!(
+            work_unit_iteration_budget(super::task_plan::PlanningMode::Standard),
+            10
+        );
+        assert_eq!(
+            work_unit_continuation_budget(super::task_plan::PlanningMode::Standard),
+            5
+        );
+        assert_eq!(MAX_WORK_UNIT_CONTINUATIONS, 1);
     }
 }
 

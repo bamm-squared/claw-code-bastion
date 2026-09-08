@@ -30,6 +30,9 @@ pub struct Snapshot {
     pub work_unit_transitions: u64,
     pub current_work_unit: Option<String>,
     pub work_unit_replans: u64,
+    pub work_unit_writer_turns: u64,
+    pub work_unit_turn_allowance: u64,
+    pub work_unit_continuation_grants: u64,
     pub model_turns: u64,
     pub tool_bearing_turns: u64,
     pub tool_calls: BTreeMap<String, u64>,
@@ -382,6 +385,14 @@ pub fn work_unit_replanned() {
         s.snapshot.work_unit_replans = s.snapshot.work_unit_replans.saturating_add(1);
     });
     lifecycle_event("work_unit_replanned");
+}
+
+pub fn work_unit_budget(used: usize, allowance: usize, continuation_grants: u8) {
+    with_state(|s| {
+        s.snapshot.work_unit_writer_turns = used as u64;
+        s.snapshot.work_unit_turn_allowance = allowance as u64;
+        s.snapshot.work_unit_continuation_grants = u64::from(continuation_grants);
+    });
 }
 
 pub fn model_turn() {
