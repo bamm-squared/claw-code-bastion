@@ -406,6 +406,7 @@ impl ExecutionBackend for IsolatedExecutionBackend {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn run_candidate_development_check(&mut self, input: &Value) -> Result<String, String> {
         let request: CandidateCheckInput = serde_json::from_value(input.clone())
             .map_err(|error| format!("invalid candidate_check input: {error}"))?;
@@ -449,16 +450,25 @@ impl ExecutionBackend for IsolatedExecutionBackend {
                 .unwrap_or_else(|_| runtime::DEFAULT_RUNTIME_IMAGE.to_string()),
             ..runtime::PodmanValidatorBackend::default()
         };
-        let validation = match runtime::validator::ValidatorBackend::validate(
-            &backend,
-            &snapshot.input(),
-            &plan,
-        ) {
+        let validation_result =
+            runtime::validator::ValidatorBackend::validate(&backend, &snapshot.input(), &plan);
+        drop(snapshot);
+        let after_check = self.workspace.scan().map_err(|error| {
+            format!("unable to rescan candidate after development check: {error}")
+        })?;
+        if after_check.id != changes.id {
+            return candidate_check_integrity_error(
+                &changes.id.to_string(),
+                &after_check.id.to_string(),
+            );
+        }
+        let validation = match validation_result {
             Ok(validation) => validation,
             Err(error) => {
-                return development_check_infrastructure_error(&format!(
-                    "candidate development validator unavailable: {error}"
-                ));
+                return development_check_infrastructure_error_for_candidate(
+                    &format!("candidate development validator unavailable: {error}"),
+                    &changes.id.to_string(),
+                );
             }
         };
         let checks = validation
@@ -496,6 +506,9 @@ impl ExecutionBackend for IsolatedExecutionBackend {
         serde_json::to_string(&json!({
             "kind": "candidate_development_check",
             "candidate_id": changes.id.to_string(),
+            "candidate_id_before": changes.id.to_string(),
+            "candidate_id_after": after_check.id.to_string(),
+            "candidate_state_unchanged": true,
             "candidate_changed": candidate_changed,
             "status": status,
             "classification": classification,
@@ -697,8 +710,60 @@ fn development_check_for_name(
             if let Some(timeout_ms) = timeout_ms {
                 check.timeout = Duration::from_millis(timeout_ms.clamp(1, 120_000));
             }
+            if matches!(requested.as_str(), "test" | "tests" | "clippy" | "lint") {
+                check.command = lock_cargo_dependency_resolution(&check.command);
+            }
             check
         })
+}
+
+fn lock_cargo_dependency_resolution(command: &str) -> String {
+    if !command.contains("cargo ") || command.contains("--locked") {
+        return command.to_string();
+    }
+    if let Some((cargo_command, passthrough)) = command.split_once(" -- ") {
+        format!("{cargo_command} --locked -- {passthrough}")
+    } else {
+        format!("{command} --locked")
+    }
+}
+
+fn candidate_check_integrity_error(before: &str, after: &str) -> Result<String, String> {
+    serde_json::to_string(&json!({
+        "kind": "candidate_development_check",
+        "status": "infrastructure_error",
+        "classification": "infrastructure_failure",
+        "checks": [],
+        "candidate_id_before": before,
+        "candidate_id_after": after,
+        "candidate_state_unchanged": false,
+        "authorizes_review": false,
+        "authoritative": false,
+        "code_failure": false,
+        "error": "candidate source state changed during a development check; check result rejected",
+    }))
+    .map_err(|error| error.to_string())
+}
+
+fn development_check_infrastructure_error_for_candidate(
+    message: &str,
+    candidate_id: &str,
+) -> Result<String, String> {
+    serde_json::to_string(&json!({
+        "kind": "candidate_development_check",
+        "status": "infrastructure_error",
+        "classification": "infrastructure_failure",
+        "checks": [],
+        "candidate_id": candidate_id,
+        "candidate_id_before": candidate_id,
+        "candidate_id_after": candidate_id,
+        "candidate_state_unchanged": true,
+        "authorizes_review": false,
+        "authoritative": false,
+        "code_failure": false,
+        "error": message,
+    }))
+    .map_err(|error| error.to_string())
 }
 
 fn development_check_infrastructure_error(message: &str) -> Result<String, String> {
@@ -10785,6 +10850,36 @@ printf 'pwsh:%s' "$1"
         assert_eq!(value["code_failure"], false);
         assert_eq!(value["authoritative"], false);
         assert_eq!(value["authorizes_review"], false);
+    }
+
+    #[test]
+    fn candidate_check_rejects_persistent_source_mutation_as_infrastructure() {
+        let output = super::candidate_check_integrity_error("before", "after")
+            .expect("diagnostic should serialize");
+        let value: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+
+        assert_eq!(value["classification"], "infrastructure_failure");
+        assert_eq!(value["code_failure"], false);
+        assert_eq!(value["candidate_id_before"], "before");
+        assert_eq!(value["candidate_id_after"], "after");
+        assert_eq!(value["candidate_state_unchanged"], false);
+        assert_eq!(value["authoritative"], false);
+    }
+
+    #[test]
+    fn cargo_development_checks_use_locked_dependency_resolution() {
+        assert_eq!(
+            super::lock_cargo_dependency_resolution("cargo test --workspace"),
+            "cargo test --workspace --locked"
+        );
+        assert_eq!(
+            super::lock_cargo_dependency_resolution("cargo clippy --workspace -- -D warnings"),
+            "cargo clippy --workspace --locked -- -D warnings"
+        );
+        assert_eq!(
+            super::lock_cargo_dependency_resolution("cargo test --workspace --locked"),
+            "cargo test --workspace --locked"
+        );
     }
 
     #[test]

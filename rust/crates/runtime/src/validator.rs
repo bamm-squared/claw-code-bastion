@@ -891,6 +891,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("claw-validator-test-{}", unique_stamp()));
         fs::create_dir_all(root.join(".git")).unwrap();
         fs::write(root.join("source.txt"), b"candidate").unwrap();
+        fs::write(root.join("Cargo.lock"), b"baseline lockfile").unwrap();
         fs::write(root.join(".git/config"), b"hostile").unwrap();
         let candidate = UntrustedCandidate { root: root.clone() };
         let snapshot =
@@ -898,7 +899,16 @@ mod tests {
         assert!(snapshot.root.join("source.txt").is_file());
         assert!(!snapshot.root.join(".git/config").exists());
         fs::write(snapshot.root.join("source.txt"), b"validator artifact").unwrap();
+        fs::write(
+            snapshot.root.join("Cargo.lock"),
+            b"validator lockfile churn",
+        )
+        .unwrap();
         assert_eq!(fs::read(root.join("source.txt")).unwrap(), b"candidate");
+        assert_eq!(
+            fs::read(root.join("Cargo.lock")).unwrap(),
+            b"baseline lockfile"
+        );
         drop(snapshot);
         let _ = fs::remove_dir_all(root);
     }
