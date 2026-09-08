@@ -276,6 +276,7 @@ struct ResponseStreamState {
     provider_error_message: Option<String>,
     incomplete_details: Option<String>,
     completed_output: Vec<Value>,
+    finalized_text: BTreeMap<(u32, u32), String>,
 }
 
 #[derive(Debug, Default)]
@@ -305,6 +306,7 @@ impl ResponseStreamState {
             provider_error_message: None,
             incomplete_details: None,
             completed_output: Vec::new(),
+            finalized_text: BTreeMap::new(),
         }
     }
 
@@ -338,6 +340,7 @@ impl ResponseStreamState {
         let value: Value = serde_json::from_str(data)
             .map_err(|error| ApiError::json_deserialize("responses", &self.model, data, error))?;
         let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
+        self.trace_output_event(kind, &value);
         let id = value
             .get("response")
             .and_then(|response| response.get("id"))
@@ -370,17 +373,8 @@ impl ResponseStreamState {
             }
             "response.output_item.added" => {
                 let item = value.get("item").cloned().unwrap_or_default();
-                if let Some(item_type) = item.get("type").and_then(Value::as_str) {
-                    self.record_output_type(item_type);
-                    if let Some(contents) = item.get("content").and_then(Value::as_array) {
-                        for content in contents {
-                            if let Some(content_type) = content.get("type").and_then(Value::as_str)
-                            {
-                                self.record_output_type(content_type);
-                            }
-                        }
-                    }
-                }
+                self.record_output_item_types(&item);
+                self.completed_output.push(item.clone());
                 if item.get("type").and_then(Value::as_str) == Some("function_call") {
                     let item_id = item.get("id").and_then(Value::as_str).unwrap_or("");
                     let call_id = item
@@ -417,6 +411,27 @@ impl ResponseStreamState {
                         }));
                     }
                 }
+            }
+            "response.content_part.added" => {
+                if let Some(part) = value.get("part") {
+                    self.record_output_item_types(part);
+                }
+            }
+            "response.output_text.done" => {
+                self.record_finalized_text(&value, value.get("text"));
+            }
+            "response.content_part.done" => {
+                let part = value.get("part");
+                self.record_finalized_text(&value, part.and_then(|part| part.get("text")));
+                if let Some(part) = part {
+                    self.record_output_item_types(part);
+                }
+            }
+            "response.output_item.done" => {
+                let item = value.get("item").cloned().unwrap_or_default();
+                self.record_output_item_types(&item);
+                self.record_message_text(&value, &item);
+                self.completed_output.push(item);
             }
             "response.function_call_arguments.delta" => {
                 let item_id = value
@@ -470,11 +485,9 @@ impl ResponseStreamState {
                 let response = value.get("response").cloned().unwrap_or_default();
                 self.record_response_metadata(&response);
                 self.usage = parse_usage(response.get("usage"));
-                self.completed_output = response
-                    .get("output")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
+                if let Some(output) = response.get("output").and_then(Value::as_array) {
+                    self.completed_output.extend(output.iter().cloned());
+                }
                 self.completed = true;
             }
             "response.incomplete" | "response.failed" | "response.cancelled" => {
@@ -551,6 +564,123 @@ impl ResponseStreamState {
         }))
     }
 
+    fn trace_output_event(&self, kind: &str, value: &Value) {
+        if !matches!(
+            kind,
+            "response.output_item.added"
+                | "response.output_item.done"
+                | "response.content_part.added"
+                | "response.content_part.done"
+                | "response.output_text.done"
+                | "response.completed"
+        ) {
+            return;
+        }
+        let response_id = value
+            .get("response")
+            .and_then(|response| response.get("id"))
+            .and_then(Value::as_str)
+            .or(self.response_id.as_deref())
+            .unwrap_or("none");
+        let item = value.get("item");
+        let part = value.get("part");
+        let text = value
+            .get("text")
+            .or_else(|| part.and_then(|part| part.get("text")));
+        let item_type = item
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str)
+            .unwrap_or("none");
+        let content_type = part
+            .and_then(|part| part.get("type"))
+            .and_then(Value::as_str)
+            .or_else(|| {
+                item.and_then(|item| item.get("content"))
+                    .and_then(Value::as_array)
+                    .and_then(|content| content.first())
+                    .and_then(|content| content.get("type"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("none");
+        let item_id = item
+            .and_then(|item| item.get("id"))
+            .and_then(Value::as_str)
+            .or_else(|| value.get("item_id").and_then(Value::as_str))
+            .unwrap_or("none");
+        let output_index = value
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .map_or_else(|| "none".to_string(), |index| index.to_string());
+        let content_index = value
+            .get("content_index")
+            .and_then(Value::as_u64)
+            .map_or_else(|| "none".to_string(), |index| index.to_string());
+        let text_len = text.and_then(Value::as_str).map_or(0, str::len);
+        provider_trace(format!(
+            "output_event type={kind} response_id={response_id} output_index={output_index} item_id={item_id} item_type={item_type} content_index={content_index} content_type={content_type} text_present={} text_len={} status={}",
+            text.is_some(),
+            text_len,
+            item.and_then(|item| item.get("status"))
+                .and_then(Value::as_str)
+                .unwrap_or("none")
+        ));
+    }
+
+    fn record_output_item_types(&mut self, item: &Value) {
+        if let Some(item_type) = item.get("type").and_then(Value::as_str) {
+            self.record_output_type(item_type);
+        }
+        if let Some(contents) = item.get("content").and_then(Value::as_array) {
+            for content in contents {
+                if let Some(content_type) = content.get("type").and_then(Value::as_str) {
+                    self.record_output_type(content_type);
+                }
+            }
+        }
+    }
+
+    fn record_finalized_text(&mut self, value: &Value, text: Option<&Value>) {
+        let Some(text) = text.and_then(Value::as_str).filter(|text| !text.is_empty()) else {
+            return;
+        };
+        let output_index = value
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32;
+        let content_index = value
+            .get("content_index")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32;
+        self.finalized_text
+            .insert((output_index, content_index), text.to_string());
+        self.record_output_type("output_text");
+    }
+
+    fn record_message_text(&mut self, value: &Value, item: &Value) {
+        if item.get("type").and_then(Value::as_str) != Some("message") {
+            return;
+        }
+        let output_index = value
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32;
+        let Some(content) = item.get("content").and_then(Value::as_array) else {
+            return;
+        };
+        for (content_index, block) in content.iter().enumerate() {
+            if block.get("type").and_then(Value::as_str) != Some("output_text") {
+                continue;
+            }
+            let Some(text) = block.get("text").and_then(Value::as_str) else {
+                continue;
+            };
+            if !text.is_empty() {
+                self.finalized_text
+                    .insert((output_index, content_index as u32), text.to_string());
+            }
+        }
+    }
+
     fn record_output_type(&mut self, output_type: &str) {
         if !self.output_types.iter().any(|known| known == output_type) {
             self.output_types.push(output_type.to_string());
@@ -605,39 +735,24 @@ impl ResponseStreamState {
 
     fn completed_output_events(&self) -> Vec<StreamEvent> {
         let mut events = Vec::new();
-        let mut block_index = 0_u32;
-        for item in &self.completed_output {
+        let mut text_by_position = self.finalized_text.clone();
+        let mut tool_calls = BTreeMap::<String, (String, String)>::new();
+        for (output_index, item) in self.completed_output.iter().enumerate() {
             match item.get("type").and_then(Value::as_str) {
-                Some("message") => {
-                    let Some(content) = item.get("content").and_then(Value::as_array) else {
-                        continue;
-                    };
-                    for block in content {
-                        if block.get("type").and_then(Value::as_str) != Some("output_text") {
-                            continue;
+                Some("message") if self.finalized_text.is_empty() => {
+                    if let Some(content) = item.get("content").and_then(Value::as_array) {
+                        for (content_index, block) in content.iter().enumerate() {
+                            if block.get("type").and_then(Value::as_str) != Some("output_text") {
+                                continue;
+                            }
+                            if let Some(text) = block.get("text").and_then(Value::as_str) {
+                                if !text.is_empty() {
+                                    text_by_position
+                                        .entry((output_index as u32, content_index as u32))
+                                        .or_insert_with(|| text.to_string());
+                                }
+                            }
                         }
-                        let Some(text) = block.get("text").and_then(Value::as_str) else {
-                            continue;
-                        };
-                        if text.is_empty() {
-                            continue;
-                        }
-                        events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
-                            index: block_index,
-                            content_block: OutputContentBlock::Text {
-                                text: String::new(),
-                            },
-                        }));
-                        events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                            index: block_index,
-                            delta: ContentBlockDelta::TextDelta {
-                                text: text.to_string(),
-                            },
-                        }));
-                        events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                            index: block_index,
-                        }));
-                        block_index += 1;
                     }
                 }
                 Some("function_call") => {
@@ -652,30 +767,54 @@ impl ResponseStreamState {
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string();
-                    let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or("");
-                    events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
-                        index: block_index,
-                        content_block: OutputContentBlock::ToolUse {
-                            id: call_id,
-                            name,
-                            input: json!({}),
-                        },
-                    }));
-                    if !arguments.is_empty() {
-                        events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                            index: block_index,
-                            delta: ContentBlockDelta::InputJsonDelta {
-                                partial_json: arguments.to_string(),
-                            },
-                        }));
-                    }
-                    events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                        index: block_index,
-                    }));
-                    block_index += 1;
+                    let arguments = item
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    tool_calls.entry(call_id).or_insert((name, arguments));
                 }
                 _ => {}
             }
+        }
+        let mut block_index = 0_u32;
+        for text in text_by_position.values() {
+            events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                index: block_index,
+                content_block: OutputContentBlock::Text {
+                    text: String::new(),
+                },
+            }));
+            events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                index: block_index,
+                delta: ContentBlockDelta::TextDelta { text: text.clone() },
+            }));
+            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                index: block_index,
+            }));
+            block_index += 1;
+        }
+        for (call_id, (name, arguments)) in tool_calls {
+            events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                index: block_index,
+                content_block: OutputContentBlock::ToolUse {
+                    id: call_id,
+                    name,
+                    input: json!({}),
+                },
+            }));
+            if !arguments.is_empty() {
+                events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                    index: block_index,
+                    delta: ContentBlockDelta::InputJsonDelta {
+                        partial_json: arguments.clone(),
+                    },
+                }));
+            }
+            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                index: block_index,
+            }));
+            block_index += 1;
         }
         if events.is_empty() {
             return events;

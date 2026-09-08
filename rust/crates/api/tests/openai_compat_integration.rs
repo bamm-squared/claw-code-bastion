@@ -158,6 +158,52 @@ async fn responses_transport_uses_completed_output_text_when_no_delta_was_stream
 }
 
 #[tokio::test]
+async fn responses_transport_uses_finalized_output_item_text_without_delta() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = concat!(
+        "data: {\"type\":\"response.output_item.added\",\"response\":{\"id\":\"resp_finalized\"},\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"status\":\"in_progress\",\"content\":[]}}\n\n",
+        "data: {\"type\":\"response.content_part.added\",\"response\":{\"id\":\"resp_finalized\"},\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n",
+        "data: {\"type\":\"response.output_text.done\",\"response\":{\"id\":\"resp_finalized\"},\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"text\":\"finalized answer\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"response\":{\"id\":\"resp_finalized\"},\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"finalized answer\",\"annotations\":[]}]}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_finalized\",\"status\":\"completed\",\"usage\":{\"input_tokens\":7,\"output_tokens\":4}}}\n\n"
+    );
+    let Some(server) = spawn_server(
+        state,
+        vec![http_response("200 OK", "text/event-stream", sse)],
+    )
+    .await
+    else {
+        return;
+    };
+
+    let client = ResponsesClient::new("responses-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let mut stream = client
+        .stream_message(&sample_request(true))
+        .await
+        .expect("responses request should succeed");
+    let mut events = Vec::new();
+    while let Some(event) = stream.next_event().await.expect("event should parse") {
+        events.push(event);
+    }
+
+    let text_events = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                    delta: ContentBlockDelta::TextDelta { text },
+                    ..
+                }) if text == "finalized answer"
+            )
+        })
+        .count();
+    assert_eq!(text_events, 1);
+    assert!(matches!(events.last(), Some(StreamEvent::MessageStop(_))));
+}
+
+#[tokio::test]
 async fn responses_transport_accepts_text_only_streams() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let sse = concat!(
