@@ -436,6 +436,7 @@ impl ExecutionBackend for IsolatedExecutionBackend {
             .workspace
             .scan()
             .map_err(|error| format!("unable to scan candidate for development check: {error}"))?;
+        let candidate_changed = !changes.changes.is_empty();
         let snapshot = runtime::ValidationSnapshot::create_verified(
             &self.workspace.candidate,
             &self.workspace.baseline,
@@ -466,12 +467,14 @@ impl ExecutionBackend for IsolatedExecutionBackend {
             .map(|check| {
                 let stdout = truncate_development_output(&check.stdout, 4_000);
                 let stderr = truncate_development_output(&check.stderr, 8_000);
+                let (classification, code_failure) =
+                    validation_check_classification_for_candidate(check.status, candidate_changed);
                 json!({
                     "name": check.name,
                     "command": check.command,
                     "status": format_validation_status(check.status),
-                    "classification": validation_check_classification(check.status).0,
-                    "code_failure": validation_check_classification(check.status).1,
+                    "classification": classification,
+                    "code_failure": code_failure,
                     "exit_code": check.exit_code,
                     "stdout": stdout,
                     "stderr": stderr,
@@ -481,7 +484,8 @@ impl ExecutionBackend for IsolatedExecutionBackend {
                 })
             })
             .collect::<Vec<_>>();
-        let (classification, code_failure) = development_check_classification(&validation);
+        let (classification, code_failure) =
+            development_check_classification(&validation, candidate_changed);
         let status = if classification == "infrastructure_failure" {
             "infrastructure_error"
         } else if classification == "success" {
@@ -492,10 +496,11 @@ impl ExecutionBackend for IsolatedExecutionBackend {
         serde_json::to_string(&json!({
             "kind": "candidate_development_check",
             "candidate_id": changes.id.to_string(),
+            "candidate_changed": candidate_changed,
             "status": status,
             "classification": classification,
             "code_failure": code_failure,
-            "diagnostic": development_check_diagnostic(&validation),
+            "diagnostic": development_check_diagnostic(&validation, candidate_changed),
             "checks": checks,
             "authorizes_review": false,
             "authoritative": false,
@@ -712,6 +717,7 @@ fn development_check_infrastructure_error(message: &str) -> Result<String, Strin
 
 fn development_check_classification(
     validation: &runtime::validator::ValidationResult,
+    candidate_changed: bool,
 ) -> (&'static str, bool) {
     if validation.has_infrastructure_failure() {
         ("infrastructure_failure", false)
@@ -721,6 +727,8 @@ fn development_check_classification(
         .all(|check| check.status == runtime::ValidationStatus::Pass)
     {
         ("success", false)
+    } else if !candidate_changed {
+        ("baseline_failure", false)
     } else {
         ("candidate_failure", true)
     }
@@ -728,6 +736,7 @@ fn development_check_classification(
 
 fn development_check_diagnostic(
     validation: &runtime::validator::ValidationResult,
+    candidate_changed: bool,
 ) -> Option<String> {
     let diagnostics = validation
         .checks
@@ -739,7 +748,8 @@ fn development_check_diagnostic(
             } else {
                 check.stderr.trim()
             };
-            let (classification, _) = validation_check_classification(check.status);
+            let (classification, _) =
+                validation_check_classification_for_candidate(check.status, candidate_changed);
             format!(
                 "{} classification={} exit_code={:?}: {}",
                 check.name,
@@ -761,6 +771,18 @@ fn validation_check_classification(status: runtime::ValidationStatus) -> (&'stat
             ("infrastructure_failure", false)
         }
         runtime::ValidationStatus::Skipped => ("unavailable", false),
+    }
+}
+
+fn validation_check_classification_for_candidate(
+    status: runtime::ValidationStatus,
+    candidate_changed: bool,
+) -> (&'static str, bool) {
+    let (classification, code_failure) = validation_check_classification(status);
+    if classification == "candidate_failure" && !candidate_changed {
+        ("baseline_failure", false)
+    } else {
+        (classification, code_failure)
     }
 }
 
@@ -10786,6 +10808,20 @@ printf 'pwsh:%s' "$1"
         assert_eq!(
             super::validation_check_classification(runtime::ValidationStatus::Skipped),
             ("unavailable", false)
+        );
+        assert_eq!(
+            super::validation_check_classification_for_candidate(
+                runtime::ValidationStatus::Fail,
+                false
+            ),
+            ("baseline_failure", false)
+        );
+        assert_eq!(
+            super::validation_check_classification_for_candidate(
+                runtime::ValidationStatus::Fail,
+                true
+            ),
+            ("candidate_failure", true)
         );
     }
 

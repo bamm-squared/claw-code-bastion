@@ -275,6 +275,7 @@ struct ResponseStreamState {
     provider_error_code: Option<String>,
     provider_error_message: Option<String>,
     incomplete_details: Option<String>,
+    completed_output: Vec<Value>,
 }
 
 #[derive(Debug, Default)]
@@ -303,6 +304,7 @@ impl ResponseStreamState {
             provider_error_code: None,
             provider_error_message: None,
             incomplete_details: None,
+            completed_output: Vec::new(),
         }
     }
 
@@ -468,6 +470,11 @@ impl ResponseStreamState {
                 let response = value.get("response").cloned().unwrap_or_default();
                 self.record_response_metadata(&response);
                 self.usage = parse_usage(response.get("usage"));
+                self.completed_output = response
+                    .get("output")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
                 self.completed = true;
             }
             "response.incomplete" | "response.failed" | "response.cancelled" => {
@@ -495,6 +502,12 @@ impl ResponseStreamState {
             _ => None,
         } {
             return Err(self.non_actionable_error(kind));
+        }
+        if !self.text_started && !self.tool_calls.values().any(|call| call.started) {
+            let snapshot_events = self.completed_output_events();
+            if !snapshot_events.is_empty() {
+                return Ok(snapshot_events);
+            }
         }
         if self.text_started || self.tool_calls.values().any(|call| call.started) {
             return Ok(vec![
@@ -588,6 +601,94 @@ impl ResponseStreamState {
                 }
             }
         }
+    }
+
+    fn completed_output_events(&self) -> Vec<StreamEvent> {
+        let mut events = Vec::new();
+        let mut block_index = 0_u32;
+        for item in &self.completed_output {
+            match item.get("type").and_then(Value::as_str) {
+                Some("message") => {
+                    let Some(content) = item.get("content").and_then(Value::as_array) else {
+                        continue;
+                    };
+                    for block in content {
+                        if block.get("type").and_then(Value::as_str) != Some("output_text") {
+                            continue;
+                        }
+                        let Some(text) = block.get("text").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        if text.is_empty() {
+                            continue;
+                        }
+                        events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                            index: block_index,
+                            content_block: OutputContentBlock::Text {
+                                text: String::new(),
+                            },
+                        }));
+                        events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                            index: block_index,
+                            delta: ContentBlockDelta::TextDelta {
+                                text: text.to_string(),
+                            },
+                        }));
+                        events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                            index: block_index,
+                        }));
+                        block_index += 1;
+                    }
+                }
+                Some("function_call") => {
+                    let call_id = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("function-call")
+                        .to_string();
+                    let name = item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or("");
+                    events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
+                        index: block_index,
+                        content_block: OutputContentBlock::ToolUse {
+                            id: call_id,
+                            name,
+                            input: json!({}),
+                        },
+                    }));
+                    if !arguments.is_empty() {
+                        events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                            index: block_index,
+                            delta: ContentBlockDelta::InputJsonDelta {
+                                partial_json: arguments.to_string(),
+                            },
+                        }));
+                    }
+                    events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                        index: block_index,
+                    }));
+                    block_index += 1;
+                }
+                _ => {}
+            }
+        }
+        if events.is_empty() {
+            return events;
+        }
+        events.push(StreamEvent::MessageDelta(MessageDeltaEvent {
+            delta: MessageDelta {
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+            },
+            usage: self.usage.clone(),
+        }));
+        events.push(StreamEvent::MessageStop(MessageStopEvent {}));
+        events
     }
 }
 

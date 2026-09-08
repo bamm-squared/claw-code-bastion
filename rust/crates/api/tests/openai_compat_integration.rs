@@ -119,6 +119,45 @@ async fn responses_transport_normalizes_tool_stream_and_uses_responses_endpoint(
 }
 
 #[tokio::test]
+async fn responses_transport_uses_completed_output_text_when_no_delta_was_streamed() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_snapshot_text\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"snapshot answer\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":7,\"output_tokens\":4}}}\n\n";
+    let Some(server) = spawn_server(
+        state,
+        vec![http_response("200 OK", "text/event-stream", sse)],
+    )
+    .await
+    else {
+        return;
+    };
+
+    let client = ResponsesClient::new("responses-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let mut stream = client
+        .stream_message(&sample_request(true))
+        .await
+        .expect("responses request should succeed");
+    let mut events = Vec::new();
+    while let Some(event) = stream.next_event().await.expect("event should parse") {
+        events.push(event);
+    }
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            delta: ContentBlockDelta::TextDelta { text },
+            ..
+        }) if text == "snapshot answer"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        StreamEvent::MessageDelta(MessageDeltaEvent { usage, .. })
+            if usage.input_tokens == 7 && usage.output_tokens == 4
+    )));
+    assert!(matches!(events.last(), Some(StreamEvent::MessageStop(_))));
+}
+
+#[tokio::test]
 async fn responses_transport_accepts_text_only_streams() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let sse = concat!(
