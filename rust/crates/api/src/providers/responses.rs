@@ -353,6 +353,9 @@ impl ResponseStreamState {
         match kind {
             "response.output_text.delta" => {
                 let delta = value.get("delta").and_then(Value::as_str).unwrap_or("");
+                if delta.is_empty() {
+                    return Ok(Some(events));
+                }
                 if !self.text_started {
                     self.text_started = true;
                     events.push(StreamEvent::ContentBlockStart(ContentBlockStartEvent {
@@ -571,6 +574,7 @@ impl ResponseStreamState {
                 | "response.output_item.done"
                 | "response.content_part.added"
                 | "response.content_part.done"
+                | "response.output_text.delta"
                 | "response.output_text.done"
                 | "response.completed"
         ) {

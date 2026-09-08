@@ -204,6 +204,45 @@ async fn responses_transport_uses_finalized_output_item_text_without_delta() {
 }
 
 #[tokio::test]
+async fn responses_transport_does_not_lose_finalized_text_after_empty_delta() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let sse = concat!(
+        "data: {\"type\":\"response.output_item.added\",\"response\":{\"id\":\"resp_empty_delta\"},\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"content\":[]}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"response\":{\"id\":\"resp_empty_delta\"},\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"\"}\n\n",
+        "data: {\"type\":\"response.output_text.done\",\"response\":{\"id\":\"resp_empty_delta\"},\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"text\":\"finalized after empty delta\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_empty_delta\",\"status\":\"completed\",\"usage\":{\"input_tokens\":7,\"output_tokens\":4}}}\n\n"
+    );
+    let Some(server) = spawn_server(
+        state,
+        vec![http_response("200 OK", "text/event-stream", sse)],
+    )
+    .await
+    else {
+        return;
+    };
+
+    let client = ResponsesClient::new("responses-test-key", OpenAiCompatConfig::openai())
+        .with_base_url(server.base_url());
+    let mut stream = client
+        .stream_message(&sample_request(true))
+        .await
+        .expect("responses request should succeed");
+    let mut events = Vec::new();
+    while let Some(event) = stream.next_event().await.expect("event should parse") {
+        events.push(event);
+    }
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+            delta: ContentBlockDelta::TextDelta { text },
+            ..
+        }) if text == "finalized after empty delta"
+    )));
+    assert!(matches!(events.last(), Some(StreamEvent::MessageStop(_))));
+}
+
+#[tokio::test]
 async fn responses_transport_accepts_text_only_streams() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let sse = concat!(
