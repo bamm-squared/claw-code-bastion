@@ -1,4 +1,5 @@
 use serde::Serialize;
+use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
@@ -33,6 +34,11 @@ pub struct Snapshot {
     pub work_unit_writer_turns: u64,
     pub work_unit_turn_allowance: u64,
     pub work_unit_continuation_grants: u64,
+    pub work_unit_completion_rejections: u64,
+    pub work_unit_no_change_attempts: u64,
+    pub work_unit_terminal_reason: Option<String>,
+    pub candidate_check_evidence: Vec<CandidateCheckEvidence>,
+    pub work_unit_checkpoints: Vec<WorkUnitCheckpoint>,
     pub model_turns: u64,
     pub tool_bearing_turns: u64,
     pub tool_calls: BTreeMap<String, u64>,
@@ -125,6 +131,40 @@ pub struct ValidationAttempt {
     pub candidate_identity: String,
     pub validation_identity: String,
     pub checks: Vec<ValidationDiagnostic>,
+}
+
+#[derive(Clone, Debug, Serialize, Default)]
+pub struct CandidateCheckEvidence {
+    pub sequence: u64,
+    pub timestamp_ms: u128,
+    pub work_unit: Option<String>,
+    pub check: String,
+    pub command: String,
+    pub classification: String,
+    pub code_failure: bool,
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub diagnostic: String,
+    pub candidate_identity: Option<String>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Default)]
+pub struct WorkUnitCheckpoint {
+    pub sequence: u64,
+    pub timestamp_ms: u128,
+    pub work_unit: Option<String>,
+    pub writer_turns: u64,
+    pub turn_allowance: u64,
+    pub remaining_turns: u64,
+    pub continuation_grants: u64,
+    pub candidate_changed: Option<bool>,
+    pub candidate_identity: Option<String>,
+    pub candidate_check_evidence_ids: Vec<u64>,
+    pub requested_status: String,
+    pub reconciliation_outcome: Option<String>,
+    pub unresolved_completion: Option<String>,
+    pub terminal_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Default)]
@@ -395,6 +435,241 @@ pub fn work_unit_budget(used: usize, allowance: usize, continuation_grants: u8) 
     });
 }
 
+pub fn work_unit_reconciliation_counters(rejections: u8, no_change_attempts: u8) {
+    with_state(|s| {
+        s.snapshot.work_unit_completion_rejections = u64::from(rejections);
+        s.snapshot.work_unit_no_change_attempts = u64::from(no_change_attempts);
+    });
+    persist_snapshot();
+}
+
+pub fn work_unit_terminal(reason: &str) {
+    with_state(|s| {
+        s.snapshot.work_unit_terminal_reason = Some(reason.chars().take(256).collect());
+    });
+    lifecycle_event(&format!("work_unit_terminal:{reason}"));
+}
+
+#[allow(clippy::too_many_lines)]
+pub fn candidate_check_result(raw: &str) {
+    with_state(|s| {
+        let value = serde_json::from_str::<Value>(raw).ok();
+        let work_unit = s.snapshot.current_work_unit.clone();
+        let default_classification = value
+            .as_ref()
+            .and_then(|value| value.get("classification"))
+            .and_then(Value::as_str)
+            .unwrap_or("malformed")
+            .to_string();
+        let default_code_failure = value
+            .as_ref()
+            .and_then(|value| value.get("code_failure"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let candidate_identity = value
+            .as_ref()
+            .and_then(|value| value.get("candidate_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let checks = value
+            .as_ref()
+            .and_then(|value| value.get("checks"))
+            .and_then(Value::as_array);
+        let mut records = Vec::new();
+        if let Some(checks) = checks {
+            for check in checks.iter().take(32) {
+                let status = check
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("malformed")
+                    .to_string();
+                let classification = if status == "timeout" {
+                    "timeout"
+                } else if status == "unavailable" {
+                    "unavailable"
+                } else {
+                    default_classification.as_str()
+                };
+                let diagnostic = check
+                    .get("stderr")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| check.get("stdout").and_then(Value::as_str))
+                    .unwrap_or_default();
+                records.push(CandidateCheckEvidence {
+                    sequence: s.snapshot.candidate_check_evidence.len() as u64
+                        + records.len() as u64
+                        + 1,
+                    timestamp_ms: now_ms(),
+                    work_unit: work_unit.clone(),
+                    check: check
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("candidate_check")
+                        .to_string(),
+                    command: check
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .unwrap_or("candidate_check")
+                        .to_string(),
+                    classification: classification.to_string(),
+                    code_failure: default_code_failure && classification == "candidate_failure",
+                    status,
+                    exit_code: check
+                        .get("exit_code")
+                        .and_then(Value::as_i64)
+                        .and_then(|code| i32::try_from(code).ok()),
+                    diagnostic: bounded_diagnostic(diagnostic),
+                    candidate_identity: candidate_identity.clone(),
+                    truncated: check
+                        .get("truncated")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                });
+            }
+        }
+        if records.is_empty() {
+            records.push(CandidateCheckEvidence {
+                sequence: s.snapshot.candidate_check_evidence.len() as u64 + 1,
+                timestamp_ms: now_ms(),
+                work_unit,
+                check: value
+                    .as_ref()
+                    .and_then(|value| value.get("kind"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("candidate_check")
+                    .to_string(),
+                command: "candidate_check".to_string(),
+                classification: default_classification,
+                code_failure: default_code_failure,
+                status: value
+                    .as_ref()
+                    .and_then(|value| value.get("status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("malformed")
+                    .to_string(),
+                exit_code: None,
+                diagnostic: value
+                    .as_ref()
+                    .and_then(|value| value.get("error").or_else(|| value.get("diagnostic")))
+                    .and_then(Value::as_str)
+                    .map_or_else(|| bounded_diagnostic(raw), bounded_diagnostic),
+                candidate_identity,
+                truncated: raw.len() > 8_000,
+            });
+        }
+        s.snapshot.candidate_check_evidence.extend(records);
+        if s.snapshot.candidate_check_evidence.len() > 128 {
+            let excess = s.snapshot.candidate_check_evidence.len() - 128;
+            s.snapshot.candidate_check_evidence.drain(0..excess);
+        }
+    });
+    lifecycle_event("candidate_check_evidence_recorded");
+}
+
+pub fn candidate_check_error(error: &str) {
+    candidate_check_result(
+        &serde_json::json!({
+            "kind": "candidate_development_check",
+            "status": "infrastructure_error",
+            "classification": "infrastructure_failure",
+            "code_failure": false,
+            "error": error,
+        })
+        .to_string(),
+    );
+}
+
+pub fn work_unit_checkpoint_requested(requested_status: &str, candidate_changed: Option<bool>) {
+    with_state(|s| {
+        let evidence = s
+            .snapshot
+            .candidate_check_evidence
+            .iter()
+            .rev()
+            .take(8)
+            .map(|item| item.sequence)
+            .collect::<Vec<_>>();
+        let candidate_identity = s
+            .snapshot
+            .candidate_check_evidence
+            .iter()
+            .rev()
+            .find_map(|item| item.candidate_identity.clone());
+        let record = WorkUnitCheckpoint {
+            sequence: s.snapshot.work_unit_checkpoints.len() as u64 + 1,
+            timestamp_ms: now_ms(),
+            work_unit: s.snapshot.current_work_unit.clone(),
+            writer_turns: s.snapshot.work_unit_writer_turns,
+            turn_allowance: s.snapshot.work_unit_turn_allowance,
+            remaining_turns: s
+                .snapshot
+                .work_unit_turn_allowance
+                .saturating_sub(s.snapshot.work_unit_writer_turns),
+            continuation_grants: s.snapshot.work_unit_continuation_grants,
+            candidate_changed,
+            candidate_identity,
+            candidate_check_evidence_ids: evidence,
+            requested_status: requested_status.chars().take(64).collect(),
+            ..WorkUnitCheckpoint::default()
+        };
+        s.snapshot.work_unit_checkpoints.push(record);
+        if s.snapshot.work_unit_checkpoints.len() > 128 {
+            let excess = s.snapshot.work_unit_checkpoints.len() - 128;
+            s.snapshot.work_unit_checkpoints.drain(0..excess);
+        }
+    });
+    lifecycle_event("work_unit_checkpoint_recorded");
+}
+
+pub fn work_unit_checkpoint_reconciled(
+    outcome: &str,
+    unresolved_completion: Option<&str>,
+    terminal_reason: Option<&str>,
+) {
+    with_state(|s| {
+        if let Some(record) = s.snapshot.work_unit_checkpoints.last_mut() {
+            record.reconciliation_outcome = Some(outcome.chars().take(64).collect());
+            record.unresolved_completion = unresolved_completion.map(bounded_diagnostic);
+            record.terminal_reason = terminal_reason.map(|value| value.chars().take(256).collect());
+        }
+    });
+    persist_snapshot();
+}
+
+pub fn work_unit_checkpoint_candidate_state(changed: bool) {
+    with_state(|s| {
+        if let Some(record) = s.snapshot.work_unit_checkpoints.last_mut() {
+            record.candidate_changed = Some(changed);
+        }
+    });
+    persist_snapshot();
+}
+
+pub fn work_unit_checkpoint_refresh_evidence() {
+    with_state(|s| {
+        let evidence = s
+            .snapshot
+            .candidate_check_evidence
+            .iter()
+            .rev()
+            .take(8)
+            .map(|item| item.sequence)
+            .collect::<Vec<_>>();
+        let candidate_identity = s
+            .snapshot
+            .candidate_check_evidence
+            .iter()
+            .rev()
+            .find_map(|item| item.candidate_identity.clone());
+        if let Some(record) = s.snapshot.work_unit_checkpoints.last_mut() {
+            record.candidate_check_evidence_ids = evidence;
+            record.candidate_identity = candidate_identity;
+        }
+    });
+    persist_snapshot();
+}
+
 pub fn model_turn() {
     with_state(|s| s.snapshot.model_turns += 1);
 }
@@ -490,6 +765,10 @@ fn add_usage(slot: &mut Option<u64>, value: u64) {
     if value > 0 {
         *slot = Some(slot.unwrap_or(0).saturating_add(value));
     }
+}
+
+fn bounded_diagnostic(value: &str) -> String {
+    value.chars().take(8_000).collect()
 }
 pub fn candidate_mutation() {
     with_state(record_candidate_mutation);

@@ -5997,6 +5997,15 @@ impl LiveCli {
                         .record_work_unit_completion_feedback(&feedback);
                     self.work_unit_completion_rejections =
                         self.work_unit_completion_rejections.saturating_add(1);
+                    benchmark_telemetry::work_unit_reconciliation_counters(
+                        self.work_unit_completion_rejections,
+                        self.work_unit_no_change_attempts,
+                    );
+                    benchmark_telemetry::work_unit_checkpoint_reconciled(
+                        "rejected",
+                        Some(&feedback),
+                        None,
+                    );
                     benchmark_telemetry::lifecycle_event(
                         "work_unit_completion_reconciliation_feedback",
                     );
@@ -6006,6 +6015,11 @@ impl LiveCli {
                         WriterCheckpoint::Submit { .. } => {
                             if self.task_plan.has_unresolved_work_units() {
                                 self.task_plan.defer_submission_until_units_complete();
+                                benchmark_telemetry::work_unit_checkpoint_reconciled(
+                                    "submission_deferred",
+                                    None,
+                                    None,
+                                );
                                 benchmark_telemetry::lifecycle_event(
                                     "work_unit_submission_deferred",
                                 );
@@ -6014,6 +6028,14 @@ impl LiveCli {
                                 ) {
                                     let _ = runtime.finish_candidate()?;
                                     self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
+                                    benchmark_telemetry::work_unit_terminal(
+                                        "work_unit_budget_exhausted",
+                                    );
+                                    benchmark_telemetry::work_unit_checkpoint_reconciled(
+                                        "terminated",
+                                        None,
+                                        Some("work_unit_budget_exhausted"),
+                                    );
                                     benchmark_telemetry::lifecycle_event(
                                         "work_unit_budget_exhausted",
                                     );
@@ -6036,6 +6058,15 @@ impl LiveCli {
                             if requires_candidate_change && !candidate_changed {
                                 self.work_unit_no_change_attempts =
                                     self.work_unit_no_change_attempts.saturating_add(1);
+                                benchmark_telemetry::work_unit_reconciliation_counters(
+                                    self.work_unit_completion_rejections,
+                                    self.work_unit_no_change_attempts,
+                                );
+                                benchmark_telemetry::work_unit_checkpoint_reconciled(
+                                    "rejected",
+                                    Some("candidate_mutation_missing"),
+                                    None,
+                                );
                                 self.task_plan.record_work_unit_completion_feedback(
                                     "status=incomplete; unresolved=[{category: candidate_mutation_missing, reason: unit_complete was requested before a meaningful candidate mutation}]",
                                 );
@@ -6046,6 +6077,14 @@ impl LiveCli {
                                     let _ = runtime.finish_candidate()?;
                                     self.candidate_state =
                                         CandidateLifecycleState::EvaluationBlocked;
+                                    benchmark_telemetry::work_unit_terminal(
+                                        "work_unit_completion_blocked_without_candidate",
+                                    );
+                                    benchmark_telemetry::work_unit_checkpoint_reconciled(
+                                        "terminated",
+                                        Some("candidate_mutation_missing"),
+                                        Some("work_unit_completion_blocked_without_candidate"),
+                                    );
                                     benchmark_telemetry::lifecycle_event(
                                         "work_unit_completion_blocked_without_candidate",
                                     );
@@ -6071,6 +6110,9 @@ impl LiveCli {
                             self.task_plan
                                 .clear_work_unit_completion_feedback(&completed);
                             benchmark_telemetry::work_unit_transition(&completed, next.as_deref());
+                            benchmark_telemetry::work_unit_checkpoint_reconciled(
+                                "accepted", None, None,
+                            );
                             self.reset_work_unit_budget();
                             if self.task_plan.has_unresolved_work_units() {
                                 if let Some(compaction) = runtime.compact_for_work_unit() {
@@ -6089,6 +6131,14 @@ impl LiveCli {
                             if objective.trim().is_empty() {
                                 let _ = runtime.finish_candidate()?;
                                 self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
+                                benchmark_telemetry::work_unit_terminal(
+                                    "continuation_missing_objective",
+                                );
+                                benchmark_telemetry::work_unit_checkpoint_reconciled(
+                                    "terminated",
+                                    None,
+                                    Some("continuation_missing_objective"),
+                                );
                                 benchmark_telemetry::lifecycle_event(
                                     "work_unit_continuation_rejected_without_objective",
                                 );
@@ -6104,6 +6154,14 @@ impl LiveCli {
                             if !self.grant_work_unit_continuation(objective) {
                                 let _ = runtime.finish_candidate()?;
                                 self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
+                                benchmark_telemetry::work_unit_terminal(
+                                    "completion_reconciliation_exhausted",
+                                );
+                                benchmark_telemetry::work_unit_checkpoint_reconciled(
+                                    "terminated",
+                                    None,
+                                    Some("completion_reconciliation_exhausted"),
+                                );
                                 benchmark_telemetry::lifecycle_event(
                                     "work_unit_completion_reconciliation_exhausted",
                                 );
@@ -6119,6 +6177,14 @@ impl LiveCli {
                             if !self.task_plan.request_replan(&message) {
                                 let _ = runtime.finish_candidate()?;
                                 self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
+                                benchmark_telemetry::work_unit_terminal(
+                                    "work_unit_replan_exhausted",
+                                );
+                                benchmark_telemetry::work_unit_checkpoint_reconciled(
+                                    "terminated",
+                                    None,
+                                    Some("work_unit_replan_exhausted"),
+                                );
                                 benchmark_telemetry::lifecycle_event("work_unit_replan_exhausted");
                                 self.replace_runtime(runtime)?;
                                 self.persist_session()?;
@@ -6139,6 +6205,12 @@ impl LiveCli {
                         | WriterCheckpoint::NeedsUserInput { message } => {
                             let _ = runtime.finish_candidate()?;
                             self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
+                            benchmark_telemetry::work_unit_terminal("writer_checkpoint_blocked");
+                            benchmark_telemetry::work_unit_checkpoint_reconciled(
+                                "terminated",
+                                Some(&message),
+                                Some("writer_checkpoint_blocked"),
+                            );
                             benchmark_telemetry::lifecycle_event("writer_checkpoint_blocked");
                             println!("Writer checkpoint stopped before Review: {message}");
                             self.replace_runtime(runtime)?;
@@ -12367,10 +12439,19 @@ impl ToolExecutor for CliToolExecutor {
             "checks": ["format", "test", "clippy"],
             "timeout_ms": 120_000,
         });
-        let output = self
+        let output = match self
             .tool_registry
             .execute_authorized("candidate_check", &input)
-            .unwrap_or_else(|error| format!("candidate development checks unavailable: {error}"));
+        {
+            Ok(output) => {
+                benchmark_telemetry::candidate_check_result(&output);
+                output
+            }
+            Err(error) => {
+                benchmark_telemetry::candidate_check_error(&error);
+                format!("candidate development checks unavailable: {error}")
+            }
+        };
         Ok(Some(output))
     }
 
@@ -12477,6 +12558,7 @@ impl CliToolExecutor {
         match result {
             Ok(output) => {
                 if candidate_check {
+                    benchmark_telemetry::candidate_check_result(&output);
                     benchmark_telemetry::lifecycle_event("candidate_check_completed");
                 }
                 if self.emit_output {
@@ -12489,6 +12571,7 @@ impl CliToolExecutor {
             }
             Err(error) => {
                 if candidate_check {
+                    benchmark_telemetry::candidate_check_error(&error.to_string());
                     benchmark_telemetry::lifecycle_event("candidate_check_failed");
                 }
                 if self.emit_output {
@@ -12517,12 +12600,14 @@ impl CliToolExecutor {
             .chars()
             .take(4_000)
             .collect::<String>();
+        benchmark_telemetry::work_unit_checkpoint_requested(status, None);
         if status == "unit_complete" && self.candidate_review_roots().is_some() {
             let candidate_changed = self
                 .tool_registry
                 .candidate_has_changes()
                 .map(|changed| changed.unwrap_or(true))
                 .map_err(ToolError::new)?;
+            benchmark_telemetry::work_unit_checkpoint_candidate_state(candidate_changed);
             if candidate_changed {
                 let diagnostics = self
                     .tool_registry
@@ -12530,7 +12615,12 @@ impl CliToolExecutor {
                         "checks": ["format", "test", "clippy"],
                         "timeout_ms": 120_000_u64,
                     }))
-                    .map_err(ToolError::new)?;
+                    .map_err(|error| {
+                        benchmark_telemetry::candidate_check_error(&error);
+                        ToolError::new(error)
+                    })?;
+                benchmark_telemetry::candidate_check_result(&diagnostics);
+                benchmark_telemetry::work_unit_checkpoint_refresh_evidence();
                 let report = serde_json::from_str::<Value>(&diagnostics).ok();
                 let check_status = report
                     .as_ref()
