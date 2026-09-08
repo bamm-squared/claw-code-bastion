@@ -38,6 +38,7 @@ pub struct ResponsesClient {
     headers: std::collections::BTreeMap<String, String>,
     bearer_auth: bool,
     profile: Option<crate::types::OpenAiCompatProfile>,
+    configured_model: Option<String>,
     max_retries: u32,
     last_rate_limit_state: Arc<StdMutex<Option<RateLimitState>>>,
 }
@@ -53,6 +54,7 @@ impl ResponsesClient {
             headers: std::collections::BTreeMap::new(),
             bearer_auth: true,
             profile: None,
+            configured_model: None,
             max_retries: 0,
             last_rate_limit_state: Arc::new(StdMutex::new(None)),
         }
@@ -111,6 +113,12 @@ impl ResponsesClient {
     }
 
     #[must_use]
+    pub fn with_configured_model(mut self, model: impl Into<String>) -> Self {
+        self.configured_model = Some(model.into());
+        self
+    }
+
+    #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
@@ -121,6 +129,17 @@ impl ResponsesClient {
             .lock()
             .ok()
             .and_then(|state| state.clone())
+    }
+
+    fn effective_request(&self, request: &MessageRequest) -> MessageRequest {
+        self.configured_model.as_ref().map_or_else(
+            || request.clone(),
+            |model| {
+                let mut request = request.clone();
+                request.model.clone_from(model);
+                request
+            },
+        )
     }
 
     fn endpoint(&self) -> String {
@@ -217,6 +236,7 @@ impl ResponsesClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageResponse, ApiError> {
+        let request = self.effective_request(request);
         let request = MessageRequest {
             stream: false,
             ..request.clone()
@@ -252,7 +272,8 @@ impl ResponsesClient {
         &self,
         request: &MessageRequest,
     ) -> Result<ResponsesStream, ApiError> {
-        preflight_message_request(request)?;
+        let request = self.effective_request(request);
+        preflight_message_request(&request)?;
         let response = self.post(&request.clone().with_streaming()).await?;
         let rate_limit_state = RateLimitState::from_headers_with_identity(
             response.headers(),

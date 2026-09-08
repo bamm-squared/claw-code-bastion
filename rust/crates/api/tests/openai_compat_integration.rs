@@ -99,10 +99,10 @@ async fn configured_chat_profile_uses_opaque_model_custom_auth_and_parameters() 
             ..Default::default()
         },
     };
-    let client = OpenAiCompatClient::from_profile(&profile)
+    let client = ProviderClient::from_openai_compat_profile("vendor/model:v3", &profile)
         .expect("custom profile should construct without credentials");
     let mut request = sample_request(false);
-    request.model = "vendor/model:v3".to_string();
+    request.model = "stale-runtime-model".to_string();
     request.temperature = Some(0.2);
     request.reasoning_effort = Some("high".to_string());
     let response = client
@@ -161,10 +161,10 @@ async fn configured_responses_profile_uses_custom_model_and_reasoning_policy() {
         },
         parameters: ParameterCapabilities::default(),
     };
-    let client =
-        ResponsesClient::from_profile(&profile).expect("custom Responses profile should construct");
+    let client = ProviderClient::from_openai_compat_profile("edge/model@1", &profile)
+        .expect("custom Responses profile should construct");
     let mut request = sample_request(false);
-    request.model = "edge/model@1".to_string();
+    request.model = "stale-runtime-model".to_string();
     request.reasoning_effort = Some("high".to_string());
     let response = client
         .send_message(&request)

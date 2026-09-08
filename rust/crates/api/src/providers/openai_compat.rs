@@ -127,6 +127,7 @@ pub struct OpenAiCompatClient {
     headers: BTreeMap<String, String>,
     bearer_auth: bool,
     profile: Option<OpenAiCompatProfile>,
+    configured_model: Option<String>,
     last_rate_limit_state: Arc<StdMutex<Option<RateLimitState>>>,
     max_retries: u32,
     initial_backoff: Duration,
@@ -161,6 +162,7 @@ impl OpenAiCompatClient {
             headers: BTreeMap::new(),
             bearer_auth: true,
             profile: None,
+            configured_model: None,
             last_rate_limit_state: Arc::new(StdMutex::new(None)),
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
@@ -227,6 +229,7 @@ impl OpenAiCompatClient {
             headers: BTreeMap::new(),
             bearer_auth: true,
             profile: None,
+            configured_model: None,
             last_rate_limit_state: Arc::new(StdMutex::new(None)),
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
@@ -237,6 +240,12 @@ impl OpenAiCompatClient {
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_configured_model(mut self, model: impl Into<String>) -> Self {
+        self.configured_model = Some(model.into());
         self
     }
 
@@ -258,9 +267,21 @@ impl OpenAiCompatClient {
     /// that need a deterministic preflight or capture boundary.
     #[must_use]
     pub fn render_request_body(&self, request: &MessageRequest) -> Value {
+        let request = self.effective_request(request);
         self.profile.as_ref().map_or_else(
-            || build_chat_completion_request(request, self.config),
-            |profile| build_chat_completion_request_with_profile(request, profile),
+            || build_chat_completion_request(&request, self.config),
+            |profile| build_chat_completion_request_with_profile(&request, profile),
+        )
+    }
+
+    fn effective_request(&self, request: &MessageRequest) -> MessageRequest {
+        self.configured_model.as_ref().map_or_else(
+            || request.clone(),
+            |model| {
+                let mut request = request.clone();
+                request.model.clone_from(model);
+                request
+            },
         )
     }
 
@@ -268,6 +289,7 @@ impl OpenAiCompatClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageResponse, ApiError> {
+        let request = self.effective_request(request);
         let request = MessageRequest {
             stream: false,
             ..request.clone()
@@ -329,7 +351,8 @@ impl OpenAiCompatClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
-        preflight_message_request(request)?;
+        let request = self.effective_request(request);
+        preflight_message_request(&request)?;
         let response = self
             .send_with_retry(&request.clone().with_streaming())
             .await?;

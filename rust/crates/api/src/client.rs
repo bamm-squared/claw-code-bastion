@@ -260,15 +260,15 @@ impl ProviderClient {
     /// model capability configuration. The model string is passed through
     /// unchanged and never selects the provider or protocol.
     pub fn from_openai_compat_profile(
-        _model: &str,
+        model: &str,
         profile: &OpenAiCompatProfile,
     ) -> Result<Self, ApiError> {
         match profile.protocol {
             crate::types::OpenAiCompatProtocol::Responses => Ok(Self::ConfiguredOpenAiResponses(
-                ResponsesClient::from_profile(profile)?,
+                ResponsesClient::from_profile(profile)?.with_configured_model(model),
             )),
             crate::types::OpenAiCompatProtocol::ChatCompletions => Ok(Self::ConfiguredOpenAi(
-                OpenAiCompatClient::from_profile(profile)?,
+                OpenAiCompatClient::from_profile(profile)?.with_configured_model(model),
             )),
         }
     }
