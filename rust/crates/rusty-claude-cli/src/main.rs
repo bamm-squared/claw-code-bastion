@@ -77,8 +77,9 @@ use tools::{
 };
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
-const WRITER_INSTRUCTION_VERSION: &str = "writer-workflow-v1";
+const WRITER_INSTRUCTION_VERSION: &str = "writer-workflow-v2";
 const WRITER_TOOL_SCHEMA_VERSION: &str = "runtime-tools-v1";
+const WRITER_WORKFLOW_GUIDANCE: &str = "[Candidate development workflow]\nThe candidate workspace is isolated from the canonical repository. Candidate edits are reversible and non-authoritative until trusted Apply. When you have a plausible coherent implementation hypothesis within the current work unit, make the smallest scoped candidate edit that tests it; do not wait for proof that the first edit is final. Use candidate_check and focused tests as development feedback: inspect concrete failures, then repair or refine within the existing bounds. Keep edits within owned contracts and invariants; do not bypass permissions, checks, validation, or authority gates.\n\n[Work-unit workflow]\nWork on the current executable work unit first. Use the supplied objective, scope, dependencies, and completion evidence as the unit contract. For an implementation unit, make a meaningful candidate mutation before requesting unit_complete; repeated repository inspection alone is not unit completion. When the objective and evidence are complete, use candidate_checkpoint with status unit_complete so the orchestrator can persist evidence, compact context, and advance to the next dependency-eligible unit. Use submit only when all planned work units are complete; use replan when a material assumption invalidates the current unit. Do not treat work-unit completion as semantic approval.\n\n[Uncertainty and checkpoints]\nOrdinary engineering uncertainty is not by itself a blocker. Several reasonable designs, an API shape that may need compiler refinement, or tests that may reveal edge cases normally call for a bounded candidate hypothesis, not open-ended discovery. Use blocked or needs_user_input only when a required input, permission, repository surface, external dependency, or plausible implementation boundary is genuinely unavailable, or requirements or infrastructure prevent progress. Use bounded_continue only for one concrete remaining implementation or repair objective that can reasonably be completed in the granted continuation; if the candidate is unchanged, state the specific missing fact that prevents a plausible edit.";
 const MAX_VALIDATION_REPAIR_CYCLES: u8 = 2;
 const MAX_EVALUATOR_REWORK_CYCLES: u8 = 1;
 const MAX_TOTAL_CORRECTION_CYCLES: u8 = MAX_VALIDATION_REPAIR_CYCLES + MAX_EVALUATOR_REWORK_CYCLES;
@@ -6046,8 +6047,9 @@ impl LiveCli {
                 )
             });
         let plan_text = format!(
-            "{}\n\n[Candidate development workflow]\nUse candidate_check for a bounded format, test, or clippy check after substantial edits or before candidate_checkpoint when useful. It runs only against the isolated candidate and provides development feedback; it never authorizes Review or Apply. Submit for trusted full validation when the candidate is coherent. If a check reports infrastructure_error, do not edit code to repair the environment.\n\n[Work-unit workflow]\nWork on the current executable work unit first. Use the supplied objective, scope, dependencies, and completion evidence as the unit contract. For an implementation unit, make a meaningful candidate mutation before requesting unit_complete; repeated repository inspection alone is not unit completion. When the objective and evidence are complete, use candidate_checkpoint with status unit_complete so the orchestrator can persist evidence, compact context, and advance to the next dependency-eligible unit. Use submit only when all planned work units are complete; use replan when a material assumption invalidates the current unit. Do not treat work-unit completion as semantic approval.",
-            self.task_plan.render_for_writer()
+            "{}\n\n{}",
+            self.task_plan.render_for_writer(),
+            WRITER_WORKFLOW_GUIDANCE
         );
         let plan_text = format!("{plan_text}{continuation_context}");
         let profile = self.selected_writer_profile.as_ref();
@@ -17408,6 +17410,34 @@ fn write_mcp_server_fixture(script_path: &Path) {
         ]
         .join("\n");
     fs::write(script_path, script).expect("mcp fixture script should write");
+}
+
+#[cfg(test)]
+mod writer_protocol_tests {
+    use super::{WRITER_INSTRUCTION_VERSION, WRITER_WORKFLOW_GUIDANCE};
+
+    #[test]
+    fn guidance_makes_isolated_candidate_a_reversible_feedback_surface() {
+        assert_eq!(WRITER_INSTRUCTION_VERSION, "writer-workflow-v2");
+        assert!(WRITER_WORKFLOW_GUIDANCE.contains("isolated from the canonical repository"));
+        assert!(WRITER_WORKFLOW_GUIDANCE.contains("reversible and non-authoritative"));
+        assert!(WRITER_WORKFLOW_GUIDANCE.contains("smallest scoped candidate edit"));
+        assert!(WRITER_WORKFLOW_GUIDANCE.contains("development feedback"));
+        assert!(WRITER_WORKFLOW_GUIDANCE.contains("repair or refine"));
+    }
+
+    #[test]
+    fn guidance_distinguishes_uncertainty_from_legitimate_blockers() {
+        assert!(WRITER_WORKFLOW_GUIDANCE
+            .contains("Ordinary engineering uncertainty is not by itself a blocker"));
+        assert!(WRITER_WORKFLOW_GUIDANCE.contains("required input, permission, repository surface"));
+        assert!(WRITER_WORKFLOW_GUIDANCE.contains("blocked or needs_user_input"));
+        assert!(WRITER_WORKFLOW_GUIDANCE
+            .contains("one concrete remaining implementation or repair objective"));
+        assert!(WRITER_WORKFLOW_GUIDANCE.contains("owned contracts and invariants"));
+        assert!(WRITER_WORKFLOW_GUIDANCE
+            .contains("Do not treat work-unit completion as semantic approval"));
+    }
 }
 
 #[cfg(test)]

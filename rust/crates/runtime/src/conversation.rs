@@ -630,11 +630,11 @@ where
                     format!("[Checkpoint candidate-development checks]\n{diagnostics}\n\n")
                 });
                 let checkpoint_instruction = if pre_candidate && !finalization_checkpoint {
-                    "The isolated candidate is still unchanged from baseline. This is a context/resource checkpoint, not a submission. Do not submit an unchanged candidate or run project checks yet. Continue for only a short bounded window toward one concrete remaining implementation or discovery objective, then use candidate_checkpoint with unit_complete when the current scheduled work unit is complete, submit only when all work units are resolved, or blocked/needs_user_input if progress is not possible.\n\n"
+                    "The isolated candidate is still unchanged from baseline. This is a context/resource checkpoint, not a submission. There is no candidate change to check yet. Continue for only a short bounded window toward one concrete remaining implementation or discovery objective. If a plausible scoped implementation hypothesis is available, test it in the isolated candidate and use development feedback; otherwise pursue the specific missing fact. Then use candidate_checkpoint with unit_complete when the current scheduled work unit is complete, submit only when all work units are resolved, or blocked/needs_user_input if progress is genuinely not possible.\n\n"
                 } else if pre_candidate {
-                    "The bounded pre-mutation continuation is exhausted and the isolated candidate is still unchanged. Do not use submit to mean no changes; use candidate_checkpoint with blocked or needs_user_input to end explicitly.\n\n"
+                    "The bounded pre-mutation continuation is exhausted and the isolated candidate is still unchanged. Ordinary engineering uncertainty alone is not evidence of inability to proceed; if no plausible scoped hypothesis can be stated, report the specific missing fact. Do not use submit to mean no changes; use candidate_checkpoint with blocked or needs_user_input to end explicitly.\n\n"
                 } else {
-                    "The bounded writer budget/resource boundary has been reached. This is a lifecycle finalization turn: do not use repository or shell tools. Call candidate_checkpoint with unit_complete when the current scheduled work unit is complete, bounded_continue with one concrete remaining objective when a small continuation is justified, submit only when all planned work units are complete, replan when a material assumption is invalid, or blocked/needs_user_input when work cannot continue. If checks reported failures, make only targeted repairs before checkpointing.\n\n"
+                    "The bounded writer budget/resource boundary has been reached. This is a lifecycle finalization turn: do not use repository or shell tools. Do not continue inspection solely to eliminate ordinary engineering uncertainty. Call candidate_checkpoint with unit_complete when the current scheduled work unit is complete, bounded_continue with one concrete remaining implementation or repair objective when a small continuation is justified, submit only when all planned work units are complete, replan when a material assumption is invalid, or blocked/needs_user_input when work genuinely cannot continue. If checks reported failures, make only targeted repairs before checkpointing.\n\n"
                 };
                 self.session
                     .push_message(ConversationMessage {
@@ -717,7 +717,7 @@ where
                             .push_message(ConversationMessage {
                                 role: MessageRole::User,
                                 blocks: vec![ContentBlock::Text {
-                                    text: "Finalization requires one structured candidate_checkpoint outcome. Do not continue repository inspection; choose unit_complete, bounded_continue with a concrete objective, replan, blocked, or needs_user_input.".to_string(),
+                                    text: "Finalization requires one structured candidate_checkpoint outcome. Do not continue repository inspection solely to eliminate ordinary uncertainty; choose unit_complete, bounded_continue with a concrete implementation or repair objective, replan, blocked, or needs_user_input.".to_string(),
                                 }],
                                 usage: None,
                             })
