@@ -7253,6 +7253,14 @@ impl LiveCli {
                             | WriterCheckpoint::NeedsUserInput { message } => {
                                 let _ = runtime.finish_candidate()?;
                                 self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
+                                benchmark_telemetry::work_unit_terminal(
+                                    "writer_checkpoint_blocked",
+                                );
+                                benchmark_telemetry::work_unit_checkpoint_reconciled(
+                                    "terminated",
+                                    Some(&message),
+                                    Some("writer_checkpoint_blocked"),
+                                );
                                 benchmark_telemetry::lifecycle_event("writer_checkpoint_blocked");
                                 println!("Writer checkpoint stopped before Review: {message}");
                                 let declared_contract_ids = self
