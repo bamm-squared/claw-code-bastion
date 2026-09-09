@@ -1851,6 +1851,67 @@ fn explicit_profile_for_model(
     }
 }
 
+#[cfg(test)]
+fn resolve_minimal_loop_profile(
+    pool: &model_router::ModelPool,
+    requested: &str,
+) -> Result<model_router::ModelProfile, String> {
+    let profile = explicit_profile_for_model(pool, requested)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("diagnostic profile {requested:?} is not configured"))?;
+    if profile.id == "legacy-default" {
+        return Err(format!(
+            "diagnostic profile {requested:?} resolved to legacy-default"
+        ));
+    }
+    if profile.model != requested {
+        return Err(format!(
+            "diagnostic profile model mismatch: expected {requested:?}, found {:?}",
+            profile.model
+        ));
+    }
+    if !profile.provider.eq_ignore_ascii_case("openai") {
+        return Err(format!(
+            "diagnostic profile provider mismatch: expected OpenAI, found {:?}",
+            profile.provider
+        ));
+    }
+    let Some(compat) = profile.openai_compat.as_ref() else {
+        return Err(format!(
+            "diagnostic profile {requested:?} lacks explicit OpenAI-compatible transport"
+        ));
+    };
+    if compat.protocol != api::OpenAiCompatProtocol::Responses {
+        return Err(format!(
+            "diagnostic profile protocol mismatch: expected Responses, found {:?}",
+            compat.protocol
+        ));
+    }
+    if compat.connection.provider.as_deref() != Some("openai") {
+        return Err(String::from(
+            "diagnostic profile connection must explicitly select OpenAI",
+        ));
+    }
+    if !compat.capabilities.responses || !compat.capabilities.function_tools {
+        return Err(String::from(
+            "diagnostic profile must support Responses function tools",
+        ));
+    }
+    if !compat.reasoning.supported
+        || !compat.reasoning.supports_with_tools
+        || !compat
+            .reasoning
+            .allowed_efforts
+            .iter()
+            .any(|effort| effort == "medium")
+    {
+        return Err(String::from(
+            "diagnostic profile must support explicit medium reasoning with tools",
+        ));
+    }
+    Ok(profile)
+}
+
 fn config_alias_for_current_dir(alias: &str) -> Option<String> {
     if alias.is_empty() {
         return None;
@@ -18405,6 +18466,56 @@ mod repository_cwd_identity_tests {
         let nested_hash = planning_artifact_hash(&plan, &nested_selection.text);
         assert_eq!(root_hash, nested_hash);
         assert!(Path::new(&root_selection.seed_files[0]).is_relative());
+    }
+}
+
+#[cfg(test)]
+mod minimal_loop_profile_tests {
+    use super::{model_router, resolve_minimal_loop_profile};
+
+    fn profile(protocol: api::OpenAiCompatProtocol) -> model_router::ModelProfile {
+        let mut compat = api::OpenAiCompatProfile::default();
+        compat.connection.provider = Some(String::from("openai"));
+        compat.protocol = protocol;
+        compat.capabilities.responses = protocol == api::OpenAiCompatProtocol::Responses;
+        compat.capabilities.function_tools = true;
+        compat.reasoning.supported = true;
+        compat.reasoning.supports_with_tools = true;
+        compat.reasoning.allowed_efforts = vec![String::from("medium")];
+        let mut profile =
+            model_router::ModelProfile::unknown("gpt-5.6-terra", "openai", "gpt-5.6-terra");
+        profile.openai_compat = Some(compat);
+        profile
+    }
+
+    #[test]
+    fn accepts_explicit_terra_responses_profile() {
+        let pool = model_router::ModelPool::one(profile(api::OpenAiCompatProtocol::Responses));
+        let resolved = resolve_minimal_loop_profile(&pool, "gpt-5.6-terra")
+            .expect("explicit Terra Responses profile should pass");
+        assert_eq!(resolved.model, "gpt-5.6-terra");
+        assert_eq!(
+            resolved
+                .openai_compat
+                .expect("compatibility config should remain present")
+                .protocol,
+            api::OpenAiCompatProtocol::Responses
+        );
+    }
+
+    #[test]
+    fn rejects_legacy_or_chat_completions_fallback() {
+        let pool =
+            model_router::ModelPool::one(profile(api::OpenAiCompatProtocol::ChatCompletions));
+        let error = resolve_minimal_loop_profile(&pool, "gpt-5.6-terra")
+            .expect_err("chat completions must not be accepted for the diagnostic");
+        assert!(error.contains("protocol mismatch"));
+
+        let legacy =
+            model_router::ModelPool::one(model_router::ModelProfile::legacy("gpt-5.6-terra"));
+        let error = resolve_minimal_loop_profile(&legacy, "gpt-5.6-terra")
+            .expect_err("legacy fallback must be rejected");
+        assert!(error.contains("legacy-default"));
     }
 }
 
