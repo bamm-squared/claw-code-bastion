@@ -79,7 +79,7 @@ use tools::{
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 const WRITER_INSTRUCTION_VERSION: &str = "writer-workflow-v2";
 const WRITER_TOOL_SCHEMA_VERSION: &str = "runtime-tools-v1";
-const WRITER_WORKFLOW_GUIDANCE: &str = "[Candidate development workflow]\nThe candidate workspace is isolated from the canonical repository. Candidate edits are reversible and non-authoritative until trusted Apply. When you have a plausible coherent implementation hypothesis within the current work unit, make the smallest scoped candidate edit that tests it; do not wait for proof that the first edit is final. Use candidate_check and focused tests as development feedback: inspect concrete failures, then repair or refine within the existing bounds. Keep edits within owned contracts and invariants; do not bypass permissions, checks, validation, or authority gates.\n\n[Work-unit workflow]\nWork on the current executable work unit first. Use the supplied objective, scope, dependencies, and completion evidence as the unit contract. For an implementation unit, make a meaningful candidate mutation before requesting unit_complete; repeated repository inspection alone is not unit completion. When the objective and evidence are complete, use candidate_checkpoint with status unit_complete so the orchestrator can persist evidence, compact context, and advance to the next dependency-eligible unit. Use submit only when all planned work units are complete; use replan when a material assumption invalidates the current unit. Do not treat work-unit completion as semantic approval.\n\n[Uncertainty and checkpoints]\nOrdinary engineering uncertainty is not by itself a blocker. Several reasonable designs, an API shape that may need compiler refinement, or tests that may reveal edge cases normally call for a bounded candidate hypothesis, not open-ended discovery. Use blocked or needs_user_input only when a required input, permission, repository surface, external dependency, or plausible implementation boundary is genuinely unavailable, or requirements or infrastructure prevent progress. Use bounded_continue only for one concrete remaining implementation or repair objective that can reasonably be completed in the granted continuation; if the candidate is unchanged, state the specific missing fact that prevents a plausible edit.";
+const WRITER_WORKFLOW_GUIDANCE: &str = "[Engineering workflow]\nThe candidate workspace is isolated from the canonical repository. Candidate edits are reversible and non-authoritative until trusted Apply. When a plausible coherent implementation boundary is identified within the active work unit, make the smallest scoped candidate edit that tests the hypothesis; do not wait for proof that the first edit is final. Use candidate checks and focused tests as development feedback, then repair or refine within the existing bounds. Keep edits within the owned contracts and global invariants; do not bypass permissions, checks, validation, or authority gates.\n\nWork on the active executable work unit. Use its objective, owned contracts, downstream boundary, repository facts, and completion evidence as the engineering scope. The orchestrator owns budgets, checkpoints, continuation, reconciliation, validation, evaluation, and unit transitions. When the owned outcome is ready, use candidate_checkpoint with status unit_complete. Use submit only when all planned work units are complete. Report blocked or needs_user_input only when a required input, permission, repository surface, external dependency, plausible implementation boundary, requirement, or infrastructure is genuinely unavailable. Ordinary engineering uncertainty, multiple reasonable designs, compiler refinement, or tests exposing edge cases normally call for a bounded candidate hypothesis and feedback, not blocking.";
 const MAX_VALIDATION_REPAIR_CYCLES: u8 = 2;
 const MAX_EVALUATOR_REWORK_CYCLES: u8 = 1;
 const MAX_TOTAL_CORRECTION_CYCLES: u8 = MAX_VALIDATION_REPAIR_CYCLES + MAX_EVALUATOR_REWORK_CYCLES;
@@ -4430,6 +4430,15 @@ impl BuiltRuntime {
         self
     }
 
+    fn with_orchestrator_checkpointing(mut self) -> Self {
+        let runtime = self
+            .runtime
+            .take()
+            .expect("runtime should exist before selecting checkpoint ownership");
+        self.runtime = Some(runtime.with_orchestrator_checkpointing());
+        self
+    }
+
     fn with_context_checkpoint_tokens(mut self, threshold: usize) -> Self {
         let runtime = self
             .runtime
@@ -6129,7 +6138,7 @@ impl LiveCli {
             .as_deref()
             .map_or(String::new(), |objective| {
                 format!(
-                    "\n\n[Bounded work-unit continuation]\nExecute only this remaining objective before the next lifecycle checkpoint: {objective}\n"
+                    "\n\n[Orchestrator feedback]\nContinue the active work-unit implementation toward this concrete objective, using candidate checks as feedback: {objective}\n"
                 )
             });
         let plan_text = format!(
@@ -6276,7 +6285,12 @@ impl LiveCli {
         } else {
             runtime.with_repository_context(plan_text)
         }
-        .with_writer_checkpoint_policy(remaining_work_unit_turns, 1)
+        .with_writer_checkpoint_policy(remaining_work_unit_turns, 1);
+        let runtime = if self.task_plan.current_work_unit().is_some() {
+            runtime.with_orchestrator_checkpointing()
+        } else {
+            runtime
+        }
         .with_context_checkpoint_tokens(WRITER_CONTEXT_CHECKPOINT_TOKENS)
         .with_hook_abort_signal(hook_abort_signal.clone());
         let mut runtime = runtime;
@@ -6389,6 +6403,42 @@ impl LiveCli {
                     benchmark_telemetry::lifecycle_event(
                         "work_unit_completion_reconciliation_feedback",
                     );
+                }
+                if let Some(reason) = runtime.checkpoint_reason().map(ToOwned::to_owned) {
+                    benchmark_telemetry::lifecycle_event("writer_checkpoint_automatic");
+                    let at_allowance = self.work_unit_writer_turns >= self.work_unit_turn_allowance;
+                    let can_continue = if at_allowance {
+                        self.grant_work_unit_continuation(
+                            "Continue the active work-unit implementation and use the available candidate feedback to reach its owned outcome.".to_string(),
+                        )
+                    } else {
+                        true
+                    };
+                    if can_continue {
+                        benchmark_telemetry::work_unit_checkpoint_reconciled(
+                            "automatic_continue",
+                            Some(&reason),
+                            None,
+                        );
+                        self.replace_runtime(runtime)?;
+                        return self.run_turn_with_presentation(input, presentation);
+                    }
+                    let _ = runtime.finish_candidate()?;
+                    self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
+                    benchmark_telemetry::work_unit_terminal("work_unit_budget_exhausted");
+                    benchmark_telemetry::work_unit_checkpoint_reconciled(
+                        "terminated",
+                        Some(&reason),
+                        Some("work_unit_budget_exhausted"),
+                    );
+                    self.replace_runtime(runtime)?;
+                    self.persist_session()?;
+                    self.render_terminal_result(
+                        presentation,
+                        &summary,
+                        Some("work_unit_budget_exhausted"),
+                    )?;
+                    return Ok(());
                 }
                 if let Some(checkpoint) = runtime.take_checkpoint() {
                     match checkpoint {
@@ -6841,6 +6891,18 @@ impl LiveCli {
         benchmark_telemetry::lifecycle_event("candidate_submitted");
 
         let candidate_id = changes.id.to_string();
+        let changed_paths = changes
+            .changes
+            .iter()
+            .map(|change| change.path().display().to_string())
+            .collect::<Vec<_>>();
+        let candidate_diff = runtime.candidate_review_roots().map_or_else(
+            String::new,
+            |(baseline_root, candidate_root)| {
+                render_candidate_evaluation_diff(&changes, &baseline_root, &candidate_root)
+            },
+        );
+        benchmark_telemetry::candidate_artifact(&candidate_id, &changed_paths, &candidate_diff);
         if self.completion_audit_pending
             && self.completion_audit_candidate_id.as_deref() == Some(candidate_id.as_str())
         {
@@ -6907,22 +6969,6 @@ impl LiveCli {
         let policy = runtime::ValidationPolicy::default();
         let normal_apply_allowed = validation.allows_apply(changes.id, policy, false);
         let blocked_apply_allowed = validation.allows_apply(changes.id, policy, true);
-        let changed_paths = changes
-            .changes
-            .iter()
-            .map(|change| change.path().display().to_string())
-            .collect::<Vec<_>>();
-        let candidate_diff = runtime.candidate_review_roots().map_or_else(
-            String::new,
-            |(baseline_root, candidate_root)| {
-                render_candidate_evaluation_diff(&changes, &baseline_root, &candidate_root)
-            },
-        );
-        benchmark_telemetry::candidate_artifact(
-            &changes.id.to_string(),
-            &changed_paths,
-            &candidate_diff,
-        );
         benchmark_telemetry::lifecycle_event("completion_audit_started");
         self.task_plan.record_candidate_evidence(&changed_paths);
         self.record_requirement_coverage();
@@ -17550,14 +17596,13 @@ mod writer_protocol_tests {
     #[test]
     fn guidance_distinguishes_uncertainty_from_legitimate_blockers() {
         assert!(WRITER_WORKFLOW_GUIDANCE
-            .contains("Ordinary engineering uncertainty is not by itself a blocker"));
+            .contains("Ordinary engineering uncertainty, multiple reasonable designs"));
         assert!(WRITER_WORKFLOW_GUIDANCE.contains("required input, permission, repository surface"));
         assert!(WRITER_WORKFLOW_GUIDANCE.contains("blocked or needs_user_input"));
-        assert!(WRITER_WORKFLOW_GUIDANCE
-            .contains("one concrete remaining implementation or repair objective"));
-        assert!(WRITER_WORKFLOW_GUIDANCE.contains("owned contracts and invariants"));
-        assert!(WRITER_WORKFLOW_GUIDANCE
-            .contains("Do not treat work-unit completion as semantic approval"));
+        assert!(WRITER_WORKFLOW_GUIDANCE.contains("orchestrator owns budgets, checkpoints"));
+        assert!(!WRITER_WORKFLOW_GUIDANCE.contains("bounded_continue"));
+        assert!(WRITER_WORKFLOW_GUIDANCE.contains("owned contracts and global invariants"));
+        assert!(WRITER_WORKFLOW_GUIDANCE.contains("When the owned outcome is ready"));
     }
 
     #[test]

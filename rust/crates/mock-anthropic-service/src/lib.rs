@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -102,6 +102,7 @@ enum Scenario {
     TokenCostReporting,
     CliCheckpointRepair,
     CliCheckpointNoAllowance,
+    CliAutomaticCheckpointRepair,
 }
 
 impl Scenario {
@@ -121,6 +122,7 @@ impl Scenario {
             "token_cost_reporting" => Some(Self::TokenCostReporting),
             "cli_checkpoint_repair" => Some(Self::CliCheckpointRepair),
             "cli_checkpoint_no_allowance" => Some(Self::CliCheckpointNoAllowance),
+            "cli_automatic_checkpoint_repair" => Some(Self::CliAutomaticCheckpointRepair),
             _ => None,
         }
     }
@@ -141,6 +143,7 @@ impl Scenario {
             Self::TokenCostReporting => "token_cost_reporting",
             Self::CliCheckpointRepair => "cli_checkpoint_repair",
             Self::CliCheckpointNoAllowance => "cli_checkpoint_no_allowance",
+            Self::CliAutomaticCheckpointRepair => "cli_automatic_checkpoint_repair",
         }
     }
 }
@@ -344,6 +347,68 @@ fn checkpoint_no_allowance_step(request: &MessageRequest) -> CheckpointRepairSte
         (1, 0, 0) => CheckpointRepairStep::IntroduceDefect,
         (1, 1, 0 | 1) => CheckpointRepairStep::RequestContinuation,
         _ => CheckpointRepairStep::Stop,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutomaticCheckpointRepairStep {
+    ReadInitial,
+    IntroduceDefect,
+    ReadCargo,
+    ReadLock,
+    GlobSource,
+    GrepValue,
+    ReadSourceAgain,
+    ReadCargoAgain,
+    GlobRust,
+    GrepSource,
+    ReadSourceFinal,
+    ReadCargoFinal,
+    GlobFinal,
+    FinalDiscovery(usize),
+    Repair,
+    Complete,
+}
+
+fn total_tool_uses(request: &MessageRequest) -> usize {
+    request
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            InputContentBlock::ToolUse { id, .. } => Some(id),
+            _ => None,
+        })
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+fn request_contains(request: &MessageRequest, text: &str) -> bool {
+    serde_json::to_string(request).is_ok_and(|request| request.contains(text))
+}
+
+fn automatic_checkpoint_repair_step(request: &MessageRequest) -> AutomaticCheckpointRepairStep {
+    if request_contains(request, "Checkpoint candidate-development checks") {
+        if request_contains(request, "toolu_auto_repair") {
+            return AutomaticCheckpointRepairStep::Complete;
+        }
+        return AutomaticCheckpointRepairStep::Repair;
+    }
+    match total_tool_uses(request) {
+        0 => AutomaticCheckpointRepairStep::ReadInitial,
+        1 => AutomaticCheckpointRepairStep::IntroduceDefect,
+        2 => AutomaticCheckpointRepairStep::ReadCargo,
+        3 => AutomaticCheckpointRepairStep::ReadLock,
+        4 => AutomaticCheckpointRepairStep::GlobSource,
+        5 => AutomaticCheckpointRepairStep::GrepValue,
+        6 => AutomaticCheckpointRepairStep::ReadSourceAgain,
+        7 => AutomaticCheckpointRepairStep::ReadCargoAgain,
+        8 => AutomaticCheckpointRepairStep::GlobRust,
+        9 => AutomaticCheckpointRepairStep::GrepSource,
+        10 => AutomaticCheckpointRepairStep::ReadSourceFinal,
+        11 => AutomaticCheckpointRepairStep::ReadCargoFinal,
+        12 => AutomaticCheckpointRepairStep::GlobFinal,
+        total => AutomaticCheckpointRepairStep::FinalDiscovery(total),
     }
 }
 
@@ -581,6 +646,94 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
             CheckpointRepairStep::Repair | CheckpointRepairStep::Complete => {
                 final_text_sse("unexpected no-allowance replay state")
             }
+        },
+        Scenario::CliAutomaticCheckpointRepair => match automatic_checkpoint_repair_step(request) {
+            AutomaticCheckpointRepairStep::ReadInitial => tool_use_sse(
+                "toolu_auto_read_initial",
+                "read_file",
+                &[r#"{"path":"src/lib.rs"}"#],
+            ),
+            AutomaticCheckpointRepairStep::IntroduceDefect => tool_use_sse(
+                "toolu_auto_bad_edit",
+                "edit_file",
+                &[
+                    r#"{"path":"src/lib.rs","old_string":"pub fn value() -> i32 { 1 }\n","new_string":"pub fn value() -> i32 {\n","replace_all":false}"#,
+                ],
+            ),
+            AutomaticCheckpointRepairStep::ReadCargo => tool_use_sse(
+                "toolu_auto_read_cargo",
+                "read_file",
+                &[r#"{"path":"Cargo.toml"}"#],
+            ),
+            AutomaticCheckpointRepairStep::ReadLock => tool_use_sse(
+                "toolu_auto_read_lock",
+                "read_file",
+                &[r#"{"path":"Cargo.lock"}"#],
+            ),
+            AutomaticCheckpointRepairStep::GlobSource => tool_use_sse(
+                "toolu_auto_glob_source",
+                "glob_search",
+                &[r#"{"pattern":"src/*.rs"}"#],
+            ),
+            AutomaticCheckpointRepairStep::GrepValue => tool_use_sse(
+                "toolu_auto_grep_value",
+                "grep_search",
+                &[r#"{"pattern":"value","path":"src"}"#],
+            ),
+            AutomaticCheckpointRepairStep::ReadSourceAgain => tool_use_sse(
+                "toolu_auto_read_source_again",
+                "read_file",
+                &[r#"{"path":"src/lib.rs","start_line":1}"#],
+            ),
+            AutomaticCheckpointRepairStep::ReadCargoAgain => tool_use_sse(
+                "toolu_auto_read_cargo_again",
+                "read_file",
+                &[r#"{"path":"Cargo.toml","start_line":1}"#],
+            ),
+            AutomaticCheckpointRepairStep::GlobRust => tool_use_sse(
+                "toolu_auto_glob_rust",
+                "glob_search",
+                &[r#"{"pattern":"**/*.rs"}"#],
+            ),
+            AutomaticCheckpointRepairStep::GrepSource => tool_use_sse(
+                "toolu_auto_grep_source",
+                "grep_search",
+                &[r#"{"pattern":"pub fn","path":"src"}"#],
+            ),
+            AutomaticCheckpointRepairStep::ReadSourceFinal => tool_use_sse(
+                "toolu_auto_read_source_final",
+                "read_file",
+                &[r#"{"path":"src/lib.rs","start_line":2}"#],
+            ),
+            AutomaticCheckpointRepairStep::ReadCargoFinal => tool_use_sse(
+                "toolu_auto_read_cargo_final",
+                "read_file",
+                &[r#"{"path":"Cargo.toml","start_line":2}"#],
+            ),
+            AutomaticCheckpointRepairStep::GlobFinal => tool_use_sse(
+                "toolu_auto_glob_final",
+                "glob_search",
+                &[r#"{"pattern":"src/**/*.rs"}"#],
+            ),
+            AutomaticCheckpointRepairStep::FinalDiscovery(index) => {
+                let id = format!("toolu_auto_final_{index}");
+                let input = format!(r#"{{"path":"src/lib.rs","start_line":{index}}}"#);
+                tool_use_sse(&id, "read_file", &[&input])
+            }
+            AutomaticCheckpointRepairStep::Repair => tool_use_sse(
+                "toolu_auto_repair",
+                "edit_file",
+                &[
+                    r#"{"path":"src/lib.rs","old_string":"pub fn value() -> i32 {\n","new_string":"pub fn value() -> i32 {\n    2\n}\n","replace_all":false}"#,
+                ],
+            ),
+            AutomaticCheckpointRepairStep::Complete => tool_use_sse(
+                "toolu_auto_complete",
+                "candidate_checkpoint",
+                &[
+                    r#"{"status":"unit_complete","message":"The active unit is implemented and candidate checks pass."}"#,
+                ],
+            ),
         },
     }
 }
@@ -845,6 +998,120 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
                 "unexpected no-allowance replay state",
             ),
         },
+        Scenario::CliAutomaticCheckpointRepair => match automatic_checkpoint_repair_step(request) {
+            AutomaticCheckpointRepairStep::ReadInitial => tool_message_response(
+                "msg_auto_read_initial",
+                "toolu_auto_read_initial",
+                "read_file",
+                json!({"path": "src/lib.rs"}),
+            ),
+            AutomaticCheckpointRepairStep::IntroduceDefect => tool_message_response(
+                "msg_auto_bad_edit",
+                "toolu_auto_bad_edit",
+                "edit_file",
+                json!({
+                    "path": "src/lib.rs",
+                    "old_string": "pub fn value() -> i32 { 1 }\n",
+                    "new_string": "pub fn value() -> i32 {\n",
+                    "replace_all": false
+                }),
+            ),
+            AutomaticCheckpointRepairStep::ReadCargo => tool_message_response(
+                "msg_auto_read_cargo",
+                "toolu_auto_read_cargo",
+                "read_file",
+                json!({"path": "Cargo.toml"}),
+            ),
+            AutomaticCheckpointRepairStep::ReadLock => tool_message_response(
+                "msg_auto_read_lock",
+                "toolu_auto_read_lock",
+                "read_file",
+                json!({"path": "Cargo.lock"}),
+            ),
+            AutomaticCheckpointRepairStep::GlobSource => tool_message_response(
+                "msg_auto_glob_source",
+                "toolu_auto_glob_source",
+                "glob_search",
+                json!({"pattern": "src/*.rs"}),
+            ),
+            AutomaticCheckpointRepairStep::GrepValue => tool_message_response(
+                "msg_auto_grep_value",
+                "toolu_auto_grep_value",
+                "grep_search",
+                json!({"pattern": "value", "path": "src"}),
+            ),
+            AutomaticCheckpointRepairStep::ReadSourceAgain => tool_message_response(
+                "msg_auto_read_source_again",
+                "toolu_auto_read_source_again",
+                "read_file",
+                json!({"path": "src/lib.rs", "start_line": 1}),
+            ),
+            AutomaticCheckpointRepairStep::ReadCargoAgain => tool_message_response(
+                "msg_auto_read_cargo_again",
+                "toolu_auto_read_cargo_again",
+                "read_file",
+                json!({"path": "Cargo.toml", "start_line": 1}),
+            ),
+            AutomaticCheckpointRepairStep::GlobRust => tool_message_response(
+                "msg_auto_glob_rust",
+                "toolu_auto_glob_rust",
+                "glob_search",
+                json!({"pattern": "**/*.rs"}),
+            ),
+            AutomaticCheckpointRepairStep::GrepSource => tool_message_response(
+                "msg_auto_grep_source",
+                "toolu_auto_grep_source",
+                "grep_search",
+                json!({"pattern": "pub fn", "path": "src"}),
+            ),
+            AutomaticCheckpointRepairStep::ReadSourceFinal => tool_message_response(
+                "msg_auto_read_source_final",
+                "toolu_auto_read_source_final",
+                "read_file",
+                json!({"path": "src/lib.rs", "start_line": 2}),
+            ),
+            AutomaticCheckpointRepairStep::ReadCargoFinal => tool_message_response(
+                "msg_auto_read_cargo_final",
+                "toolu_auto_read_cargo_final",
+                "read_file",
+                json!({"path": "Cargo.toml", "start_line": 2}),
+            ),
+            AutomaticCheckpointRepairStep::GlobFinal => tool_message_response(
+                "msg_auto_glob_final",
+                "toolu_auto_glob_final",
+                "glob_search",
+                json!({"pattern": "src/**/*.rs"}),
+            ),
+            AutomaticCheckpointRepairStep::FinalDiscovery(index) => {
+                let id = format!("toolu_auto_final_{index}");
+                tool_message_response(
+                    &format!("msg_auto_final_{index}"),
+                    &id,
+                    "read_file",
+                    json!({"path": "src/lib.rs", "start_line": index}),
+                )
+            }
+            AutomaticCheckpointRepairStep::Repair => tool_message_response(
+                "msg_auto_repair",
+                "toolu_auto_repair",
+                "edit_file",
+                json!({
+                    "path": "src/lib.rs",
+                    "old_string": "pub fn value() -> i32 {\n",
+                    "new_string": "pub fn value() -> i32 {\n    2\n}\n",
+                    "replace_all": false
+                }),
+            ),
+            AutomaticCheckpointRepairStep::Complete => tool_message_response(
+                "msg_auto_complete",
+                "toolu_auto_complete",
+                "candidate_checkpoint",
+                json!({
+                    "status": "unit_complete",
+                    "message": "The active unit is implemented and candidate checks pass."
+                }),
+            ),
+        },
     }
 }
 
@@ -864,6 +1131,7 @@ fn request_id_for(scenario: Scenario) -> &'static str {
         Scenario::TokenCostReporting => "req_token_cost_reporting",
         Scenario::CliCheckpointRepair => "req_cli_checkpoint_repair",
         Scenario::CliCheckpointNoAllowance => "req_cli_checkpoint_no_allowance",
+        Scenario::CliAutomaticCheckpointRepair => "req_cli_automatic_checkpoint_repair",
     }
 }
 

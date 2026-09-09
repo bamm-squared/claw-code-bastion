@@ -279,6 +279,7 @@ pub struct ConversationRuntime<C, T> {
     checkpoint: Option<WriterCheckpoint>,
     checkpoint_candidate_check_ran: bool,
     checkpoint_reason: Option<String>,
+    orchestrator_checkpointing: bool,
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
     auto_compaction_input_tokens_threshold: u32,
@@ -337,6 +338,7 @@ where
             checkpoint: None,
             checkpoint_candidate_check_ran: false,
             checkpoint_reason: None,
+            orchestrator_checkpointing: false,
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
             auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
@@ -368,6 +370,14 @@ where
         self.configured_max_iterations = max_iterations;
         self.checkpoint_finalization_turns = finalization_turns;
         self.checkpoint_turns_remaining = finalization_turns;
+        self
+    }
+
+    /// Let the caller own checkpoint decisions while retaining shared
+    /// checkpoint detection, checks, compaction, and accounting.
+    #[must_use]
+    pub fn with_orchestrator_checkpointing(mut self) -> Self {
+        self.orchestrator_checkpointing = true;
         self
     }
 
@@ -626,6 +636,37 @@ where
                 };
                 self.checkpoint_candidate_check_ran = candidate_check.is_some();
                 checkpoint_compaction = self.compact_for_checkpoint();
+                if self.orchestrator_checkpointing {
+                    let checkpoint_candidate_check_ran = candidate_check.is_some();
+                    let checkpoint_evidence =
+                        candidate_check.map_or_else(String::new, |diagnostics| {
+                            format!("[Checkpoint candidate-development checks]\n{diagnostics}\n\n")
+                        });
+                    self.session
+                        .push_message(ConversationMessage {
+                            role: MessageRole::User,
+                            blocks: vec![ContentBlock::Text {
+                                text: format!(
+                                    "{checkpoint_evidence}The orchestrator reached a bounded engineering checkpoint ({reason}). Continue implementing the active work unit using the current candidate and concrete check feedback. When the owned outcome is ready, report unit_complete; report blocked or needs_user_input only for a genuine blocker."
+                                ),
+                            }],
+                            usage: None,
+                        })
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    if let Some(session_tracer) = &self.session_tracer {
+                        session_tracer.record(
+                            "writer_checkpoint_automatic",
+                            Map::from_iter([
+                                ("reason".to_string(), Value::from(reason)),
+                                (
+                                    "candidate_check_ran".to_string(),
+                                    Value::from(checkpoint_candidate_check_ran),
+                                ),
+                            ]),
+                        );
+                    }
+                    break;
+                }
                 let checkpoint_evidence = candidate_check.map_or_else(String::new, |diagnostics| {
                     format!("[Checkpoint candidate-development checks]\n{diagnostics}\n\n")
                 });

@@ -454,6 +454,89 @@ fn cli_text_and_json_share_checkpoint_repair_lifecycle() {
 }
 
 #[test]
+fn cli_json_automatic_checkpoint_repair_is_orchestrator_driven() {
+    const TASK: &str = "PARITY_SCENARIO:cli_automatic_checkpoint_repair Implement the value behavior in src/lib.rs with focused tests while preserving existing behavior.";
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let workspace = HarnessWorkspace::new(unique_temp_dir("automatic-checkpoint-repair"));
+    workspace.create().expect("workspace should exist");
+    prepare_checkpoint_repair_fixture(&workspace);
+    let telemetry = unique_temp_dir("automatic-checkpoint-repair-telemetry").with_extension("json");
+    let before = runtime.block_on(server.captured_requests()).len();
+    let output =
+        run_checkpoint_repair_case(TASK, "json", &workspace, &telemetry, &server.base_url());
+    assert_success(&output);
+
+    let captured = runtime.block_on(server.captured_requests());
+    let requests = captured[before..]
+        .iter()
+        .filter(|request| request.path == "/v1/messages")
+        .collect::<Vec<_>>();
+    assert!(
+        requests.len() >= 12,
+        "automatic checkpoint should preserve the repair window"
+    );
+    let turn_tools = requests
+        .iter()
+        .map(|request| provider_latest_assistant_tool_trace(request))
+        .collect::<Vec<_>>();
+    let all_tools = turn_tools.iter().flatten().collect::<Vec<_>>();
+    assert_eq!(
+        all_tools
+            .iter()
+            .filter(|tool| **tool == "edit_file")
+            .count(),
+        2
+    );
+    assert_eq!(
+        all_tools
+            .iter()
+            .filter(|tool| **tool == "candidate_checkpoint")
+            .count(),
+        1
+    );
+    assert!(requests.iter().any(|request| request
+        .raw_body
+        .contains("Checkpoint candidate-development checks")));
+    assert!(!requests.iter().any(|request| provider_tool_input_contains(
+        request,
+        "candidate_checkpoint",
+        "bounded_continue"
+    )));
+
+    let telemetry_value: Value =
+        serde_json::from_slice(&fs::read(&telemetry).expect("telemetry should exist"))
+            .expect("telemetry should be valid JSON");
+    assert!(telemetry_value["lifecycle_events"]
+        .as_array()
+        .is_some_and(|events| {
+            events
+                .iter()
+                .any(|event| event == "writer_checkpoint_automatic")
+                && events
+                    .iter()
+                    .any(|event| event == "work_unit_bounded_continuation_granted")
+        }));
+    assert!(telemetry_value["candidate_check_evidence"]
+        .as_array()
+        .is_some_and(|checks| !checks.is_empty()));
+    assert!(telemetry_value["candidate_artifact"]["changed_paths"]
+        .as_array()
+        .is_some_and(|paths| paths.iter().any(|path| path == "src/lib.rs")));
+    assert!(telemetry_value["candidate_artifact"]["diff"]
+        .as_str()
+        .is_some_and(|diff| diff.contains("src/lib.rs")));
+    assert_eq!(
+        fs::read_to_string(workspace.root.join("src/lib.rs")).expect("fixture should read"),
+        "pub fn value() -> i32 { 1 }\n"
+    );
+    let _ = fs::remove_file(telemetry);
+    fs::remove_dir_all(&workspace.root).expect("workspace cleanup should succeed");
+}
+
+#[test]
 fn cli_json_checkpoint_repair_denies_exhausted_continuation() {
     const TASK: &str = "PARITY_SCENARIO:cli_checkpoint_no_allowance Implement the value behavior in src/lib.rs and expose its result through a command-facing integration while preserving existing behavior and adding focused tests.";
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
@@ -607,6 +690,48 @@ fn provider_tool_trace(request: &mock_anthropic_service::CapturedRequest) -> Vec
                 .flatten()
         })
         .collect()
+}
+
+fn provider_latest_assistant_tool_trace(
+    request: &mock_anthropic_service::CapturedRequest,
+) -> Vec<String> {
+    let body: Value = serde_json::from_str(&request.raw_body).expect("request should be JSON");
+    body["messages"]
+        .as_array()
+        .and_then(|messages| {
+            messages
+                .iter()
+                .rev()
+                .find(|message| message["role"] == "assistant")
+        })
+        .and_then(|message| message["content"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|block| {
+            (block["type"] == "tool_use")
+                .then(|| block["name"].as_str().map(ToOwned::to_owned))
+                .flatten()
+        })
+        .collect()
+}
+
+fn provider_tool_input_contains(
+    request: &mock_anthropic_service::CapturedRequest,
+    tool_name: &str,
+    text: &str,
+) -> bool {
+    let body: Value = serde_json::from_str(&request.raw_body).expect("request should be JSON");
+    body["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|message| message["content"].as_array())
+        .flatten()
+        .any(|block| {
+            block["type"] == "tool_use"
+                && block["name"] == tool_name
+                && block["input"].to_string().contains(text)
+        })
 }
 
 #[allow(dead_code)]
