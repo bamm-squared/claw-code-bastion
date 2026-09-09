@@ -1823,6 +1823,15 @@ fn relevance_terms(task: &str) -> BTreeSet<String> {
         .collect()
 }
 
+fn explicit_task_terms(task: &str) -> BTreeSet<String> {
+    task_tokens(task)
+        .filter_map(|token| token.strip_prefix('/'))
+        .flat_map(|token| token.split(|character: char| !character.is_ascii_alphanumeric()))
+        .map(str::to_ascii_lowercase)
+        .filter(|term| term.len() >= 3)
+        .collect()
+}
+
 fn label_terms(label: &str) -> impl Iterator<Item = String> + '_ {
     label
         .split(|character: char| !character.is_ascii_alphanumeric())
@@ -1855,6 +1864,7 @@ fn inferred_seed_ids(graph: &RepositoryGraph, task: &str) -> BTreeSet<String> {
     }
 
     let mut candidates: BTreeMap<String, usize> = BTreeMap::new();
+    let mut file_candidates = Vec::new();
     for path in graph.facts.keys() {
         let score = terms
             .iter()
@@ -1866,9 +1876,12 @@ fn inferred_seed_ids(graph: &RepositoryGraph, task: &str) -> BTreeSet<String> {
             })
             .sum();
         if score >= 3 {
-            candidates.insert(format!("file:{path}"), score);
+            let id = format!("file:{path}");
+            candidates.insert(id.clone(), score);
+            file_candidates.push((score, seed_priority(graph, &id), id));
         }
     }
+    let mut symbol_candidates = Vec::new();
     for node in graph
         .nodes
         .values()
@@ -1885,16 +1898,90 @@ fn inferred_seed_ids(graph: &RepositoryGraph, task: &str) -> BTreeSet<String> {
             .sum();
         if score >= 4 {
             candidates.insert(node.id.clone(), score);
+            symbol_candidates.push((score, seed_priority(graph, &node.id), node.id.clone()));
         }
     }
 
-    let best_score = candidates.values().copied().max().unwrap_or(0);
-    candidates
-        .into_iter()
-        .filter(|(_, score)| *score == best_score)
-        .take(8)
-        .map(|(id, _)| id)
-        .collect()
+    file_candidates.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    symbol_candidates.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+
+    let mut selected = BTreeSet::new();
+    let explicit_terms = explicit_task_terms(task);
+    for (_, _, id) in symbol_candidates.iter().filter(|(_, _, id)| {
+        seed_priority(graph, id) >= 3
+            && graph.node(id).is_some_and(|node| {
+                explicit_terms
+                    .iter()
+                    .any(|term| label_terms(&node.label).any(|label| label == *term))
+            })
+    }) {
+        if selected.len() == 4 {
+            break;
+        }
+        selected.insert(id.clone());
+    }
+    for (_, _, id) in file_candidates
+        .iter()
+        .filter(|(_, priority, _)| *priority >= 3)
+    {
+        if selected.len() == 8 {
+            break;
+        }
+        selected.insert(id.clone());
+    }
+
+    let mut remaining = candidates.into_iter().collect::<Vec<_>>();
+    remaining.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| seed_priority(graph, &right.0).cmp(&seed_priority(graph, &left.0)))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    for (id, _) in remaining {
+        if selected.len() == 8 {
+            break;
+        }
+        selected.insert(id);
+    }
+    selected
+}
+
+fn seed_priority(graph: &RepositoryGraph, node_id: &str) -> u8 {
+    let path = if let Some(path) = node_id.strip_prefix("file:") {
+        Some(path)
+    } else {
+        graph.file_defining_node(node_id)
+    };
+    let Some(path) = path else {
+        return 0;
+    };
+    let components = path.split('/').collect::<Vec<_>>();
+    if components
+        .iter()
+        .any(|component| matches!(*component, "target" | ".git" | "build" | "generated"))
+    {
+        return 0;
+    }
+    if components.contains(&"tests") || components.contains(&"test") {
+        return 2;
+    }
+    if components.contains(&"src") || components.contains(&"crates") {
+        return 3;
+    }
+    1
 }
 
 #[must_use]
@@ -2435,6 +2522,89 @@ mod tests {
         let selection = context_for_task(&output.graph, "inspect same", 8, 4096);
         assert_eq!(selection.seeds.len(), 2);
         assert_eq!(selection.selected_files.len(), 2);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn broker_covers_generic_cross_layer_command_and_backend_surfaces() {
+        let dir = std::env::temp_dir().join(format!("ri-cross-layer-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("src/cli.rs"),
+            "pub fn run_audit() { validate_effective_state(); render_audit_report(); }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("src/backend.rs"),
+            "pub fn validate_effective_state() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("src/presentation.rs"),
+            "pub fn render_audit_report() {}\n",
+        )
+        .unwrap();
+        let output = RepositoryIndex::build(&dir, None, AnalysisConfig::default(), true).unwrap();
+        let selection = context_for_task(
+            &output.graph,
+            "Improve /audit so it validates effective runtime state and reports actionable diagnostics",
+            16,
+            4096,
+        );
+        for expected in ["src/cli.rs", "src/backend.rs", "src/presentation.rs"] {
+            assert!(
+                selection.selected_files.iter().any(|path| path == expected),
+                "cross-layer selection omitted {expected}: {:?}",
+                selection.selected_files
+            );
+        }
+        assert!(selection
+            .seeds
+            .iter()
+            .any(|seed| seed.contains("run_audit")));
+        assert!(selection
+            .seeds
+            .iter()
+            .any(|seed| seed.contains("validate_effective_state")));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn broker_keeps_upstream_context_compact_without_downstream_command_anchor() {
+        let dir = std::env::temp_dir().join(format!("ri-upstream-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("src/cli.rs"),
+            "pub fn run_audit() { validate_effective_state(); render_audit_report(); }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("src/backend.rs"),
+            "pub fn validate_effective_state() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("src/presentation.rs"),
+            "pub fn render_audit_report() {}\n",
+        )
+        .unwrap();
+        let output = RepositoryIndex::build(&dir, None, AnalysisConfig::default(), true).unwrap();
+        let selection =
+            context_for_task(&output.graph, "validate effective runtime state", 16, 4096);
+        assert!(selection
+            .selected_files
+            .iter()
+            .any(|path| path == "src/backend.rs"));
+        assert!(!selection
+            .selected_files
+            .iter()
+            .any(|path| path == "src/cli.rs"));
+        assert!(!selection
+            .selected_files
+            .iter()
+            .any(|path| path == "src/presentation.rs"));
         let _ = fs::remove_dir_all(dir);
     }
 }
