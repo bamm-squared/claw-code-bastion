@@ -90,6 +90,8 @@ pub struct Snapshot {
     pub writer_route_reason: Option<String>,
     pub writer_route_rejections: Vec<RoutingRejection>,
     pub writer_route_estimate: Option<RoutingEstimate>,
+    pub writer_profile_events: Vec<WriterProfileEvent>,
+    pub candidate_artifact: Option<CandidateArtifact>,
     pub evaluation_blocked_reason: Option<String>,
     pub requirement_coverage: Vec<RequirementCoverage>,
     pub started_at_ms: u128,
@@ -119,6 +121,30 @@ pub struct ProviderCallRecord {
     pub cache_write_tokens: u64,
     pub estimated_cost_usd: Option<f64>,
     pub price_source: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Default)]
+pub struct WriterProfileEvent {
+    pub sequence: u64,
+    pub timestamp_ms: u128,
+    pub work_unit: Option<String>,
+    pub role: String,
+    pub previous_profile: Option<String>,
+    pub profile: String,
+    pub provider: Option<String>,
+    pub model: String,
+    pub protocol: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub selection_source: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Default)]
+pub struct CandidateArtifact {
+    pub candidate_identity: String,
+    pub changed_paths: Vec<String>,
+    pub diff: String,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Default)]
@@ -1003,6 +1029,35 @@ pub fn writer_routing(
         s.snapshot.writer_route_reason = Some(reason.to_string());
         s.snapshot.writer_route_rejections = rejections;
         s.snapshot.writer_route_estimate = Some(estimate);
+    });
+    persist_snapshot();
+}
+
+pub fn writer_profile_event(mut event: WriterProfileEvent) {
+    with_state(|s| {
+        event.sequence = s.snapshot.writer_profile_events.len() as u64 + 1;
+        event.timestamp_ms = now_ms();
+        event.work_unit.clone_from(&s.snapshot.current_work_unit);
+        event.reason = bounded_diagnostic(&event.reason);
+        s.snapshot.writer_profile_events.push(event);
+        if s.snapshot.writer_profile_events.len() > 128 {
+            let excess = s.snapshot.writer_profile_events.len() - 128;
+            s.snapshot.writer_profile_events.drain(0..excess);
+        }
+    });
+    lifecycle_event("writer_profile_event_recorded");
+}
+
+pub fn candidate_artifact(candidate_identity: &str, changed_paths: &[String], diff: &str) {
+    const MAX_DIFF_CHARS: usize = 32_000;
+    let bounded_diff = diff.chars().take(MAX_DIFF_CHARS).collect::<String>();
+    with_state(|s| {
+        s.snapshot.candidate_artifact = Some(CandidateArtifact {
+            candidate_identity: candidate_identity.to_string(),
+            changed_paths: changed_paths.iter().take(128).cloned().collect(),
+            truncated: bounded_diff.len() < diff.len(),
+            diff: bounded_diff,
+        });
     });
     persist_snapshot();
 }

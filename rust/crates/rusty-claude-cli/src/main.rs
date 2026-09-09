@@ -4076,6 +4076,7 @@ struct LiveCli {
     routing_policy: model_router::RoutingPolicy,
     explicit_writer_profile: Option<model_router::ModelProfile>,
     last_routing_explanation: Option<String>,
+    writer_profile_owner: Option<model_router::ModelProfile>,
     selected_writer_profile: Option<model_router::ModelProfile>,
     selected_evaluator_profile: Option<model_router::ModelProfile>,
     evaluator_routing_signals: Option<model_router::TaskSignals>,
@@ -5251,6 +5252,7 @@ impl LiveCli {
             routing_policy,
             explicit_writer_profile,
             last_routing_explanation: None,
+            writer_profile_owner: None,
             selected_writer_profile: None,
             selected_evaluator_profile: None,
             evaluator_routing_signals: None,
@@ -5286,38 +5288,84 @@ impl LiveCli {
         }
     }
 
+    fn activate_writer_profile(
+        &mut self,
+        profile: &model_router::ModelProfile,
+        selection_source: &str,
+        reason: &str,
+    ) {
+        let previous_profile = self
+            .selected_writer_profile
+            .as_ref()
+            .map(|previous| previous.id.clone());
+        self.model.clone_from(&profile.model);
+        let provider = profile
+            .openai_compat
+            .as_ref()
+            .and_then(|compat| compat.connection.provider.as_deref())
+            .or(Some(profile.provider.as_str()));
+        let protocol = profile
+            .openai_compat
+            .as_ref()
+            .map(|compat| match compat.protocol {
+                api::OpenAiCompatProtocol::Responses => "responses",
+                api::OpenAiCompatProtocol::ChatCompletions => "chat_completions",
+            });
+        let reasoning_effort = profile.reasoning_effort().ok().flatten();
+        self.selected_writer_profile = Some(profile.clone());
+        benchmark_telemetry::writer_profile_event(benchmark_telemetry::WriterProfileEvent {
+            previous_profile,
+            profile: profile.id.clone(),
+            provider: provider.map(str::to_string),
+            model: profile.model.clone(),
+            protocol: protocol.map(str::to_string),
+            reasoning_effort,
+            selection_source: selection_source.to_string(),
+            reason: reason.to_string(),
+            ..benchmark_telemetry::WriterProfileEvent::default()
+        });
+        orchestration_trace(format!(
+            "writer_profile_activated profile={} source={selection_source}",
+            profile.id
+        ));
+    }
+
+    fn inherited_writer_profile(
+        owner: Option<&model_router::ModelProfile>,
+        selected: Option<&model_router::ModelProfile>,
+    ) -> Option<model_router::ModelProfile> {
+        owner.cloned().or_else(|| selected.cloned())
+    }
+
     #[allow(clippy::too_many_lines)]
     fn route_writer_for_current_task(&mut self) {
         orchestration_trace("writer_routing_started");
         if let Some(profile) = self.rework_profile.clone() {
-            self.model.clone_from(&profile.model);
-            self.selected_writer_profile = Some(profile.clone());
-            self.last_routing_explanation = Some(format!(
-                "Bounded validation repair reuses the initially selected profile {}.",
+            let reason = format!(
+                "repair routing selected profile {} for the bounded correction role",
                 profile.id
-            ));
-            orchestration_trace(format!("writer_profile_selected profile={}", profile.id));
+            );
+            self.last_routing_explanation = Some(reason.clone());
+            self.activate_writer_profile(&profile, "repair_routing", &reason);
             return;
         }
         if !self.escalation_requested {
-            if let Some(profile) = self.selected_writer_profile.clone() {
-                self.model.clone_from(&profile.model);
-                self.last_routing_explanation = Some(format!(
-                    "Writer continuation reuses the selected profile {}.",
+            if let Some(profile) = Self::inherited_writer_profile(
+                self.writer_profile_owner.as_ref(),
+                self.selected_writer_profile.as_ref(),
+            ) {
+                if self.writer_profile_owner.is_none() {
+                    self.writer_profile_owner = Some(profile.clone());
+                }
+                let reason = format!(
+                    "normal writer execution inherits task owner profile {} across the current work unit",
                     profile.id
-                ));
-                orchestration_trace(format!("writer_profile_reused profile={}", profile.id));
-                return;
-            }
-        }
-        if !self.escalation_requested {
-            if let Some(profile) = self.selected_writer_profile.clone() {
-                self.model.clone_from(&profile.model);
+                );
                 self.last_routing_explanation = Some(format!(
-                    "Writer continuation reuses the selected profile {}.",
-                    profile.id
+                    "Writer execution inherits the task-owned profile {}.",
+                    profile.id,
                 ));
-                orchestration_trace(format!("writer_profile_reused profile={}", profile.id));
+                self.activate_writer_profile(&profile, "inherited_writer_profile", &reason);
                 return;
             }
         }
@@ -5403,14 +5451,16 @@ impl LiveCli {
             return;
         }
         if let Some(profile) = decision.selected {
-            self.model.clone_from(&profile.model);
-            self.selected_writer_profile = Some(profile);
-            orchestration_trace(format!(
-                "writer_profile_selected profile={}",
-                self.selected_writer_profile
-                    .as_ref()
-                    .map_or("unknown", |profile| profile.id.as_str())
-            ));
+            let selection_source = if self.escalation_requested {
+                "explicit_reroute"
+            } else {
+                "initial_routing"
+            };
+            let reason = decision.reason.clone();
+            if selection_source == "initial_routing" {
+                self.writer_profile_owner = Some(profile.clone());
+            }
+            self.activate_writer_profile(&profile, selection_source, &reason);
             self.escalation_requested = false;
         }
     }
@@ -5659,6 +5709,7 @@ impl LiveCli {
     fn prepare_exploration(&mut self, input: &str) {
         orchestration_trace("exploration_started");
         if self.exploration_input.as_deref() != Some(input) && self.pending_rework.is_none() {
+            self.writer_profile_owner = None;
             self.selected_writer_profile = None;
             self.selected_evaluator_profile = None;
             self.evaluator_routing_signals = None;
@@ -6483,6 +6534,17 @@ impl LiveCli {
             .iter()
             .map(|change| change.path().display().to_string())
             .collect::<Vec<_>>();
+        let candidate_diff = runtime.candidate_review_roots().map_or_else(
+            String::new,
+            |(baseline_root, candidate_root)| {
+                render_candidate_evaluation_diff(&changes, &baseline_root, &candidate_root)
+            },
+        );
+        benchmark_telemetry::candidate_artifact(
+            &changes.id.to_string(),
+            &changed_paths,
+            &candidate_diff,
+        );
         benchmark_telemetry::lifecycle_event("completion_audit_started");
         self.task_plan.record_candidate_evidence(&changed_paths);
         self.record_requirement_coverage();
@@ -6560,12 +6622,6 @@ impl LiveCli {
         );
         self.evaluation = Some(evaluation.clone());
         if !evaluation.deterministic {
-            let candidate_diff = runtime.candidate_review_roots().map_or_else(
-                String::new,
-                |(baseline_root, candidate_root)| {
-                    render_candidate_evaluation_diff(&changes, &baseline_root, &candidate_root)
-                },
-            );
             let request =
                 requirement_evaluator::RequirementEvaluator::request_with_candidate_evidence(
                     &self.task_plan,
@@ -6981,6 +7037,7 @@ impl LiveCli {
         self.exploration_input = None;
         self.exploration_context = None;
         self.selected_writer_profile = None;
+        self.writer_profile_owner = None;
         self.selected_evaluator_profile = None;
         self.last_routing_explanation = None;
         self.candidate_state = CandidateLifecycleState::Editing;
@@ -16779,6 +16836,28 @@ fn write_mcp_server_fixture(script_path: &Path) {
         ]
         .join("\n");
     fs::write(script_path, script).expect("mcp fixture script should write");
+}
+
+#[cfg(test)]
+mod writer_profile_ownership_tests {
+    use super::{model_router, LiveCli};
+
+    #[test]
+    fn task_owner_wins_over_stale_current_selection() {
+        let owner = model_router::ModelProfile::unknown("mini", "openai", "gpt-5.4-mini");
+        let stale = model_router::ModelProfile::unknown("luna", "openai", "gpt-5.6-luna");
+        let inherited = LiveCli::inherited_writer_profile(Some(&owner), Some(&stale))
+            .expect("task owner should remain available");
+        assert_eq!(inherited.id, "mini");
+    }
+
+    #[test]
+    fn initial_selection_can_seed_task_owner() {
+        let selected = model_router::ModelProfile::unknown("luna", "openai", "gpt-5.6-luna");
+        let inherited = LiveCli::inherited_writer_profile(None, Some(&selected))
+            .expect("initial selection should be inherited");
+        assert_eq!(inherited.id, "luna");
+    }
 }
 
 #[cfg(test)]
