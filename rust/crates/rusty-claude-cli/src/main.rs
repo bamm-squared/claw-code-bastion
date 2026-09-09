@@ -4204,6 +4204,7 @@ struct LiveCli {
     task_plan: task_plan::TaskPlan,
     frozen_plan_hash: Option<String>,
     frozen_plan_context: Option<String>,
+    reasoning_effort_override: Option<String>,
     evaluation: Option<requirement_evaluator::EvaluationReport>,
     model_pool: model_router::ModelPool,
     calibration: model_router::CalibrationStore,
@@ -5390,6 +5391,7 @@ impl LiveCli {
             frozen_plan_context: frozen_plan
                 .as_ref()
                 .map(|artifact| artifact.repository_context.clone()),
+            reasoning_effort_override: None,
             evaluation: None,
             model_pool,
             calibration,
@@ -5427,6 +5429,7 @@ impl LiveCli {
     }
 
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
+        self.reasoning_effort_override.clone_from(&effort);
         if let Some(rt) = self.runtime.runtime.as_mut() {
             rt.api_client_mut().set_reasoning_effort(effort);
         }
@@ -6048,9 +6051,28 @@ impl LiveCli {
         );
         let plan_text = format!("{plan_text}{continuation_context}");
         let profile = self.selected_writer_profile.as_ref();
-        let effective_reasoning = profile.and_then(|value| value.reasoning_effort().ok().flatten());
-        let reasoning_policy =
-            profile.map_or_else(|| "unknown".to_string(), reasoning_policy_label);
+        let effective_reasoning = self
+            .reasoning_effort_override
+            .clone()
+            .or_else(|| profile.and_then(|value| value.reasoning_effort().ok().flatten()));
+        let reasoning_policy = self.reasoning_effort_override.as_deref().map_or_else(
+            || profile.map_or_else(|| "unknown".to_string(), reasoning_policy_label),
+            |effort| format!("explicit_{effort}"),
+        );
+        let current_unit = self.task_plan.current_work_unit();
+        let protocol = profile
+            .and_then(|value| {
+                value
+                    .openai_compat
+                    .as_ref()
+                    .map(|compat| match compat.protocol {
+                        api::OpenAiCompatProtocol::Responses => "responses".to_string(),
+                        api::OpenAiCompatProtocol::ChatCompletions => {
+                            "chat_completions".to_string()
+                        }
+                    })
+            })
+            .or_else(benchmark_telemetry::provider_protocol);
         let packet_hash = writer_packet_hash(
             &self.task_plan,
             repository_text.unwrap_or_default(),
@@ -6065,17 +6087,7 @@ impl LiveCli {
             work_unit: self.task_plan.current_work_unit_id.clone(),
             profile: profile.map_or_else(|| "unknown".to_string(), |value| value.id.clone()),
             model: profile.map_or_else(|| self.model.clone(), |value| value.model.clone()),
-            protocol: profile.and_then(|value| {
-                value
-                    .openai_compat
-                    .as_ref()
-                    .map(|compat| match compat.protocol {
-                        api::OpenAiCompatProtocol::Responses => "responses".to_string(),
-                        api::OpenAiCompatProtocol::ChatCompletions => {
-                            "chat_completions".to_string()
-                        }
-                    })
-            }),
+            protocol,
             reasoning_effort: effective_reasoning,
             reasoning_policy,
             instruction_version: WRITER_INSTRUCTION_VERSION.to_string(),
@@ -6086,6 +6098,15 @@ impl LiveCli {
                 .iter()
                 .map(|contract| contract.id.clone())
                 .collect(),
+            owned_contract_ids: current_unit
+                .map(|unit| unit.owned_contract_ids.clone())
+                .unwrap_or_default(),
+            downstream_contract_ids: current_unit
+                .map(|unit| unit.downstream_contract_ids.clone())
+                .unwrap_or_default(),
+            global_invariant_ids: current_unit
+                .map(|unit| unit.global_invariant_ids.clone())
+                .unwrap_or_default(),
             repository_fact_ids: self.task_plan.repository_files.clone(),
             candidate_identity: format!("candidate-baseline:{}", self.session.id),
             context_message_count: self.runtime.session().messages.len() as u64,
@@ -6130,6 +6151,9 @@ impl LiveCli {
         if let Some(profile) = self.selected_writer_profile.as_ref() {
             set_provider_telemetry_context("writer", profile);
         }
+        if let Some(effort) = self.reasoning_effort_override.as_deref() {
+            benchmark_telemetry::set_provider_reasoning(effort, &format!("explicit_{effort}"));
+        }
         let runtime = build_runtime_with_backend_profile(
             self.runtime.session().clone(),
             &self.session.id,
@@ -6147,9 +6171,11 @@ impl LiveCli {
         let mut runtime = runtime;
         if let Some(profile) = &self.selected_writer_profile {
             if let Some(inner) = runtime.runtime.as_mut() {
-                inner
-                    .api_client_mut()
-                    .set_reasoning_effort(profile.reasoning_effort()?);
+                inner.api_client_mut().set_reasoning_effort(
+                    self.reasoning_effort_override
+                        .clone()
+                        .or(profile.reasoning_effort()?),
+                );
             }
         }
         let runtime = if let Some(selection) = repository_context {
@@ -6473,14 +6499,29 @@ impl LiveCli {
                                 .current_work_unit()
                                 .map(|unit| unit.owned_contract_ids.clone())
                                 .unwrap_or_default();
+                            let downstream_contract_ids = self
+                                .task_plan
+                                .current_work_unit()
+                                .map(|unit| unit.downstream_contract_ids.clone())
+                                .unwrap_or_default();
+                            let global_invariant_ids = self
+                                .task_plan
+                                .current_work_unit()
+                                .map(|unit| unit.global_invariant_ids.clone())
+                                .unwrap_or_default();
+                            let writer_turns = self.work_unit_writer_turns as u64;
+                            let turn_allowance = self.work_unit_turn_allowance as u64;
                             benchmark_telemetry::blocked_checkpoint(
                                 benchmark_telemetry::BlockedCheckpointEvent {
                                     work_unit: self.task_plan.current_work_unit_id.clone(),
-                                    writer_turns: self.work_unit_writer_turns as u64,
-                                    turns_remaining: self
-                                        .work_unit_turn_allowance
-                                        .saturating_sub(self.work_unit_writer_turns)
-                                        as u64,
+                                    writer_turns,
+                                    productive_writer_turns: writer_turns.min(turn_allowance),
+                                    turn_allowance,
+                                    checkpoint_turn: writer_turns > turn_allowance,
+                                    turns_remaining: turn_allowance.saturating_sub(writer_turns),
+                                    continuation_grants: u64::from(
+                                        self.work_unit_continuation_grants,
+                                    ),
                                     candidate_identity: format!(
                                         "candidate-baseline:{}",
                                         self.session.id
@@ -6488,6 +6529,13 @@ impl LiveCli {
                                     category: "writer_reported_blocked".to_string(),
                                     reason: message,
                                     declared_contract_ids,
+                                    owned_contract_ids: self
+                                        .task_plan
+                                        .current_work_unit()
+                                        .map(|unit| unit.owned_contract_ids.clone())
+                                        .unwrap_or_default(),
+                                    downstream_contract_ids,
+                                    global_invariant_ids,
                                     continuation_eligible: false,
                                     terminal_reason: "writer_checkpoint_blocked".to_string(),
                                     ..benchmark_telemetry::BlockedCheckpointEvent::default()
@@ -13109,6 +13157,9 @@ impl CliToolExecutor {
             .take(4_000)
             .collect::<String>();
         benchmark_telemetry::work_unit_checkpoint_requested(status, None);
+        if matches!(status, "blocked" | "needs_user_input") {
+            benchmark_telemetry::blocked_checkpoint_requested(&message);
+        }
         if status == "unit_complete" && self.candidate_review_roots().is_some() {
             let candidate_changed = self
                 .tool_registry

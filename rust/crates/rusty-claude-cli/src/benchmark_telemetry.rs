@@ -224,6 +224,10 @@ pub struct WorkUnitCheckpoint {
     pub reconciliation_outcome: Option<String>,
     pub unresolved_completion: Option<String>,
     pub terminal_reason: Option<String>,
+    pub blocker_category: Option<String>,
+    pub blocker_reason: Option<String>,
+    pub declared_contract_ids: Vec<String>,
+    pub continuation_eligible: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Default)]
@@ -240,6 +244,9 @@ pub struct WriterPacketEvent {
     pub instruction_version: String,
     pub tool_schema_version: String,
     pub contract_ids: Vec<String>,
+    pub owned_contract_ids: Vec<String>,
+    pub downstream_contract_ids: Vec<String>,
+    pub global_invariant_ids: Vec<String>,
     pub repository_fact_ids: Vec<String>,
     pub candidate_identity: String,
     pub context_message_count: u64,
@@ -255,11 +262,19 @@ pub struct BlockedCheckpointEvent {
     pub timestamp_ms: u128,
     pub work_unit: Option<String>,
     pub writer_turns: u64,
+    pub productive_writer_turns: u64,
+    pub turn_allowance: u64,
+    pub checkpoint_turn: bool,
     pub turns_remaining: u64,
+    pub continuation_grants: u64,
     pub candidate_identity: String,
     pub category: String,
     pub reason: String,
     pub declared_contract_ids: Vec<String>,
+    pub owned_contract_ids: Vec<String>,
+    pub downstream_contract_ids: Vec<String>,
+    pub global_invariant_ids: Vec<String>,
+    pub latest_evidence_ids: Vec<u64>,
     pub continuation_eligible: bool,
     pub terminal_reason: String,
 }
@@ -486,6 +501,20 @@ pub fn set_provider_protocol(protocol: &str) {
     with_state(|s| {
         s.provider_context.protocol = Some(protocol.to_string());
     });
+}
+
+pub fn set_provider_reasoning(effort: &str, policy: &str) {
+    with_state(|s| {
+        s.provider_context.reasoning_effort = Some(effort.to_string());
+        s.provider_context.reasoning_policy = Some(policy.to_string());
+    });
+}
+
+pub fn provider_protocol() -> Option<String> {
+    STATE
+        .get()
+        .and_then(|lock| lock.lock().ok())
+        .and_then(|guard| guard.as_ref()?.provider_context.protocol.clone())
 }
 
 /// Attach the effective, non-secret execution configuration to subsequent
@@ -850,6 +879,48 @@ pub fn work_unit_checkpoint_requested(requested_status: &str, candidate_changed:
         }
     });
     lifecycle_event("work_unit_checkpoint_recorded");
+}
+
+pub fn blocked_checkpoint_requested(reason: &str) {
+    with_state(|s| {
+        let writer_turns = s.snapshot.work_unit_writer_turns;
+        let turn_allowance = s.snapshot.work_unit_turn_allowance;
+        let latest_evidence_ids = s
+            .snapshot
+            .candidate_check_evidence
+            .iter()
+            .rev()
+            .take(8)
+            .map(|item| item.sequence)
+            .collect::<Vec<_>>();
+        let candidate_identity = s
+            .snapshot
+            .candidate_check_evidence
+            .iter()
+            .rev()
+            .find_map(|item| item.candidate_identity.clone())
+            .unwrap_or_else(|| "candidate-unknown".to_string());
+        record_blocked_checkpoint_event(
+            s,
+            BlockedCheckpointEvent {
+                work_unit: s.snapshot.current_work_unit.clone(),
+                writer_turns,
+                productive_writer_turns: writer_turns.min(turn_allowance),
+                turn_allowance,
+                checkpoint_turn: writer_turns > turn_allowance,
+                turns_remaining: turn_allowance.saturating_sub(writer_turns),
+                continuation_grants: s.snapshot.work_unit_continuation_grants,
+                candidate_identity,
+                category: "writer_reported_blocked".to_string(),
+                reason: reason.to_string(),
+                latest_evidence_ids,
+                continuation_eligible: false,
+                terminal_reason: "checkpoint_requested".to_string(),
+                ..BlockedCheckpointEvent::default()
+            },
+        );
+    });
+    persist_snapshot();
 }
 
 pub fn work_unit_checkpoint_reconciled(
@@ -1230,17 +1301,61 @@ pub fn writer_packet(event: WriterPacketEvent) {
 
 pub fn blocked_checkpoint(event: BlockedCheckpointEvent) {
     with_state(|s| {
-        let mut event = event;
-        event.sequence = s.snapshot.blocked_checkpoint_events.len() as u64 + 1;
-        event.timestamp_ms = now_ms();
-        event.reason = bounded_diagnostic(&event.reason);
-        s.snapshot.blocked_checkpoint_events.push(event);
-        if s.snapshot.blocked_checkpoint_events.len() > 64 {
-            let excess = s.snapshot.blocked_checkpoint_events.len() - 64;
-            s.snapshot.blocked_checkpoint_events.drain(0..excess);
-        }
+        record_blocked_checkpoint_event(s, event);
     });
     persist_snapshot();
+}
+
+fn record_blocked_checkpoint_event(state: &mut State, mut event: BlockedCheckpointEvent) {
+    event.reason = bounded_diagnostic(&event.reason);
+    update_checkpoint_from_blocked_event(state, &event);
+    if let Some(existing) = state
+        .snapshot
+        .blocked_checkpoint_events
+        .iter_mut()
+        .rev()
+        .find(|existing| {
+            existing.work_unit == event.work_unit
+                && existing.category == event.category
+                && existing.reason == event.reason
+        })
+    {
+        let sequence = existing.sequence;
+        let timestamp_ms = existing.timestamp_ms;
+        *existing = event;
+        existing.sequence = sequence;
+        existing.timestamp_ms = timestamp_ms;
+        return;
+    }
+    event.sequence = state.snapshot.blocked_checkpoint_events.len() as u64 + 1;
+    event.timestamp_ms = now_ms();
+    state.snapshot.blocked_checkpoint_events.push(event);
+    if state.snapshot.blocked_checkpoint_events.len() > 64 {
+        let excess = state.snapshot.blocked_checkpoint_events.len() - 64;
+        state.snapshot.blocked_checkpoint_events.drain(0..excess);
+    }
+}
+
+fn update_checkpoint_from_blocked_event(state: &mut State, event: &BlockedCheckpointEvent) {
+    if let Some(record) = state.snapshot.work_unit_checkpoints.last_mut() {
+        record.candidate_identity =
+            (!event.candidate_identity.is_empty()).then(|| event.candidate_identity.clone());
+        record.writer_turns = event.writer_turns;
+        record.productive_writer_turns = event.productive_writer_turns;
+        record.turn_allowance = event.turn_allowance;
+        record.checkpoint_turn = event.checkpoint_turn;
+        record.remaining_turns = event.turns_remaining;
+        record.continuation_grants = event.continuation_grants;
+        record.blocker_category = Some(event.category.clone());
+        record.blocker_reason = Some(event.reason.clone());
+        record
+            .declared_contract_ids
+            .clone_from(&event.declared_contract_ids);
+        record.continuation_eligible = Some(event.continuation_eligible);
+        record
+            .candidate_check_evidence_ids
+            .clone_from(&event.latest_evidence_ids);
+    }
 }
 
 pub fn candidate_artifact(candidate_identity: &str, changed_paths: &[String], diff: &str) {
@@ -1528,8 +1643,12 @@ mod tests {
             work_unit: Some("WU-1".to_string()),
             profile: "profile-a".to_string(),
             model: "opaque-model".to_string(),
+            protocol: Some("responses".to_string()),
             reasoning_policy: "omitted_provider_default".to_string(),
             contract_ids: vec!["contract-1".to_string()],
+            owned_contract_ids: vec!["contract-1".to_string()],
+            downstream_contract_ids: vec!["contract-2".to_string()],
+            global_invariant_ids: vec!["contract-3".to_string()],
             repository_fact_ids: vec!["fact-1".to_string()],
             candidate_identity: "candidate-1".to_string(),
             packet_hash: "packet-hash".to_string(),
@@ -1537,10 +1656,20 @@ mod tests {
         };
         let blocked = BlockedCheckpointEvent {
             work_unit: Some("WU-1".to_string()),
+            writer_turns: 12,
+            productive_writer_turns: 10,
+            turn_allowance: 10,
+            checkpoint_turn: true,
+            turns_remaining: 0,
+            continuation_grants: 1,
             candidate_identity: "candidate-1".to_string(),
             category: "writer_reported_blocked".to_string(),
             reason: "missing implementation surface".to_string(),
             declared_contract_ids: vec!["contract-1".to_string()],
+            owned_contract_ids: vec!["contract-1".to_string()],
+            downstream_contract_ids: vec!["contract-2".to_string()],
+            global_invariant_ids: vec!["contract-3".to_string()],
+            latest_evidence_ids: vec![7],
             terminal_reason: "writer_checkpoint_blocked".to_string(),
             ..BlockedCheckpointEvent::default()
         };
@@ -1549,8 +1678,13 @@ mod tests {
         let blocked_json =
             serde_json::to_value(blocked).expect("blocked telemetry should serialize");
         assert_eq!(packet_json["packet_hash"], "packet-hash");
+        assert_eq!(packet_json["protocol"], "responses");
         assert_eq!(packet_json["reasoning_policy"], "omitted_provider_default");
+        assert_eq!(packet_json["owned_contract_ids"][0], "contract-1");
+        assert_eq!(packet_json["downstream_contract_ids"][0], "contract-2");
         assert_eq!(blocked_json["category"], "writer_reported_blocked");
         assert_eq!(blocked_json["declared_contract_ids"][0], "contract-1");
+        assert_eq!(blocked_json["productive_writer_turns"], 10);
+        assert_eq!(blocked_json["latest_evidence_ids"][0], 7);
     }
 }
