@@ -825,6 +825,31 @@ impl CliOutputFormat {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnPresentation {
+    Text,
+    Compact,
+    Json,
+}
+
+impl TurnPresentation {
+    fn emits_tool_output(self) -> bool {
+        matches!(self, Self::Text)
+    }
+
+    fn is_text(self) -> bool {
+        matches!(self, Self::Text)
+    }
+}
+
+fn turn_presentation(output_format: CliOutputFormat, compact: bool) -> TurnPresentation {
+    match output_format {
+        CliOutputFormat::Text if compact => TurnPresentation::Compact,
+        CliOutputFormat::Text => TurnPresentation::Text,
+        CliOutputFormat::Json => TurnPresentation::Json,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut model = DEFAULT_MODEL.to_string();
@@ -6208,8 +6233,16 @@ impl LiveCli {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.run_turn_with_presentation(input, TurnPresentation::Text)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn run_turn_with_presentation(
+        &mut self,
+        input: &str,
+        presentation: TurnPresentation,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (_prompt, image_blocks) = self.prepare_user_turn(input)?;
         self.route_writer_for_current_task();
         if let Some(reason) = self.rework_blocked.take() {
@@ -6226,7 +6259,8 @@ impl LiveCli {
                 }
             }
         }
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true, input)?;
+        let (mut runtime, hook_abort_monitor) =
+            self.prepare_turn_runtime(presentation.emits_tool_output(), input)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         let hud = trusted_hud_line(
@@ -6235,11 +6269,13 @@ impl LiveCli {
             self.candidate_state,
             context_reference::reference_count(input),
         );
-        spinner.tick(
-            &format!("{hud} | Thinking..."),
-            TerminalRenderer::new().color_theme(),
-            &mut stdout,
-        )?;
+        if presentation.is_text() {
+            spinner.tick(
+                &format!("{hud} | Thinking..."),
+                TerminalRenderer::new().color_theme(),
+                &mut stdout,
+            )?;
+        }
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result =
             runtime.run_turn_with_images(input, image_blocks, Some(&mut permission_prompter));
@@ -6324,10 +6360,15 @@ impl LiveCli {
                                     );
                                     self.replace_runtime(runtime)?;
                                     self.persist_session()?;
+                                    self.render_terminal_result(
+                                        presentation,
+                                        &summary,
+                                        Some("work_unit_budget_exhausted"),
+                                    )?;
                                     return Ok(());
                                 }
                                 self.replace_runtime(runtime)?;
-                                return self.run_turn(input);
+                                return self.run_turn_with_presentation(input, presentation);
                             }
                             benchmark_telemetry::lifecycle_event("writer_checkpoint_submit");
                         }
@@ -6373,10 +6414,15 @@ impl LiveCli {
                                     );
                                     self.replace_runtime(runtime)?;
                                     self.persist_session()?;
+                                    self.render_terminal_result(
+                                        presentation,
+                                        &summary,
+                                        Some("work_unit_completion_blocked_without_candidate"),
+                                    )?;
                                     return Ok(());
                                 }
                                 self.replace_runtime(runtime)?;
-                                return self.run_turn(input);
+                                return self.run_turn_with_presentation(input, presentation);
                             }
                             self.work_unit_no_change_attempts = 0;
                             self.work_unit_completion_rejections = 0;
@@ -6406,7 +6452,7 @@ impl LiveCli {
                                     );
                                 }
                                 self.replace_runtime(runtime)?;
-                                return self.run_turn(input);
+                                return self.run_turn_with_presentation(input, presentation);
                             }
                             benchmark_telemetry::lifecycle_event("writer_checkpoint_submit");
                         }
@@ -6427,6 +6473,11 @@ impl LiveCli {
                                 );
                                 self.replace_runtime(runtime)?;
                                 self.persist_session()?;
+                                self.render_terminal_result(
+                                    presentation,
+                                    &summary,
+                                    Some("continuation_missing_objective"),
+                                )?;
                                 return Ok(());
                             }
                             let objective = if objective.trim().is_empty() {
@@ -6450,10 +6501,15 @@ impl LiveCli {
                                 );
                                 self.replace_runtime(runtime)?;
                                 self.persist_session()?;
+                                self.render_terminal_result(
+                                    presentation,
+                                    &summary,
+                                    Some("completion_reconciliation_exhausted"),
+                                )?;
                                 return Ok(());
                             }
                             self.replace_runtime(runtime)?;
-                            return self.run_turn(input);
+                            return self.run_turn_with_presentation(input, presentation);
                         }
                         WriterCheckpoint::Replan { message } => {
                             self.work_unit_no_change_attempts = 0;
@@ -6471,6 +6527,11 @@ impl LiveCli {
                                 benchmark_telemetry::lifecycle_event("work_unit_replan_exhausted");
                                 self.replace_runtime(runtime)?;
                                 self.persist_session()?;
+                                self.render_terminal_result(
+                                    presentation,
+                                    &summary,
+                                    Some("work_unit_replan_exhausted"),
+                                )?;
                                 return Ok(());
                             }
                             benchmark_telemetry::work_unit_replanned();
@@ -6495,7 +6556,9 @@ impl LiveCli {
                                 Some("writer_checkpoint_blocked"),
                             );
                             benchmark_telemetry::lifecycle_event("writer_checkpoint_blocked");
-                            println!("Writer checkpoint stopped before Review: {message}");
+                            if presentation.is_text() {
+                                println!("Writer checkpoint stopped before Review: {message}");
+                            }
                             let declared_contract_ids = self
                                 .task_plan
                                 .current_work_unit()
@@ -6547,6 +6610,11 @@ impl LiveCli {
                             self.persist_session()?;
                             self.context_tray.clear();
                             self.attachments.clear();
+                            self.render_terminal_result(
+                                presentation,
+                                &summary,
+                                Some("writer_checkpoint_blocked"),
+                            )?;
                             return Ok(());
                         }
                     }
@@ -6554,34 +6622,39 @@ impl LiveCli {
                 let automatic_rework = self.review_candidate_changes(&mut runtime)?;
                 self.replace_runtime(runtime)?;
                 if automatic_rework {
-                    self.run_automatic_rework(input, true)?;
+                    self.run_automatic_rework(input, presentation.emits_tool_output())?;
                 }
-                spinner.finish(
-                    "✨ Done",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
-                println!();
-                if let Some(event) = summary.auto_compaction {
-                    println!(
-                        "{}",
-                        format_auto_compaction_notice(event.removed_message_count)
-                    );
+                if presentation.is_text() {
+                    spinner.finish(
+                        "✨ Done",
+                        TerminalRenderer::new().color_theme(),
+                        &mut stdout,
+                    )?;
+                    println!();
+                    if let Some(event) = summary.auto_compaction {
+                        println!(
+                            "{}",
+                            format_auto_compaction_notice(event.removed_message_count)
+                        );
+                    }
                 }
                 self.persist_session()?;
                 self.context_tray.clear();
                 self.attachments.clear();
+                self.render_terminal_result(presentation, &summary, None)?;
                 Ok(())
             }
             Err(error) => {
                 let _ = runtime.discard_candidate();
                 self.candidate_state = CandidateLifecycleState::Discarded;
                 runtime.shutdown_plugins()?;
-                spinner.fail(
-                    "❌ Request failed",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
+                if presentation.is_text() {
+                    spinner.fail(
+                        "❌ Request failed",
+                        TerminalRenderer::new().color_theme(),
+                        &mut stdout,
+                    )?;
+                }
                 Err(Box::new(error))
             }
         }
@@ -6628,103 +6701,60 @@ impl LiveCli {
         output_format: CliOutputFormat,
         compact: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        match output_format {
-            CliOutputFormat::Text if compact => self.run_prompt_compact(input),
-            CliOutputFormat::Text => self.run_turn(input),
-            CliOutputFormat::Json => self.run_prompt_json(input),
-        }
+        self.run_turn_with_presentation(input, turn_presentation(output_format, compact))
     }
 
-    fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        self.prepare_exploration(input);
-        self.route_writer_for_current_task();
-        if let Some(reason) = self.rework_blocked.take() {
-            return Err(reason.into());
-        }
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false, input)?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
-        hook_abort_monitor.stop();
-        let summary = match result {
-            Ok(summary) => summary,
-            Err(error) => {
-                let _ = runtime.discard_candidate();
-                self.candidate_state = CandidateLifecycleState::Discarded;
-                return Err(Box::new(error));
+    fn render_terminal_result(
+        &self,
+        presentation: TurnPresentation,
+        summary: &runtime::TurnSummary,
+        lifecycle_status: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match presentation {
+            TurnPresentation::Text => {}
+            TurnPresentation::Compact => {
+                println!("{}", final_assistant_text(summary));
             }
-        };
-        let automatic_rework = self.review_candidate_changes(&mut runtime)?;
-        self.replace_runtime(runtime)?;
-        if automatic_rework {
-            self.run_automatic_rework(input, false)?;
-        }
-        self.persist_session()?;
-        let final_text = final_assistant_text(&summary);
-        println!("{final_text}");
-        Ok(())
-    }
-
-    fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        self.prepare_exploration(input);
-        self.route_writer_for_current_task();
-        if let Some(reason) = self.rework_blocked.take() {
-            return Err(reason.into());
-        }
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false, input)?;
-        orchestration_trace("writer_turn_started");
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = runtime.run_turn(input, Some(&mut permission_prompter));
-        hook_abort_monitor.stop();
-        let summary = match result {
-            Ok(summary) => summary,
-            Err(error) => {
-                let _ = runtime.discard_candidate();
-                self.candidate_state = CandidateLifecycleState::Discarded;
-                return Err(Box::new(error));
+            TurnPresentation::Json => {
+                let mut result = json!({
+                    "message": final_assistant_text(summary),
+                    "model": self.model,
+                    "iterations": summary.iterations,
+                    "auto_compaction": summary.auto_compaction.map(|event| json!({
+                        "removed_messages": event.removed_message_count,
+                        "notice": format_auto_compaction_notice(event.removed_message_count),
+                    })),
+                    "tool_uses": collect_tool_uses(summary),
+                    "tool_results": collect_tool_results(summary),
+                    "prompt_cache_events": collect_prompt_cache_events(summary),
+                    "usage": {
+                        "input_tokens": summary.usage.input_tokens,
+                        "output_tokens": summary.usage.output_tokens,
+                        "cache_creation_input_tokens": summary.usage.cache_creation_input_tokens,
+                        "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
+                    },
+                    "estimated_cost": self.selected_writer_profile
+                        .as_ref()
+                        .and_then(model_router::actual_pricing_for_profile)
+                        .or_else(|| pricing_for_model(&self.model))
+                        .map_or_else(
+                            || "unknown".to_string(),
+                            |pricing| {
+                                format_usd(
+                                    summary
+                                        .usage
+                                        .estimate_cost_usd_with_pricing(pricing)
+                                        .total_cost_usd(),
+                                )
+                            },
+                        )
+                });
+                if let Some(status) = lifecycle_status {
+                    result["lifecycle_status"] = json!(status);
+                }
+                println!("{result}");
             }
-        };
-        let automatic_rework = self.review_candidate_changes(&mut runtime)?;
-        self.replace_runtime(runtime)?;
-        if automatic_rework {
-            self.run_automatic_rework(input, false)?;
         }
-        self.persist_session()?;
-        println!(
-            "{}",
-            json!({
-                "message": final_assistant_text(&summary),
-                "model": self.model,
-                "iterations": summary.iterations,
-                "auto_compaction": summary.auto_compaction.map(|event| json!({
-                    "removed_messages": event.removed_message_count,
-                    "notice": format_auto_compaction_notice(event.removed_message_count),
-                })),
-                "tool_uses": collect_tool_uses(&summary),
-                "tool_results": collect_tool_results(&summary),
-                "prompt_cache_events": collect_prompt_cache_events(&summary),
-                "usage": {
-                    "input_tokens": summary.usage.input_tokens,
-                    "output_tokens": summary.usage.output_tokens,
-                    "cache_creation_input_tokens": summary.usage.cache_creation_input_tokens,
-                    "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
-                },
-                "estimated_cost": self.selected_writer_profile
-                    .as_ref()
-                    .and_then(model_router::actual_pricing_for_profile)
-                    .or_else(|| pricing_for_model(&self.model))
-                    .map_or_else(
-                        || "unknown".to_string(),
-                        |pricing| {
-                            format_usd(
-                                summary
-                                    .usage
-                                    .estimate_cost_usd_with_pricing(pricing)
-                                    .total_cost_usd(),
-                            )
-                        },
-                    )
-            })
-        );
         Ok(())
     }
 
@@ -17441,7 +17471,10 @@ fn write_mcp_server_fixture(script_path: &Path) {
 
 #[cfg(test)]
 mod writer_protocol_tests {
-    use super::{WRITER_INSTRUCTION_VERSION, WRITER_WORKFLOW_GUIDANCE};
+    use super::{
+        turn_presentation, CliOutputFormat, TurnPresentation, WRITER_INSTRUCTION_VERSION,
+        WRITER_WORKFLOW_GUIDANCE,
+    };
 
     #[test]
     fn guidance_makes_isolated_candidate_a_reversible_feedback_surface() {
@@ -17464,6 +17497,25 @@ mod writer_protocol_tests {
         assert!(WRITER_WORKFLOW_GUIDANCE.contains("owned contracts and invariants"));
         assert!(WRITER_WORKFLOW_GUIDANCE
             .contains("Do not treat work-unit completion as semantic approval"));
+    }
+
+    #[test]
+    fn output_modes_share_the_lifecycle_driver() {
+        assert_eq!(
+            turn_presentation(CliOutputFormat::Text, false),
+            TurnPresentation::Text
+        );
+        assert_eq!(
+            turn_presentation(CliOutputFormat::Text, true),
+            TurnPresentation::Compact
+        );
+        assert_eq!(
+            turn_presentation(CliOutputFormat::Json, false),
+            TurnPresentation::Json
+        );
+        assert!(TurnPresentation::Text.emits_tool_output());
+        assert!(!TurnPresentation::Compact.emits_tool_output());
+        assert!(!TurnPresentation::Json.emits_tool_output());
     }
 }
 
