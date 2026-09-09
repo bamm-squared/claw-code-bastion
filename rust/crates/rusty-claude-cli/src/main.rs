@@ -105,6 +105,18 @@ const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 const POST_TOOL_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_PROVIDER_TURN_TIMEOUT: Duration = Duration::from_secs(300);
+
+fn provider_turn_timeout() -> Duration {
+    let millis = env::var("CLAW_PROVIDER_TURN_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| {
+            u64::try_from(DEFAULT_PROVIDER_TURN_TIMEOUT.as_millis()).unwrap_or(u64::MAX)
+        });
+    Duration::from_millis(millis)
+}
 const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 const LEGACY_SESSION_EXTENSION: &str = "json";
 const OFFICIAL_REPO_URL: &str = runtime::release::RELEASE_REPOSITORY_URL;
@@ -10981,9 +10993,32 @@ fn execute_evaluator_profile(
         benchmark_telemetry::model_request_bytes(bytes.len() as u64);
     }
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
-    let response = runtime
-        .block_on(client.send_message(&message_request))
-        .map_err(|error| error.to_string())?;
+    let response_result = runtime.block_on(async {
+        tokio::time::timeout(
+            provider_turn_timeout(),
+            client.send_message(&message_request),
+        )
+        .await
+    });
+    let response = match response_result {
+        Ok(Ok(response)) => {
+            benchmark_telemetry::provider_call_finished("completed", None);
+            response
+        }
+        Ok(Err(error)) => {
+            let message = error.to_string();
+            benchmark_telemetry::provider_call_finished("failed", Some(&message));
+            return Err(message);
+        }
+        Err(_) => {
+            let message = format!(
+                "provider_connect_timeout: provider request exceeded {} ms",
+                provider_turn_timeout().as_millis()
+            );
+            benchmark_telemetry::provider_call_finished("timed_out", Some(&message));
+            return Err(message);
+        }
+    };
     if let Some(request_id) = response.request_id.as_deref() {
         benchmark_telemetry::provider_request_id(request_id);
     }
@@ -11039,9 +11074,32 @@ fn execute_explorer_profile(
         benchmark_telemetry::model_request_bytes(bytes.len() as u64);
     }
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
-    let response = runtime
-        .block_on(client.send_message(&message_request))
-        .map_err(|error| error.to_string())?;
+    let response_result = runtime.block_on(async {
+        tokio::time::timeout(
+            provider_turn_timeout(),
+            client.send_message(&message_request),
+        )
+        .await
+    });
+    let response = match response_result {
+        Ok(Ok(response)) => {
+            benchmark_telemetry::provider_call_finished("completed", None);
+            response
+        }
+        Ok(Err(error)) => {
+            let message = error.to_string();
+            benchmark_telemetry::provider_call_finished("failed", Some(&message));
+            return Err(message);
+        }
+        Err(_) => {
+            let message = format!(
+                "provider_connect_timeout: provider request exceeded {} ms",
+                provider_turn_timeout().as_millis()
+            );
+            benchmark_telemetry::provider_call_finished("timed_out", Some(&message));
+            return Err(message);
+        }
+    };
     if let Some(request_id) = response.request_id.as_deref() {
         benchmark_telemetry::provider_request_id(request_id);
     }
@@ -11133,58 +11191,79 @@ impl ApiClient for AnthropicRuntimeClient {
             benchmark_telemetry::model_request_bytes(bytes.len() as u64);
         }
 
-        self.runtime.block_on(async {
-            // When resuming after tool execution, apply a stall timeout on the
-            // first stream event.  If the model does not respond within the
-            // deadline we drop the stalled connection and re-send the request as
-            // a continuation nudge (one retry only).
-            let max_attempts: usize = if is_post_tool { 3 } else { 2 };
-            let mut provider_recoveries = 0;
+        let result = self.runtime.block_on(async {
+            tokio::time::timeout(provider_turn_timeout(), async {
+                // When resuming after tool execution, apply a stall timeout on the
+                // first stream event.  If the model does not respond within the
+                // deadline we drop the stalled connection and re-send the request as
+                // a continuation nudge (one retry only).
+                let max_attempts: usize = if is_post_tool { 3 } else { 2 };
+                let mut provider_recoveries = 0;
 
-            for attempt in 1..=max_attempts {
-                let result = self
-                    .consume_stream(&message_request, is_post_tool && attempt == 1)
-                    .await;
-                match result {
-                    Ok(events) => return Ok(events),
-                    Err(error)
-                        if should_retry_provider_turn(provider_recoveries, &error)
-                            && attempt < max_attempts =>
-                    {
-                        if error.is_provider_rate_limit() {
-                            let delay = self
-                                .rate_limit_state
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .as_ref()
-                                .and_then(|state| state.token_reset_after_seconds)
-                                .unwrap_or(0)
-                                .min(15);
-                            if delay > 0 {
-                                benchmark_telemetry::provider_rate_limit_pacing(delay);
-                                tokio::time::sleep(Duration::from_secs(delay)).await;
+                for attempt in 1..=max_attempts {
+                    let result = self
+                        .consume_stream(&message_request, is_post_tool && attempt == 1)
+                        .await;
+                    match result {
+                        Ok(events) => return Ok(events),
+                        Err(error)
+                            if should_retry_provider_turn(provider_recoveries, &error)
+                                && attempt < max_attempts =>
+                        {
+                            if error.is_provider_rate_limit() {
+                                let delay = self
+                                    .rate_limit_state
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .as_ref()
+                                    .and_then(|state| state.token_reset_after_seconds)
+                                    .unwrap_or(0)
+                                    .min(15);
+                                if delay > 0 {
+                                    benchmark_telemetry::provider_rate_limit_pacing(delay);
+                                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                                }
+                            }
+                            provider_recoveries += 1;
+                            if error.is_empty_provider_response() {
+                                benchmark_telemetry::provider_empty_response_recovery();
+                            } else {
+                                benchmark_telemetry::provider_transient_recovery();
                             }
                         }
-                        provider_recoveries += 1;
-                        if error.is_empty_provider_response() {
-                            benchmark_telemetry::provider_empty_response_recovery();
-                        } else {
-                            benchmark_telemetry::provider_transient_recovery();
+                        Err(error)
+                            if error.to_string().contains("post-tool stall")
+                                && attempt < max_attempts =>
+                        {
+                            // Stalled after tool completion — nudge the model by
+                            // re-sending the same request.
                         }
+                        Err(error) => return Err(error),
                     }
-                    Err(error)
-                        if error.to_string().contains("post-tool stall")
-                            && attempt < max_attempts =>
-                    {
-                        // Stalled after tool completion — nudge the model by
-                        // re-sending the same request.
-                    }
-                    Err(error) => return Err(error),
                 }
-            }
 
-            Err(RuntimeError::new("post-tool continuation nudge exhausted"))
-        })
+                Err(RuntimeError::new("post-tool continuation nudge exhausted"))
+            })
+            .await
+            .unwrap_or_else(|_| {
+                Err(RuntimeError::new(format!(
+                    "provider_stream_timeout: provider turn exceeded {} ms",
+                    provider_turn_timeout().as_millis()
+                )))
+            })
+        });
+        match &result {
+            Ok(_) => benchmark_telemetry::provider_call_finished("completed", None),
+            Err(error) => {
+                let status = if error.to_string().contains("timeout") {
+                    "timed_out"
+                } else {
+                    "failed"
+                };
+                benchmark_telemetry::provider_call_finished(status, Some(&error.to_string()));
+            }
+        }
+        result
     }
 
     fn checkpoint_reason(&self, request: &ApiRequest) -> Option<String> {
@@ -12609,6 +12688,13 @@ impl CliToolExecutor {
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
         let candidate_check = tool_name == "candidate_check";
+        benchmark_telemetry::execution_stage(
+            "tool_dispatch_started",
+            Some(tool_name),
+            Some(input.len() as u64),
+            None,
+            None,
+        );
         if candidate_check {
             benchmark_telemetry::lifecycle_event("candidate_check_started");
         }
@@ -12628,6 +12714,13 @@ impl CliToolExecutor {
         };
         match result {
             Ok(output) => {
+                benchmark_telemetry::execution_stage(
+                    "tool_result_received",
+                    Some(tool_name),
+                    Some(input.len() as u64),
+                    Some(output.len() as u64),
+                    Some("completed"),
+                );
                 if candidate_check {
                     benchmark_telemetry::candidate_check_result(&output);
                     benchmark_telemetry::lifecycle_event("candidate_check_completed");
@@ -12641,6 +12734,13 @@ impl CliToolExecutor {
                 Ok(output)
             }
             Err(error) => {
+                benchmark_telemetry::execution_stage(
+                    "tool_result_received",
+                    Some(tool_name),
+                    Some(input.len() as u64),
+                    Some(error.to_string().len() as u64),
+                    Some("failed"),
+                );
                 if candidate_check {
                     benchmark_telemetry::candidate_check_error(&error.to_string());
                     benchmark_telemetry::lifecycle_event("candidate_check_failed");

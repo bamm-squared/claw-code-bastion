@@ -372,9 +372,15 @@ impl ExecutionBackend for IsolatedExecutionBackend {
             .client
             .as_mut()
             .ok_or_else(|| String::from("isolated worker is no longer running"))?;
-        let response = client
-            .request(&request)
-            .map_err(|error| error.to_string())?;
+        let response = client.request(&request).map_err(|error| {
+            let class = match error.kind() {
+                std::io::ErrorKind::TimedOut => "worker_ipc_timeout",
+                std::io::ErrorKind::UnexpectedEof => "worker_result_eof",
+                std::io::ErrorKind::BrokenPipe => "worker_ipc_closed",
+                _ => "worker_ipc_error",
+            };
+            format!("{class}: {error}")
+        })?;
         if serde_json::to_vec(&response)
             .map_err(|error| error.to_string())?
             .len()

@@ -1,8 +1,10 @@
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -16,10 +18,15 @@ pub struct PodmanWorkerSpec {
 #[derive(Debug)]
 pub struct PodmanWorkerClient {
     child: Child,
-    stdin: BufWriter<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    stdin_tx: Option<Sender<PendingWrite>>,
+    stdin_writer: Option<JoinHandle<io::Result<()>>>,
+    response_rx: Receiver<io::Result<Vec<u8>>>,
+    stdout_reader: Option<JoinHandle<io::Result<()>>>,
     stderr: Arc<Mutex<Vec<u8>>>,
     stderr_reader: Option<JoinHandle<io::Result<()>>>,
+    dispatch_timeout: Duration,
+    response_timeout: Duration,
+    terminated: bool,
     next_request_id: u64,
     last_request_id: Option<u64>,
     last_operation: Option<String>,
@@ -43,6 +50,10 @@ impl PodmanWorkerClient {
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("worker stdout unavailable"))?;
+        let (stdin_tx, stdin_rx) = mpsc::channel();
+        let stdin_writer = spawn_stdin_writer(stdin, stdin_rx);
+        let (response_tx, response_rx) = mpsc::channel();
+        let stdout_reader = spawn_stdout_reader(stdout, response_tx);
         let stderr = Arc::new(Mutex::new(Vec::new()));
         let stderr_reader = child
             .stderr
@@ -50,10 +61,15 @@ impl PodmanWorkerClient {
             .map(|stream| spawn_stderr_reader(stream, Arc::clone(&stderr)));
         Ok(Self {
             child,
-            stdin: BufWriter::new(stdin),
-            stdout: BufReader::new(stdout),
+            stdin_tx: Some(stdin_tx),
+            stdin_writer: Some(stdin_writer),
+            response_rx,
+            stdout_reader: Some(stdout_reader),
             stderr,
             stderr_reader,
+            dispatch_timeout: worker_dispatch_timeout(),
+            response_timeout: worker_response_timeout(),
+            terminated: false,
             next_request_id: 1,
             last_request_id: None,
             last_operation: None,
@@ -67,6 +83,12 @@ impl PodmanWorkerClient {
             .get("operation")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        if self.terminated {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "isolated worker has been terminated",
+            ));
+        }
         if self.child.try_wait()?.is_some() {
             return Err(self.worker_exit_error());
         }
@@ -84,25 +106,48 @@ impl PodmanWorkerClient {
         if encoded.len() > 16 * 1024 * 1024 {
             return Err(io::Error::other("worker request exceeds 16 MiB limit"));
         }
-        self.stdin.write_all(&encoded)?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()?;
-        let mut line = Vec::new();
-        for _ in 0..=16 * 1024 * 1024 {
-            let mut byte = [0_u8; 1];
-            if self.stdout.read(&mut byte)? == 0 {
-                return Err(self.worker_exit_error());
+        let (write_result_tx, write_result_rx) = mpsc::channel();
+        self.stdin_tx
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "worker stdin unavailable"))?
+            .send(PendingWrite {
+                frame: encoded,
+                completion: write_result_tx,
+            })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "worker stdin closed"))?;
+        match write_result_rx.recv_timeout(self.dispatch_timeout) {
+            Ok(result) => result?,
+            Err(RecvTimeoutError::Timeout) => {
+                self.terminate_after_failure();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "worker dispatch timeout after {} ms during {} request {}",
+                        self.dispatch_timeout.as_millis(),
+                        self.last_operation.as_deref().unwrap_or("unknown"),
+                        request_id
+                    ),
+                ));
             }
-            line.push(byte[0]);
-            if byte[0] == b'\n' {
-                break;
+            Err(RecvTimeoutError::Disconnected) => return Err(self.worker_exit_error()),
+        }
+        let frame = match self.response_rx.recv_timeout(self.response_timeout) {
+            Ok(result) => result?,
+            Err(RecvTimeoutError::Timeout) => {
+                self.terminate_after_failure();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "worker IPC response timeout after {} ms during {} request {}",
+                        self.response_timeout.as_millis(),
+                        self.last_operation.as_deref().unwrap_or("unknown"),
+                        request_id
+                    ),
+                ));
             }
-        }
-        if line.len() > 16 * 1024 * 1024 || !line.ends_with(b"\n") {
-            return Err(io::Error::other("worker response exceeds 16 MiB limit"));
-        }
-        let response: Value =
-            serde_json::from_slice(&line[..line.len() - 1]).map_err(io::Error::other)?;
+            Err(RecvTimeoutError::Disconnected) => return Err(self.worker_exit_error()),
+        };
+        let response: Value = serde_json::from_slice(&frame).map_err(io::Error::other)?;
         if response.get("protocol_version").and_then(Value::as_u64) != Some(1)
             || response.get("request_id").and_then(Value::as_u64) != Some(request_id)
         {
@@ -113,10 +158,17 @@ impl PodmanWorkerClient {
 
     /// Terminate the worker during trusted lifecycle teardown.
     pub fn terminate(&mut self) -> io::Result<()> {
+        self.terminated = true;
         if self.child.try_wait()?.is_none() {
             self.child.kill()?;
         }
         self.child.wait().map(|_| ())
+    }
+
+    fn terminate_after_failure(&mut self) {
+        self.terminated = true;
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 
     fn worker_exit_error(&mut self) -> io::Error {
@@ -148,15 +200,132 @@ impl PodmanWorkerClient {
 
 impl Drop for PodmanWorkerClient {
     fn drop(&mut self) {
+        self.stdin_tx.take();
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(writer) = self.stdin_writer.take() {
+            let _ = writer.join();
+        }
+        if let Some(reader) = self.stdout_reader.take() {
+            let _ = reader.join();
+        }
         if let Some(reader) = self.stderr_reader.take() {
             let _ = reader.join();
         }
     }
 }
 
+const MAX_WORKER_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_WORKER_STDERR_BYTES: usize = 64 * 1024;
+const DEFAULT_WORKER_DISPATCH_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_WORKER_RESPONSE_TIMEOUT_MS: u64 = 120_000;
+
+struct PendingWrite {
+    frame: Vec<u8>,
+    completion: Sender<io::Result<()>>,
+}
+
+fn worker_dispatch_timeout() -> Duration {
+    timeout_from_env(
+        "CLAW_WORKER_DISPATCH_TIMEOUT_MS",
+        DEFAULT_WORKER_DISPATCH_TIMEOUT_MS,
+    )
+}
+
+fn worker_response_timeout() -> Duration {
+    timeout_from_env(
+        "CLAW_WORKER_RESPONSE_TIMEOUT_MS",
+        DEFAULT_WORKER_RESPONSE_TIMEOUT_MS,
+    )
+}
+
+fn timeout_from_env(name: &str, default_ms: u64) -> Duration {
+    let millis = std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default_ms);
+    Duration::from_millis(millis)
+}
+
+fn spawn_stdin_writer(
+    mut stdin: ChildStdin,
+    requests: Receiver<PendingWrite>,
+) -> JoinHandle<io::Result<()>> {
+    std::thread::spawn(move || {
+        for pending in requests {
+            let result = stdin
+                .write_all(&pending.frame)
+                .and_then(|()| stdin.write_all(b"\n"))
+                .and_then(|()| stdin.flush());
+            let failed = result.is_err();
+            let _ = pending.completion.send(result);
+            if failed {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "worker stdin write failed",
+                ));
+            }
+        }
+        Ok(())
+    })
+}
+
+fn spawn_stdout_reader(
+    stdout: ChildStdout,
+    responses: Sender<io::Result<Vec<u8>>>,
+) -> JoinHandle<io::Result<()>> {
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            match read_frame(&mut reader) {
+                Ok(frame) => {
+                    if responses.send(Ok(frame)).is_err() {
+                        return Ok(());
+                    }
+                }
+                Err(error) => {
+                    let message = io::Error::new(error.kind(), error.to_string());
+                    let _ = responses.send(Err(message));
+                    return Err(error);
+                }
+            }
+        }
+    })
+}
+
+fn read_frame<R: BufRead>(reader: &mut R) -> io::Result<Vec<u8>> {
+    let mut frame = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "worker stdout closed before a complete response frame",
+            ));
+        }
+        if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+            if frame.len().saturating_add(newline) > MAX_WORKER_FRAME_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "worker response exceeds 16 MiB limit",
+                ));
+            }
+            frame.extend_from_slice(&available[..newline]);
+            reader.consume(newline + 1);
+            return Ok(frame);
+        }
+        if frame.len().saturating_add(available.len()) > MAX_WORKER_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "worker response exceeds 16 MiB limit",
+            ));
+        }
+        frame.extend_from_slice(available);
+        let consumed = available.len();
+        reader.consume(consumed);
+    }
+}
 
 fn spawn_stderr_reader(
     mut stderr: ChildStderr,
@@ -241,7 +410,8 @@ pub fn require_podman() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::PodmanWorkerSpec;
+    use super::{read_frame, PodmanWorkerSpec, MAX_WORKER_FRAME_BYTES};
+    use std::io::Cursor;
     use std::path::PathBuf;
 
     #[test]
@@ -278,5 +448,23 @@ mod tests {
                 "forbidden feature {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn framed_reader_handles_multiple_and_unicode_frames() {
+        let mut reader = Cursor::new("{\"text\":\"first\"}\n{\"text\":\"π\\nsecond\"}\n");
+        assert_eq!(read_frame(&mut reader).unwrap(), b"{\"text\":\"first\"}");
+        assert_eq!(
+            read_frame(&mut reader).unwrap(),
+            "{\"text\":\"π\\nsecond\"}".as_bytes()
+        );
+    }
+
+    #[test]
+    fn framed_reader_rejects_an_unterminated_oversized_frame() {
+        let mut payload = vec![b'x'; MAX_WORKER_FRAME_BYTES + 1];
+        payload.push(b'\n');
+        let error = read_frame(&mut Cursor::new(payload)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 }

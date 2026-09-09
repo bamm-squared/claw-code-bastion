@@ -644,6 +644,39 @@ fn real_worker_crash_is_reported_without_fallback() {
     fs::remove_dir_all(root).expect("clean crash fixture");
 }
 
+#[test]
+#[ignore = "requires a working rootless Podman runtime and CLAW_REAL_PODMAN_IMAGE"]
+fn real_worker_large_read_is_bounded_and_timeout_is_finite() {
+    let (root, _canonical, candidate) = worker_fixture("worker-large-read");
+    let content = "line with useful source context\n".repeat(40_000);
+    fs::write(candidate.join("large.rs"), content).expect("write large source fixture");
+
+    let mut worker = PodmanWorkerClient::spawn(&worker_spec(&candidate)).expect("spawn worker");
+    let response = worker
+        .request(&json!({"operation": "read_file", "path": "large.rs"}))
+        .expect("large read response");
+    assert_eq!(response["ok"], true);
+    let file = &response["result"]["file"];
+    assert_eq!(file["truncated"], true);
+    assert!(file["content"].as_str().unwrap().len() <= 512 * 1024);
+    assert!(file["nextOffset"].as_u64().unwrap() > 0);
+
+    std::env::set_var("CLAW_WORKER_RESPONSE_TIMEOUT_MS", "100");
+    drop(worker);
+    let mut worker = PodmanWorkerClient::spawn(&worker_spec(&candidate)).expect("spawn worker");
+    let error = worker
+        .request(&json!({
+            "operation": "run_command",
+            "command": "sleep 5"
+        }))
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(error.to_string().contains("worker IPC response timeout"));
+    std::env::remove_var("CLAW_WORKER_RESPONSE_TIMEOUT_MS");
+    drop(worker);
+    fs::remove_dir_all(root).expect("clean large read fixture");
+}
+
 fn validator_plan(command: String, timeout: std::time::Duration) -> ValidationPlan {
     ValidationPlan::new(vec![ValidationCheck {
         name: String::from("real validator probe"),

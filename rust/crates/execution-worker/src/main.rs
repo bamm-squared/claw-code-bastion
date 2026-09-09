@@ -94,8 +94,9 @@ fn handle_request(filesystem: &FilesystemCapability, line: &str) -> Response {
         }
         Err(error) => (1, 0, Err(error.to_string())),
     };
-    let result =
-        result.and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string()));
+    let result = result
+        .and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string()))
+        .map(bound_worker_result);
     match result {
         Ok(result) => Response {
             protocol_version,
@@ -112,6 +113,64 @@ fn handle_request(filesystem: &FilesystemCapability, line: &str) -> Response {
             error: Some(error),
         },
     }
+}
+
+const MAX_INLINE_READ_BYTES: usize = 512 * 1024;
+
+/// Keep repository reads useful without allowing one source file to become an
+/// unbounded IPC/context payload. The writer can request the next line range
+/// using the returned offset.
+fn bound_worker_result(mut result: Value) -> Value {
+    let Some(file) = result.get_mut("file").and_then(Value::as_object_mut) else {
+        return result;
+    };
+    let Some(content) = file
+        .get("content")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return result;
+    };
+    if content.len() <= MAX_INLINE_READ_BYTES {
+        return result;
+    }
+
+    let mut end = content
+        .char_indices()
+        .take_while(|(index, _)| *index <= MAX_INLINE_READ_BYTES)
+        .map(|(index, _)| index)
+        .last()
+        .unwrap_or(0);
+    if let Some(newline) = content[..end].rfind('\n') {
+        end = newline + 1;
+    }
+    if end == 0 {
+        end = content
+            .char_indices()
+            .take_while(|(index, _)| *index <= MAX_INLINE_READ_BYTES)
+            .map(|(index, _)| index)
+            .last()
+            .unwrap_or(0);
+    }
+    let returned = &content[..end];
+    let total_bytes = content.len();
+    let returned_lines = returned.bytes().filter(|byte| *byte == b'\n').count();
+    let start_line = file.get("startLine").and_then(Value::as_u64).unwrap_or(1);
+    if let Some(content_slot) = file.get_mut("content") {
+        *content_slot = Value::String(returned.to_string());
+    }
+    file.insert("truncated".to_string(), Value::Bool(true));
+    file.insert("returnedBytes".to_string(), Value::from(end as u64));
+    file.insert("totalBytes".to_string(), Value::from(total_bytes as u64));
+    file.insert(
+        "nextOffset".to_string(),
+        Value::from(
+            start_line
+                .saturating_sub(1)
+                .saturating_add(returned_lines as u64),
+        ),
+    );
+    result
 }
 
 fn execute_request(filesystem: &FilesystemCapability, request: Request) -> Result<Value, String> {
@@ -168,4 +227,40 @@ fn to_value<T: Serialize>(value: T) -> Result<Value, String> {
 #[allow(clippy::needless_pass_by_value)]
 fn error_text(error: io::Error) -> String {
     error.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bound_worker_result;
+    use serde_json::json;
+
+    #[test]
+    fn large_read_result_is_bounded_with_continuation_metadata() {
+        let content = "0123456789abcdef\n".repeat(40_000);
+        let result = bound_worker_result(json!({
+            "file": {
+                "content": content,
+                "startLine": 1,
+                "totalLines": 40_000
+            }
+        }));
+        let file = &result["file"];
+        assert_eq!(file["truncated"], true);
+        assert!(file["content"].as_str().unwrap().len() <= 512 * 1024);
+        assert!(file["returnedBytes"].as_u64().unwrap() > 0);
+        assert!(file["totalBytes"].as_u64().unwrap() > file["returnedBytes"].as_u64().unwrap());
+        assert!(file["nextOffset"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn small_read_result_is_unchanged() {
+        let result = json!({
+            "file": {
+                "content": "small\n",
+                "startLine": 1,
+                "totalLines": 1
+            }
+        });
+        assert_eq!(bound_worker_result(result.clone()), result);
+    }
 }

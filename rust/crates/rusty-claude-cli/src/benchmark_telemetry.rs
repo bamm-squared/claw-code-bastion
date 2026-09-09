@@ -99,11 +99,19 @@ pub struct Snapshot {
     pub terminal_status: String,
     pub lifecycle_events: Vec<String>,
     pub provider_call_records: Vec<ProviderCallRecord>,
+    pub execution_stages: Vec<ExecutionStage>,
 }
 
 #[derive(Clone, Debug, Serialize, Default)]
 pub struct ProviderCallRecord {
     pub sequence: u64,
+    pub cycle_id: String,
+    pub started_at_ms: u128,
+    pub finished_at_ms: Option<u128>,
+    pub status: String,
+    pub terminal_error: Option<String>,
+    pub usage_known: bool,
+    pub request_bytes: u64,
     pub role: Option<String>,
     pub profile: Option<String>,
     pub provider: Option<String>,
@@ -121,6 +129,18 @@ pub struct ProviderCallRecord {
     pub cache_write_tokens: u64,
     pub estimated_cost_usd: Option<f64>,
     pub price_source: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Default)]
+pub struct ExecutionStage {
+    pub sequence: u64,
+    pub timestamp_ms: u128,
+    pub cycle_id: Option<String>,
+    pub stage: String,
+    pub tool: Option<String>,
+    pub request_bytes: Option<u64>,
+    pub result_bytes: Option<u64>,
+    pub terminal_status: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Default)]
@@ -306,8 +326,12 @@ pub fn provider_call() {
         s.snapshot.provider_calls += 1;
         let context = &s.provider_context;
         let sequence = s.snapshot.provider_calls;
+        let cycle_id = format!("provider-call-{sequence}");
         s.snapshot.provider_call_records.push(ProviderCallRecord {
             sequence,
+            cycle_id: cycle_id.clone(),
+            started_at_ms: now_ms(),
+            status: String::from("started"),
             role: context.role.clone(),
             profile: context.profile.clone(),
             provider: context.provider.clone(),
@@ -322,7 +346,72 @@ pub fn provider_call() {
             ..ProviderCallRecord::default()
         });
         s.active_provider_record = Some(s.snapshot.provider_call_records.len() - 1);
+        push_execution_stage(s, "provider_request_started", None, None, None, None);
     });
+    persist_snapshot();
+}
+
+pub fn provider_call_finished(status: &str, error: Option<&str>) {
+    with_state(|s| {
+        if let Some(index) = s.active_provider_record {
+            {
+                let record = &mut s.snapshot.provider_call_records[index];
+                record.status = status.chars().take(64).collect();
+                record.finished_at_ms = Some(now_ms());
+                record.terminal_error = error.map(bounded_diagnostic);
+            }
+            let stage = if status == "completed" {
+                "provider_response_completed"
+            } else {
+                "provider_attempt_finished"
+            };
+            push_execution_stage(s, stage, None, None, None, Some(status));
+        }
+    });
+    persist_snapshot();
+}
+
+pub fn execution_stage(
+    stage: &str,
+    tool: Option<&str>,
+    request_bytes: Option<u64>,
+    result_bytes: Option<u64>,
+    terminal_status: Option<&str>,
+) {
+    with_state(|s| {
+        push_execution_stage(s, stage, tool, request_bytes, result_bytes, terminal_status);
+    });
+    persist_snapshot();
+}
+
+fn push_execution_stage(
+    telemetry_state: &mut State,
+    stage_name: &str,
+    tool: Option<&str>,
+    request_bytes: Option<u64>,
+    result_bytes: Option<u64>,
+    terminal_status: Option<&str>,
+) {
+    if telemetry_state.snapshot.execution_stages.len() >= 256 {
+        return;
+    }
+    let cycle_id = telemetry_state
+        .active_provider_record
+        .and_then(|index| telemetry_state.snapshot.provider_call_records.get(index))
+        .map(|record| record.cycle_id.clone());
+    telemetry_state
+        .snapshot
+        .execution_stages
+        .push(ExecutionStage {
+            sequence: telemetry_state.snapshot.execution_stages.len() as u64 + 1,
+            timestamp_ms: now_ms(),
+            cycle_id,
+            stage: stage_name.chars().take(64).collect(),
+            tool: tool.map(|value| value.chars().take(64).collect()),
+            request_bytes,
+            result_bytes,
+            terminal_status: terminal_status.map(|value| value.chars().take(64).collect()),
+        });
 }
 
 pub fn set_provider_context(
@@ -791,6 +880,7 @@ pub fn usage(input: u64, output: u64, cache_read: u64, cache_write: u64) {
         add_usage(&mut s.snapshot.cache_write_tokens, cache_write);
         if let Some(index) = s.active_provider_record {
             let record = &mut s.snapshot.provider_call_records[index];
+            record.usage_known = true;
             record.input_tokens = record.input_tokens.saturating_add(input);
             record.output_tokens = record.output_tokens.saturating_add(output);
             record.cache_read_tokens = record.cache_read_tokens.saturating_add(cache_read);
@@ -812,6 +902,10 @@ pub fn usage(input: u64, output: u64, cache_read: u64, cache_write: u64) {
 pub fn model_request_bytes(bytes: u64) {
     with_state(|s| {
         s.snapshot.model_request_bytes = s.snapshot.model_request_bytes.saturating_add(bytes);
+        if let Some(index) = s.active_provider_record {
+            let record = &mut s.snapshot.provider_call_records[index];
+            record.request_bytes = record.request_bytes.saturating_add(bytes);
+        }
     });
 }
 
