@@ -91,6 +91,9 @@ pub struct Snapshot {
     pub writer_route_rejections: Vec<RoutingRejection>,
     pub writer_route_estimate: Option<RoutingEstimate>,
     pub writer_profile_events: Vec<WriterProfileEvent>,
+    pub planning_artifact: Option<Value>,
+    pub writer_packet_events: Vec<WriterPacketEvent>,
+    pub blocked_checkpoint_events: Vec<BlockedCheckpointEvent>,
     pub candidate_artifact: Option<CandidateArtifact>,
     pub evaluation_blocked_reason: Option<String>,
     pub requirement_coverage: Vec<RequirementCoverage>,
@@ -119,6 +122,7 @@ pub struct ProviderCallRecord {
     pub model: Option<String>,
     pub endpoint: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub reasoning_policy: Option<String>,
     pub tools_supported: Option<bool>,
     pub context_window: Option<u32>,
     pub rate_limit: Option<api::RateLimitState>,
@@ -155,6 +159,7 @@ pub struct WriterProfileEvent {
     pub model: String,
     pub protocol: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub reasoning_policy: Option<String>,
     pub selection_source: String,
     pub reason: String,
 }
@@ -222,6 +227,43 @@ pub struct WorkUnitCheckpoint {
 }
 
 #[derive(Clone, Debug, Serialize, Default)]
+pub struct WriterPacketEvent {
+    pub sequence: u64,
+    pub timestamp_ms: u128,
+    pub task_id: String,
+    pub work_unit: Option<String>,
+    pub profile: String,
+    pub model: String,
+    pub protocol: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub reasoning_policy: String,
+    pub instruction_version: String,
+    pub tool_schema_version: String,
+    pub contract_ids: Vec<String>,
+    pub repository_fact_ids: Vec<String>,
+    pub candidate_identity: String,
+    pub context_message_count: u64,
+    pub context_bytes: u64,
+    pub packet_bytes: u64,
+    pub packet_hash: String,
+}
+
+#[derive(Clone, Debug, Serialize, Default)]
+pub struct BlockedCheckpointEvent {
+    pub sequence: u64,
+    pub timestamp_ms: u128,
+    pub work_unit: Option<String>,
+    pub writer_turns: u64,
+    pub turns_remaining: u64,
+    pub candidate_identity: String,
+    pub category: String,
+    pub reason: String,
+    pub declared_contract_ids: Vec<String>,
+    pub continuation_eligible: bool,
+    pub terminal_reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Default)]
 pub struct RequirementCoverage {
     pub id: String,
     pub status: String,
@@ -262,6 +304,7 @@ struct ProviderContext {
     model: Option<String>,
     endpoint: Option<String>,
     reasoning_effort: Option<String>,
+    reasoning_policy: Option<String>,
     tools_supported: Option<bool>,
     context_window: Option<u32>,
     rate_limit: Option<api::RateLimitState>,
@@ -339,6 +382,7 @@ pub fn provider_call() {
             model: context.model.clone(),
             endpoint: context.endpoint.clone(),
             reasoning_effort: context.reasoning_effort.clone(),
+            reasoning_policy: context.reasoning_policy.clone(),
             tools_supported: context.tools_supported,
             context_window: context.context_window,
             rate_limit: context.rate_limit.clone(),
@@ -450,6 +494,7 @@ pub fn set_provider_execution(
     model: Option<&str>,
     endpoint: Option<&str>,
     reasoning_effort: Option<&str>,
+    reasoning_policy: Option<&str>,
     tools_supported: Option<bool>,
     context_window: Option<u32>,
 ) {
@@ -457,6 +502,7 @@ pub fn set_provider_execution(
         s.provider_context.model = model.map(str::to_string);
         s.provider_context.endpoint = endpoint.map(str::to_string);
         s.provider_context.reasoning_effort = reasoning_effort.map(str::to_string);
+        s.provider_context.reasoning_policy = reasoning_policy.map(str::to_string);
         s.provider_context.tools_supported = tools_supported;
         s.provider_context.context_window = context_window;
     });
@@ -1142,6 +1188,60 @@ pub fn writer_profile_event(mut event: WriterProfileEvent) {
     lifecycle_event("writer_profile_event_recorded");
 }
 
+pub fn planning_state(plan: &crate::task_plan::TaskPlan) {
+    let value = planning_artifact_value(plan);
+    with_state(|s| s.snapshot.planning_artifact = Some(value));
+    persist_snapshot();
+}
+
+fn planning_artifact_value(plan: &crate::task_plan::TaskPlan) -> Value {
+    let mut value =
+        serde_json::to_value(plan).unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+    if let Some(object) = value.as_object_mut() {
+        if let Some(request) = object
+            .get_mut("full_request")
+            .and_then(|value| value.as_str())
+        {
+            const MAX_REQUEST_CHARS: usize = 16_384;
+            if request.chars().count() > MAX_REQUEST_CHARS {
+                let bounded = request.chars().take(MAX_REQUEST_CHARS).collect::<String>();
+                object.insert("full_request".to_string(), Value::String(bounded));
+                object.insert("full_request_truncated".to_string(), Value::Bool(true));
+            }
+        }
+    }
+    value
+}
+
+pub fn writer_packet(event: WriterPacketEvent) {
+    with_state(|s| {
+        let mut event = event;
+        event.sequence = s.snapshot.writer_packet_events.len() as u64 + 1;
+        event.timestamp_ms = now_ms();
+        s.snapshot.writer_packet_events.push(event);
+        if s.snapshot.writer_packet_events.len() > 64 {
+            let excess = s.snapshot.writer_packet_events.len() - 64;
+            s.snapshot.writer_packet_events.drain(0..excess);
+        }
+    });
+    persist_snapshot();
+}
+
+pub fn blocked_checkpoint(event: BlockedCheckpointEvent) {
+    with_state(|s| {
+        let mut event = event;
+        event.sequence = s.snapshot.blocked_checkpoint_events.len() as u64 + 1;
+        event.timestamp_ms = now_ms();
+        event.reason = bounded_diagnostic(&event.reason);
+        s.snapshot.blocked_checkpoint_events.push(event);
+        if s.snapshot.blocked_checkpoint_events.len() > 64 {
+            let excess = s.snapshot.blocked_checkpoint_events.len() - 64;
+            s.snapshot.blocked_checkpoint_events.drain(0..excess);
+        }
+    });
+    persist_snapshot();
+}
+
 pub fn candidate_artifact(candidate_identity: &str, changed_paths: &[String], diff: &str) {
     const MAX_DIFF_CHARS: usize = 32_000;
     let bounded_diff = diff.chars().take(MAX_DIFF_CHARS).collect::<String>();
@@ -1404,5 +1504,52 @@ mod tests {
         assert_eq!(record.productive_writer_turns, 10);
         assert!(record.checkpoint_turn);
         assert_eq!(record.writer_turns, 11);
+    }
+
+    #[test]
+    fn planning_artifact_contains_contracts_and_work_units() {
+        let plan = crate::task_plan::TaskPlan::from_request(
+            "Validate merged configuration and render safe diagnostics.",
+            Some("doctor command; configuration loader; JSON output"),
+        );
+        let value = planning_artifact_value(&plan);
+
+        assert!(value.get("full_request").is_some());
+        assert!(value.get("contracts").and_then(Value::as_array).is_some());
+        assert!(value.get("work_units").and_then(Value::as_array).is_some());
+        assert!(value.get("repository_files").is_some());
+    }
+
+    #[test]
+    fn packet_and_blocked_checkpoint_records_preserve_safe_semantic_identity() {
+        let packet = WriterPacketEvent {
+            task_id: "task-1".to_string(),
+            work_unit: Some("WU-1".to_string()),
+            profile: "profile-a".to_string(),
+            model: "opaque-model".to_string(),
+            reasoning_policy: "omitted_provider_default".to_string(),
+            contract_ids: vec!["contract-1".to_string()],
+            repository_fact_ids: vec!["fact-1".to_string()],
+            candidate_identity: "candidate-1".to_string(),
+            packet_hash: "packet-hash".to_string(),
+            ..WriterPacketEvent::default()
+        };
+        let blocked = BlockedCheckpointEvent {
+            work_unit: Some("WU-1".to_string()),
+            candidate_identity: "candidate-1".to_string(),
+            category: "writer_reported_blocked".to_string(),
+            reason: "missing implementation surface".to_string(),
+            declared_contract_ids: vec!["contract-1".to_string()],
+            terminal_reason: "writer_checkpoint_blocked".to_string(),
+            ..BlockedCheckpointEvent::default()
+        };
+
+        let packet_json = serde_json::to_value(packet).expect("packet telemetry should serialize");
+        let blocked_json =
+            serde_json::to_value(blocked).expect("blocked telemetry should serialize");
+        assert_eq!(packet_json["packet_hash"], "packet-hash");
+        assert_eq!(packet_json["reasoning_policy"], "omitted_provider_default");
+        assert_eq!(blocked_json["category"], "writer_reported_blocked");
+        assert_eq!(blocked_json["declared_contract_ids"][0], "contract-1");
     }
 }

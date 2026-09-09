@@ -77,6 +77,8 @@ use tools::{
 };
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
+const WRITER_INSTRUCTION_VERSION: &str = "writer-workflow-v1";
+const WRITER_TOOL_SCHEMA_VERSION: &str = "runtime-tools-v1";
 const MAX_VALIDATION_REPAIR_CYCLES: u8 = 2;
 const MAX_EVALUATOR_REWORK_CYCLES: u8 = 1;
 const MAX_TOTAL_CORRECTION_CYCLES: u8 = MAX_VALIDATION_REPAIR_CYCLES + MAX_EVALUATOR_REWORK_CYCLES;
@@ -5324,6 +5326,7 @@ impl LiveCli {
                 api::OpenAiCompatProtocol::ChatCompletions => "chat_completions",
             });
         let reasoning_effort = profile.reasoning_effort().ok().flatten();
+        let reasoning_policy = reasoning_policy_label(profile);
         self.selected_writer_profile = Some(profile.clone());
         benchmark_telemetry::writer_profile_event(benchmark_telemetry::WriterProfileEvent {
             previous_profile,
@@ -5332,6 +5335,7 @@ impl LiveCli {
             model: profile.model.clone(),
             protocol: protocol.map(str::to_string),
             reasoning_effort,
+            reasoning_policy: Some(reasoning_policy),
             selection_source: selection_source.to_string(),
             reason: reason.to_string(),
             ..benchmark_telemetry::WriterProfileEvent::default()
@@ -5753,6 +5757,7 @@ impl LiveCli {
             &repository_context.seed_files,
             &repository_context.surface_guidance,
         );
+        benchmark_telemetry::planning_state(&self.task_plan);
         self.repository_map_cache = Some(RepositoryMapCache {
             request: input.to_string(),
             selection: repository_context.clone(),
@@ -5883,6 +5888,7 @@ impl LiveCli {
                     &selection.surface_guidance,
                 );
             }
+            benchmark_telemetry::planning_state(&self.task_plan);
         }
         let continuation_objective = self.work_unit_continuation_objective.take();
         let continuation_context = continuation_objective
@@ -5897,6 +5903,53 @@ impl LiveCli {
             self.task_plan.render_for_writer()
         );
         let plan_text = format!("{plan_text}{continuation_context}");
+        let profile = self.selected_writer_profile.as_ref();
+        let effective_reasoning = profile.and_then(|value| value.reasoning_effort().ok().flatten());
+        let reasoning_policy =
+            profile.map_or_else(|| "unknown".to_string(), reasoning_policy_label);
+        let packet_hash = writer_packet_hash(
+            &self.task_plan,
+            repository_text.unwrap_or_default(),
+            &plan_text,
+            profile,
+            &reasoning_policy,
+        );
+        benchmark_telemetry::writer_packet(benchmark_telemetry::WriterPacketEvent {
+            task_id: self.session.id.clone(),
+            work_unit: self.task_plan.current_work_unit_id.clone(),
+            profile: profile.map_or_else(|| "unknown".to_string(), |value| value.id.clone()),
+            model: profile.map_or_else(|| self.model.clone(), |value| value.model.clone()),
+            protocol: profile.and_then(|value| {
+                value
+                    .openai_compat
+                    .as_ref()
+                    .map(|compat| match compat.protocol {
+                        api::OpenAiCompatProtocol::Responses => "responses".to_string(),
+                        api::OpenAiCompatProtocol::ChatCompletions => {
+                            "chat_completions".to_string()
+                        }
+                    })
+            }),
+            reasoning_effort: effective_reasoning,
+            reasoning_policy,
+            instruction_version: WRITER_INSTRUCTION_VERSION.to_string(),
+            tool_schema_version: WRITER_TOOL_SCHEMA_VERSION.to_string(),
+            contract_ids: self
+                .task_plan
+                .contracts
+                .iter()
+                .map(|contract| contract.id.clone())
+                .collect(),
+            repository_fact_ids: self.task_plan.repository_files.clone(),
+            candidate_identity: format!("candidate-baseline:{}", self.session.id),
+            context_message_count: self.runtime.session().messages.len() as u64,
+            context_bytes: repository_text
+                .map_or(0, str::len)
+                .saturating_add(plan_text.len()) as u64,
+            packet_bytes: plan_text.len() as u64,
+            packet_hash,
+            ..benchmark_telemetry::WriterPacketEvent::default()
+        });
         if self.work_unit_turn_allowance == 0 && self.task_plan.current_work_unit().is_some() {
             self.reset_work_unit_budget();
         }
@@ -6268,6 +6321,31 @@ impl LiveCli {
                             );
                             benchmark_telemetry::lifecycle_event("writer_checkpoint_blocked");
                             println!("Writer checkpoint stopped before Review: {message}");
+                            let declared_contract_ids = self
+                                .task_plan
+                                .current_work_unit()
+                                .map(|unit| unit.contract_ids.clone())
+                                .unwrap_or_default();
+                            benchmark_telemetry::blocked_checkpoint(
+                                benchmark_telemetry::BlockedCheckpointEvent {
+                                    work_unit: self.task_plan.current_work_unit_id.clone(),
+                                    writer_turns: self.work_unit_writer_turns as u64,
+                                    turns_remaining: self
+                                        .work_unit_turn_allowance
+                                        .saturating_sub(self.work_unit_writer_turns)
+                                        as u64,
+                                    candidate_identity: format!(
+                                        "candidate-baseline:{}",
+                                        self.session.id
+                                    ),
+                                    category: "writer_reported_blocked".to_string(),
+                                    reason: message,
+                                    declared_contract_ids,
+                                    continuation_eligible: false,
+                                    terminal_reason: "writer_checkpoint_blocked".to_string(),
+                                    ..benchmark_telemetry::BlockedCheckpointEvent::default()
+                                },
+                            );
                             self.replace_runtime(runtime)?;
                             self.persist_session()?;
                             self.context_tray.clear();
@@ -8249,16 +8327,61 @@ fn set_provider_telemetry_context(role: &str, profile: &model_router::ModelProfi
         }),
     );
     let reasoning = profile.reasoning_effort().ok().flatten();
+    let reasoning_policy = reasoning_policy_label(profile);
     benchmark_telemetry::set_provider_execution(
         Some(&profile.model),
         endpoint.as_deref(),
         reasoning.as_deref(),
+        Some(&reasoning_policy),
         profile
             .openai_compat
             .as_ref()
             .map(|compat| compat.capabilities.function_tools),
         Some(profile.capability.context_window),
     );
+}
+
+fn reasoning_policy_label(profile: &model_router::ModelProfile) -> String {
+    match profile.reasoning_profile.as_deref() {
+        Some("none" | "off") => "explicit_none".to_string(),
+        Some("low" | "medium" | "high") => {
+            format!(
+                "explicit_{}",
+                profile.reasoning_profile.as_deref().unwrap_or("unknown")
+            )
+        }
+        Some("default") => profile
+            .openai_compat
+            .as_ref()
+            .and_then(|compat| compat.reasoning.default_effort.as_deref())
+            .map_or_else(
+                || "omitted_provider_default".to_string(),
+                |effort| format!("profile_default_{effort}"),
+            ),
+        Some(_) => "unknown".to_string(),
+        None => "omitted_provider_default".to_string(),
+    }
+}
+
+fn writer_packet_hash(
+    plan: &task_plan::TaskPlan,
+    repository_context: &str,
+    plan_text: &str,
+    profile: Option<&model_router::ModelProfile>,
+    reasoning_policy: &str,
+) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(plan)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    repository_context.hash(&mut hasher);
+    plan_text.hash(&mut hasher);
+    profile.map(|value| value.id.as_str()).hash(&mut hasher);
+    profile.map(|value| value.model.as_str()).hash(&mut hasher);
+    reasoning_policy.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 fn record_writer_routing(decision: &model_router::RouteDecision) {
