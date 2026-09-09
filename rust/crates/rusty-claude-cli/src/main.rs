@@ -384,12 +384,13 @@ type RuntimePluginStateBuildOutput = (
 
 fn main() {
     benchmark_telemetry::init();
+    let argv: Vec<String> = std::env::args().collect();
+    let planning_only = argv.iter().any(|arg| arg == "plan");
     if let Err(error) = run() {
         benchmark_telemetry::flush("internal_error");
         let message = error.to_string();
         // When --output-format json is active, emit errors as JSON so downstream
         // tools can parse failures the same way they parse successes (ROADMAP #42).
-        let argv: Vec<String> = std::env::args().collect();
         let json_output = argv
             .windows(2)
             .any(|w| w[0] == "--output-format" && w[1] == "json")
@@ -416,7 +417,11 @@ Run `claw --help` for usage."
         }
         std::process::exit(1);
     }
-    benchmark_telemetry::flush("completed");
+    benchmark_telemetry::flush(if planning_only {
+        "planning_complete"
+    } else {
+        "completed"
+    });
 }
 
 /// Classify CLI failures into stable machine-readable categories.
@@ -587,6 +592,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             manifests_dir,
         } => dump_manifests(manifests_dir.as_deref(), output_format)?,
         CliAction::BootstrapPlan { output_format } => print_bootstrap_plan(output_format)?,
+        CliAction::Plan {
+            request,
+            output_path,
+            output_format,
+        } => run_plan_only(&request, output_path.as_deref(), output_format)?,
         CliAction::Agents {
             args,
             output_format,
@@ -698,6 +708,11 @@ enum CliAction {
         manifests_dir: Option<PathBuf>,
     },
     BootstrapPlan {
+        output_format: CliOutputFormat,
+    },
+    Plan {
+        request: String,
+        output_path: Option<PathBuf>,
         output_format: CliOutputFormat,
     },
     Agents {
@@ -1087,6 +1102,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "calibration" => parse_calibration_args(&rest[1..], output_format),
         "dump-manifests" => parse_dump_manifests_args(&rest[1..], output_format),
         "bootstrap-plan" => Ok(CliAction::BootstrapPlan { output_format }),
+        "plan" => parse_plan_args(&rest[1..], output_format),
         "agents" => Ok(CliAction::Agents {
             args: join_optional_args(&rest[1..]),
             output_format,
@@ -1529,6 +1545,7 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
         command_name,
         "dump-manifests"
             | "bootstrap-plan"
+            | "plan"
             | "agents"
             | "mcp"
             | "skills"
@@ -2053,6 +2070,46 @@ fn parse_dump_manifests_args(
     Ok(CliAction::DumpManifests {
         output_format,
         manifests_dir,
+    })
+}
+
+fn parse_plan_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+    let mut output_path = None;
+    let mut request = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--output" | "-o" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--output requires a path".to_string())?;
+                output_path = Some(PathBuf::from(value));
+                index += 2;
+            }
+            value if value.starts_with("--output=") => {
+                let path = value[9..].trim();
+                if path.is_empty() {
+                    return Err("--output requires a path".to_string());
+                }
+                output_path = Some(PathBuf::from(path));
+                index += 1;
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown plan option: {value}"));
+            }
+            value => {
+                request.push(value.to_string());
+                index += 1;
+            }
+        }
+    }
+    if request.is_empty() {
+        return Err("plan requires a user requirement".to_string());
+    }
+    Ok(CliAction::Plan {
+        request: request.join(" "),
+        output_path,
+        output_format,
     })
 }
 
@@ -3024,6 +3081,67 @@ fn print_bootstrap_plan(output_format: CliOutputFormat) -> Result<(), Box<dyn st
                 "phases": phases,
             }))?
         ),
+    }
+    Ok(())
+}
+
+fn run_plan_only(
+    request: &str,
+    output_path: Option<&Path>,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repository_context = build_repository_context(request, None)
+        .ok_or_else(|| "planning requires repository intelligence context".to_string())?;
+    let mut plan = task_plan::TaskPlan::from_request(request, Some(&repository_context.text));
+    plan.set_repository_scope(
+        &repository_context.selected_files,
+        &repository_context.seed_files,
+        &repository_context.surface_guidance,
+    );
+    plan.validate_executable()
+        .map_err(|errors| format!("generated plan is not executable: {}", errors.join("; ")))?;
+    benchmark_telemetry::planning_state(&plan);
+    benchmark_telemetry::lifecycle_event("planning_complete");
+
+    let source_revision = git_output(&["rev-parse", "HEAD"])
+        .unwrap_or_else(|_| "unknown".to_string())
+        .trim()
+        .to_string();
+    let plan_hash = planning_artifact_hash(&plan, &repository_context.text);
+    let artifact = json!({
+        "schema": "claw-planning-artifact-v1",
+        "terminal_status": "planning_complete",
+        "source_revision": source_revision,
+        "candidate_baseline_identity": current_baseline_identity(&source_revision),
+        "requirement": request,
+        "planner_version": task_plan::PLANNER_VERSION,
+        "instruction_version": WRITER_INSTRUCTION_VERSION,
+        "tool_schema_version": WRITER_TOOL_SCHEMA_VERSION,
+        "plan_hash": plan_hash,
+        "repository_context": repository_context.text,
+        "repository_facts": {
+            "selected_files": repository_context.selected_files,
+            "seed_files": repository_context.seed_files,
+            "surface_guidance": repository_context.surface_guidance,
+        },
+        "task_plan": plan,
+    });
+    let destination =
+        output_path.map_or_else(|| PathBuf::from(".claw/plans/latest.json"), PathBuf::from);
+    if let Some(parent) = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&destination, serde_json::to_vec_pretty(&artifact)?)?;
+    match output_format {
+        CliOutputFormat::Text => println!(
+            "planning_complete\n  artifact: {}\n  plan_hash: {}",
+            destination.display(),
+            artifact["plan_hash"].as_str().unwrap_or("unknown")
+        ),
+        CliOutputFormat::Json => println!("{}", serde_json::to_string_pretty(&artifact)?),
     }
     Ok(())
 }
@@ -4084,6 +4202,8 @@ struct LiveCli {
     context_tray: Vec<ContextTrayItem>,
     attachments: Vec<attachments::TaskAttachment>,
     task_plan: task_plan::TaskPlan,
+    frozen_plan_hash: Option<String>,
+    frozen_plan_context: Option<String>,
     evaluation: Option<requirement_evaluator::EvaluationReport>,
     model_pool: model_router::ModelPool,
     calibration: model_router::CalibrationStore,
@@ -5170,6 +5290,7 @@ impl LiveCli {
         permission_mode: PermissionMode,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
+        let frozen_plan = load_frozen_plan_from_env()?;
         let cwd = env::current_dir()?;
         let config = ConfigLoader::default_for(&cwd).load()?;
         let model_pool = model_router::ModelPool::from_runtime_config(&config, &model);
@@ -5259,7 +5380,16 @@ impl LiveCli {
             review_file_index: None,
             context_tray: Vec::new(),
             attachments: Vec::new(),
-            task_plan: task_plan::TaskPlan::default(),
+            task_plan: frozen_plan
+                .as_ref()
+                .map(|artifact| artifact.task_plan.clone())
+                .unwrap_or_default(),
+            frozen_plan_hash: frozen_plan
+                .as_ref()
+                .map(|artifact| artifact.plan_hash.clone()),
+            frozen_plan_context: frozen_plan
+                .as_ref()
+                .map(|artifact| artifact.repository_context.clone()),
             evaluation: None,
             model_pool,
             calibration,
@@ -5751,12 +5881,14 @@ impl LiveCli {
             self.exploration_input = Some(input.to_string());
             return;
         };
-        self.task_plan.update(input, Some(&repository_context.text));
-        self.task_plan.set_repository_scope(
-            &repository_context.selected_files,
-            &repository_context.seed_files,
-            &repository_context.surface_guidance,
-        );
+        if self.frozen_plan_hash.is_none() {
+            self.task_plan.update(input, Some(&repository_context.text));
+            self.task_plan.set_repository_scope(
+                &repository_context.selected_files,
+                &repository_context.seed_files,
+                &repository_context.surface_guidance,
+            );
+        }
         benchmark_telemetry::planning_state(&self.task_plan);
         self.repository_map_cache = Some(RepositoryMapCache {
             request: input.to_string(),
@@ -5879,7 +6011,7 @@ impl LiveCli {
         let repository_text = repository_context
             .as_ref()
             .map(|selection| selection.text.as_str());
-        if !is_rework {
+        if !is_rework && self.frozen_plan_hash.is_none() {
             self.task_plan.update(task_input, repository_text);
             if let Some(selection) = &repository_context {
                 self.task_plan.set_repository_scope(
@@ -5889,6 +6021,18 @@ impl LiveCli {
                 );
             }
             benchmark_telemetry::planning_state(&self.task_plan);
+        }
+        if let Some(expected_hash) = &self.frozen_plan_hash {
+            let actual_hash =
+                planning_artifact_hash(&self.task_plan, repository_text.unwrap_or_default());
+            if &actual_hash != expected_hash {
+                return Err(format!(
+                    "frozen plan context/hash changed before writer startup: expected {expected_hash}, found {actual_hash}"
+                ).into());
+            }
+            if self.frozen_plan_context.as_deref() != repository_text {
+                return Err("frozen plan repository context changed before writer startup".into());
+            }
         }
         let continuation_objective = self.work_unit_continuation_objective.take();
         let continuation_context = continuation_objective
@@ -5914,6 +6058,8 @@ impl LiveCli {
             profile,
             &reasoning_policy,
         );
+        let plan_hash =
+            planning_artifact_hash(&self.task_plan, repository_text.unwrap_or_default());
         benchmark_telemetry::writer_packet(benchmark_telemetry::WriterPacketEvent {
             task_id: self.session.id.clone(),
             work_unit: self.task_plan.current_work_unit_id.clone(),
@@ -5947,6 +6093,7 @@ impl LiveCli {
                 .map_or(0, str::len)
                 .saturating_add(plan_text.len()) as u64,
             packet_bytes: plan_text.len() as u64,
+            plan_hash,
             packet_hash,
             ..benchmark_telemetry::WriterPacketEvent::default()
         });
@@ -6324,7 +6471,7 @@ impl LiveCli {
                             let declared_contract_ids = self
                                 .task_plan
                                 .current_work_unit()
-                                .map(|unit| unit.contract_ids.clone())
+                                .map(|unit| unit.owned_contract_ids.clone())
                                 .unwrap_or_default();
                             benchmark_telemetry::blocked_checkpoint(
                                 benchmark_telemetry::BlockedCheckpointEvent {
@@ -7172,7 +7319,7 @@ impl LiveCli {
                     .task_plan
                     .work_units
                     .iter()
-                    .find(|unit| unit.contract_ids.contains(&finding.requirement_id))
+                    .find(|unit| unit.owned_contract_ids.contains(&finding.requirement_id))
                     .map(|unit| unit.id.clone());
                 self.task_plan
                     .reopen_for_evaluation(&finding.requirement_id, &finding.finding);
@@ -8361,6 +8508,68 @@ fn reasoning_policy_label(profile: &model_router::ModelProfile) -> String {
         Some(_) => "unknown".to_string(),
         None => "omitted_provider_default".to_string(),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct FrozenPlanArtifact {
+    requirement: String,
+    repository_context: String,
+    plan_hash: String,
+    task_plan: task_plan::TaskPlan,
+}
+
+fn planning_artifact_hash(plan: &task_plan::TaskPlan, repository_context: &str) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(plan)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    repository_context.hash(&mut hasher);
+    task_plan::PLANNER_VERSION.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn current_baseline_identity(source_revision: &str) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let tracked_diff = git_output(&["diff", "--binary", "HEAD"]).unwrap_or_default();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    source_revision.hash(&mut hasher);
+    tracked_diff.hash(&mut hasher);
+    format!("git:{source_revision}-worktree:{:016x}", hasher.finish())
+}
+
+fn load_frozen_plan_from_env() -> Result<Option<FrozenPlanArtifact>, Box<dyn std::error::Error>> {
+    let Some(path) = env::var_os("CLAW_PLAN_ARTIFACT") else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(path);
+    let artifact: FrozenPlanArtifact = serde_json::from_slice(&fs::read(&path)?)?;
+    if artifact.requirement != artifact.task_plan.authoritative_request() {
+        return Err(format!(
+            "frozen plan requirement does not match its TaskPlan: {}",
+            path.display()
+        )
+        .into());
+    }
+    artifact
+        .task_plan
+        .validate_executable()
+        .map_err(|errors| -> Box<dyn std::error::Error> {
+            format!("frozen plan is not executable: {}", errors.join("; ")).into()
+        })?;
+    let expected = planning_artifact_hash(&artifact.task_plan, &artifact.repository_context);
+    if expected != artifact.plan_hash {
+        return Err(format!(
+            "frozen plan hash mismatch for {}: expected {}, found {}",
+            path.display(),
+            expected,
+            artifact.plan_hash
+        )
+        .into());
+    }
+    Ok(Some(artifact))
 }
 
 fn writer_packet_hash(
@@ -13221,6 +13430,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(out, "  claw dump-manifests [--manifests-dir PATH]")?;
     writeln!(out, "  claw bootstrap-plan")?;
+    writeln!(out, "  claw plan [--output PATH] REQUIREMENT")?;
+    writeln!(
+        out,
+        "      Generate and persist a production TaskPlan without starting a writer"
+    )?;
     writeln!(out, "  claw agents")?;
     writeln!(out, "  claw mcp")?;
     writeln!(out, "  claw skills")?;
@@ -17773,6 +17987,24 @@ mod dump_manifests_tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod frozen_plan_identity_tests {
+    use super::{planning_artifact_hash, task_plan};
+
+    #[test]
+    fn audited_plan_hash_is_stable_for_writer_reuse() {
+        let plan = task_plan::TaskPlan::from_request(
+            "Implement the behavior. Preserve compatibility.",
+            Some("src/lib.rs"),
+        );
+        let context = "selected: src/lib.rs";
+        let audited = planning_artifact_hash(&plan, context);
+        let resumed = planning_artifact_hash(&plan, context);
+        assert_eq!(audited, resumed);
+        assert!(!audited.is_empty());
     }
 }
 

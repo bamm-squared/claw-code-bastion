@@ -245,6 +245,7 @@ pub struct WriterPacketEvent {
     pub context_message_count: u64,
     pub context_bytes: u64,
     pub packet_bytes: u64,
+    pub plan_hash: String,
     pub packet_hash: String,
 }
 

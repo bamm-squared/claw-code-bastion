@@ -4,6 +4,8 @@
 //! authority. It turns the user's request and already-selected repository
 //! facts into a compact working hypothesis.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde::{Deserialize, Serialize};
 
 const MAX_REQUEST_BYTES: usize = 512;
@@ -15,6 +17,7 @@ const MAX_SCOPE_FILES: usize = 8;
 const MAX_SCOPE_GUIDANCE: usize = 8;
 const MAX_WORK_UNITS: usize = 5;
 const MAX_REPLANS: u8 = 2;
+pub const PLANNER_VERSION: &str = "deterministic-contract-ownership-v2";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum PlanItemStatus {
@@ -156,11 +159,16 @@ pub enum WorkUnitStatus {
 pub struct WorkUnit {
     pub id: String,
     pub objective: String,
-    pub contract_ids: Vec<String>,
+    #[serde(default, alias = "contract_ids")]
+    pub owned_contract_ids: Vec<String>,
+    #[serde(default)]
+    pub downstream_contract_ids: Vec<String>,
     pub fact_refs: Vec<String>,
     pub likely_scope: Vec<String>,
     pub dependencies: Vec<String>,
     pub invariants: Vec<String>,
+    #[serde(default)]
+    pub global_invariant_ids: Vec<String>,
     pub completion_evidence: String,
     #[serde(default)]
     pub requires_candidate_change: bool,
@@ -192,6 +200,8 @@ pub struct TaskPlan {
     pub revision: u32,
     pub items: Vec<PlanItem>,
     pub contracts: Vec<ExpectedContract>,
+    #[serde(default)]
+    pub global_invariant_ids: Vec<String>,
     pub known_impact: Vec<String>,
     #[serde(default)]
     pub repository_files: Vec<String>,
@@ -411,60 +421,92 @@ impl TaskPlan {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn rebuild_work_units(&mut self) {
+        let candidate_global_ids = self
+            .contracts
+            .iter()
+            .filter(|contract| is_global_invariant(&contract.expectation))
+            .map(|contract| contract.id.clone())
+            .collect::<Vec<_>>();
+        let implementation_contracts = if candidate_global_ids.len() < self.contracts.len() {
+            self.contracts
+                .iter()
+                .filter(|contract| !candidate_global_ids.contains(&contract.id))
+                .collect::<Vec<_>>()
+        } else {
+            self.contracts.iter().collect::<Vec<_>>()
+        };
+        self.global_invariant_ids = if candidate_global_ids.len() < self.contracts.len() {
+            candidate_global_ids
+        } else {
+            Vec::new()
+        };
         let mut groups: Vec<Vec<&ExpectedContract>> = Vec::new();
-        if self.contracts.is_empty() {
+        if implementation_contracts.is_empty() {
             groups.push(Vec::new());
         } else if self.planning_mode() == PlanningMode::Minimal {
-            groups.push(self.contracts.iter().collect());
+            groups.push(implementation_contracts);
         } else {
             let mut grouped = vec![Vec::new(), Vec::new(), Vec::new()];
-            for contract in &self.contracts {
+            for contract in implementation_contracts {
                 grouped[work_unit_group(&contract.verification_boundary)].push(contract);
             }
             groups.extend(grouped.into_iter().filter(|group| !group.is_empty()));
         }
 
+        let grouped_owned_ids = groups
+            .iter()
+            .map(|contracts| {
+                contracts
+                    .iter()
+                    .map(|contract| contract.id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
         self.work_units = groups
             .into_iter()
             .take(MAX_WORK_UNITS)
             .enumerate()
             .map(|(index, contracts)| {
                 let id = format!("WU-{}", index + 1);
-                let contract_ids = contracts
+                let owned_contract_ids = contracts
                     .iter()
                     .map(|contract| contract.id.clone())
-                    .collect();
-                let invariants = contracts
+                    .collect::<Vec<_>>();
+                let downstream_contract_ids = grouped_owned_ids
                     .iter()
-                    .filter(|contract| contract.basis != "user requirement")
-                    .map(|contract| contract.expectation.clone())
-                    .collect();
-                let objective = match index {
-                    0 => "Deliver the first coherent implementation outcome for the requested behavior and public integration, preserving the task-wide contracts for downstream work.".to_string(),
-                    1 => "Integrate the remaining compatibility, default, and error-path behavior around the completed implementation without reopening unrelated scope.".to_string(),
-                    _ => "Close the remaining required behavioral boundaries with focused evidence and reconcile the complete candidate for submission.".to_string(),
-                };
-                let completion_evidence = if contracts.is_empty() {
-                    "For this implementation unit, make a meaningful candidate change and obtain targeted development evidence for the requested behavior.".to_string()
+                    .skip(index + 1)
+                    .flatten()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let objective = if contracts.is_empty() {
+                    "Establish the smallest coherent implementation outcome required by the task contracts.".to_string()
                 } else {
-                    contracts
+                    let summary = contracts
                         .iter()
-                        .map(|contract| {
-                            format!(
-                                "{} at the {} boundary",
-                                contract.id,
-                                contract.verification_boundary.label()
-                            )
-                        })
+                        .map(|contract| contract.expectation.clone())
                         .collect::<Vec<_>>()
-                        .join("; ")
+                        .join("; ");
+                    format!("Establish the owned behavior boundary: {summary}.")
                 };
+                let completion_evidence = contracts
+                    .iter()
+                    .map(|contract| {
+                        format!(
+                            "{} verified at the {} boundary with targeted candidate evidence",
+                            contract.id,
+                            contract.verification_boundary.label()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
                 let requires_candidate_change = true;
                 WorkUnit {
                     id: id.clone(),
                     objective,
-                    contract_ids,
+                    owned_contract_ids,
+                    downstream_contract_ids,
                     fact_refs: self.repository_files.clone(),
                     likely_scope: if self.primary_repository_files.is_empty() {
                         self.repository_files.clone()
@@ -476,7 +518,17 @@ impl TaskPlan {
                     } else {
                         vec![format!("WU-{index}")]
                     },
-                    invariants,
+                    invariants: self
+                        .global_invariant_ids
+                        .iter()
+                        .filter_map(|id| {
+                            self.contracts
+                                .iter()
+                                .find(|contract| &contract.id == id)
+                                .map(|contract| contract.expectation.clone())
+                        })
+                        .collect(),
+                    global_invariant_ids: self.global_invariant_ids.clone(),
                     completion_evidence,
                     requires_candidate_change,
                     status: if index == 0 {
@@ -491,6 +543,100 @@ impl TaskPlan {
             })
             .collect();
         self.current_work_unit_id = self.work_units.first().map(|unit| unit.id.clone());
+    }
+
+    pub fn validate_executable(&self) -> Result<(), Vec<String>> {
+        let contract_ids = self
+            .contracts
+            .iter()
+            .map(|contract| contract.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let global_ids = self
+            .global_invariant_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let mut errors = Vec::new();
+        for id in &global_ids {
+            if !contract_ids.contains(id) {
+                errors.push(format!("global invariant references unknown contract {id}"));
+            }
+        }
+        let mut owners = BTreeMap::<&str, &str>::new();
+        let unit_ids = self
+            .work_units
+            .iter()
+            .map(|unit| unit.id.as_str())
+            .collect::<BTreeSet<_>>();
+        for unit in &self.work_units {
+            if unit.owned_contract_ids.is_empty() {
+                errors.push(format!("{} has no owned contracts", unit.id));
+            }
+            if unit.objective.contains("first coherent implementation")
+                || unit
+                    .objective
+                    .contains("remaining required behavioral boundaries")
+            {
+                errors.push(format!("{} retains a generic planner objective", unit.id));
+            }
+            for id in &unit.owned_contract_ids {
+                if !contract_ids.contains(id.as_str()) {
+                    errors.push(format!("{} owns unknown contract {id}", unit.id));
+                    continue;
+                }
+                if global_ids.contains(id.as_str()) {
+                    errors.push(format!("{} owns global invariant {id}", unit.id));
+                }
+                if let Some(previous) = owners.insert(id, unit.id.as_str()) {
+                    errors.push(format!(
+                        "contract {id} has ambiguous owners {previous} and {}",
+                        unit.id
+                    ));
+                }
+                if !unit.completion_evidence.contains(id) {
+                    errors.push(format!(
+                        "{} completion evidence does not identify owned contract {id}",
+                        unit.id
+                    ));
+                }
+            }
+            for id in &unit.downstream_contract_ids {
+                if !contract_ids.contains(id.as_str()) {
+                    errors.push(format!(
+                        "{} references unknown downstream contract {id}",
+                        unit.id
+                    ));
+                } else if unit.owned_contract_ids.iter().any(|owned| owned == id) {
+                    errors.push(format!(
+                        "{} lists owned contract {id} as downstream",
+                        unit.id
+                    ));
+                }
+            }
+            for dependency in &unit.dependencies {
+                if dependency == &unit.id || !unit_ids.contains(dependency.as_str()) {
+                    errors.push(format!("{} has invalid dependency {dependency}", unit.id));
+                }
+            }
+        }
+        for contract in &self.contracts {
+            if !global_ids.contains(contract.id.as_str())
+                && !owners.contains_key(contract.id.as_str())
+            {
+                errors.push(format!("required contract {} is unowned", contract.id));
+            }
+        }
+        if self.work_units.is_empty() {
+            errors.push("plan has no work units".to_string());
+        }
+        if dependency_cycle(&self.work_units) {
+            errors.push("work-unit dependencies contain a cycle".to_string());
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     fn activate_next_work_unit(&mut self) -> Option<String> {
@@ -591,13 +737,14 @@ impl TaskPlan {
     pub fn current_work_unit_completion_context(&self) -> Option<String> {
         let unit = self.current_work_unit()?;
         Some(format!(
-            "work_unit={} objective={} contracts={:?} completion_evidence={} requires_candidate_change={} invariants={:?}",
+            "work_unit={} objective={} owned_contracts={:?} downstream_contracts={:?} completion_evidence={} requires_candidate_change={} global_invariants={:?}",
             unit.id,
             unit.objective,
-            unit.contract_ids,
+            unit.owned_contract_ids,
+            unit.downstream_contract_ids,
             unit.completion_evidence,
             unit.requires_candidate_change,
-            unit.invariants,
+            unit.global_invariant_ids,
         ))
     }
 
@@ -638,8 +785,8 @@ impl TaskPlan {
 
     pub fn reconcile_work_units(&mut self) {
         for unit in &mut self.work_units {
-            if !unit.contract_ids.is_empty()
-                && unit.contract_ids.iter().all(|id| {
+            if !unit.owned_contract_ids.is_empty()
+                && unit.owned_contract_ids.iter().all(|id| {
                     self.contracts.iter().any(|contract| {
                         contract.id == *id && contract.status == ContractStatus::Verified
                     })
@@ -731,11 +878,11 @@ impl TaskPlan {
             contract.status = ContractStatus::Unresolved;
             contract.evidence = truncate(&gap.reason, MAX_STATEMENT_BYTES);
         }
-        if let Some(unit) = self
-            .work_units
-            .iter_mut()
-            .find(|unit| unit.contract_ids.iter().any(|id| id == &gap.contract_id))
-        {
+        if let Some(unit) = self.work_units.iter_mut().find(|unit| {
+            unit.owned_contract_ids
+                .iter()
+                .any(|id| id == &gap.contract_id)
+        }) {
             unit.status = WorkUnitStatus::Reopened;
             unit.evidence = truncate(&gap.reason, MAX_STATEMENT_BYTES);
             self.current_work_unit_id = Some(unit.id.clone());
@@ -818,7 +965,7 @@ impl TaskPlan {
         if let Some(unit) = self
             .work_units
             .iter_mut()
-            .find(|unit| unit.contract_ids.iter().any(|id| id == item_id))
+            .find(|unit| unit.owned_contract_ids.iter().any(|id| id == item_id))
         {
             unit.status = WorkUnitStatus::Reopened;
             unit.evidence = truncate(reason, MAX_STATEMENT_BYTES);
@@ -917,7 +1064,7 @@ impl TaskPlan {
                 output.push_str(" [");
                 output.push_str(work_unit_status_label(&unit.status));
                 output.push_str("]; contracts: ");
-                output.push_str(&unit.contract_ids.join(", "));
+                output.push_str(&unit.owned_contract_ids.join(", "));
                 if !unit.dependencies.is_empty() {
                     output.push_str("; depends on ");
                     output.push_str(&unit.dependencies.join(", "));
@@ -1003,9 +1150,14 @@ impl TaskPlan {
             output.push_str(&unit.objective);
             output.push_str(" [");
             output.push_str(work_unit_status_label(&unit.status));
-            output.push_str("]\n  advances contracts: ");
-            output.push_str(&unit.contract_ids.join(", "));
+            output.push_str("]\n  owns contracts: ");
+            output.push_str(&unit.owned_contract_ids.join(", "));
             output.push('\n');
+            if !unit.downstream_contract_ids.is_empty() {
+                output.push_str("  downstream contracts: ");
+                output.push_str(&unit.downstream_contract_ids.join(", "));
+                output.push('\n');
+            }
             if !unit.dependencies.is_empty() {
                 output.push_str("  completed dependencies: ");
                 output.push_str(&unit.dependencies.join(", "));
@@ -1122,6 +1274,8 @@ fn infer_verification_boundary(expectation: &str) -> VerificationBoundary {
         "interactive",
         "stdin",
         "stdout",
+        "json",
+        "text output",
         "terminal",
         "prompt",
         "process",
@@ -1200,22 +1354,90 @@ fn clauses(request: &str) -> Vec<String> {
 }
 
 fn expand_requirement_clause(clause: &str) -> Vec<String> {
-    let Some((prefix, list)) = clause.split_once(" for ") else {
-        return vec![clause.to_string()];
-    };
-    let entries = list
-        .split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(|entry| entry.strip_prefix("and ").unwrap_or(entry))
-        .collect::<Vec<_>>();
-    if entries.len() < 2 {
-        return vec![clause.to_string()];
+    let mut segments = split_compound_clause(clause);
+    let mut expanded = Vec::new();
+    while let Some(segment) = segments.pop() {
+        let Some((prefix, list)) = segment.split_once(" for ") else {
+            expanded.push(segment);
+            continue;
+        };
+        let entries = list
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| entry.strip_prefix("and ").unwrap_or(entry))
+            .collect::<Vec<_>>();
+        if entries.len() < 2 {
+            expanded.push(segment);
+        } else {
+            expanded.extend(
+                entries
+                    .into_iter()
+                    .map(|entry| format!("{prefix} for {entry}")),
+            );
+        }
     }
-    entries
-        .into_iter()
-        .map(|entry| format!("{prefix} for {entry}"))
-        .collect()
+    expanded.reverse();
+    expanded
+}
+
+fn split_compound_clause(clause: &str) -> Vec<String> {
+    let mut segments = vec![clause.trim().to_string()];
+    for delimiter in [";", " while "] {
+        let mut next = Vec::new();
+        for segment in segments {
+            if let Some(index) = segment.find(delimiter) {
+                let left = segment[..index].trim();
+                let right = segment[index + delimiter.len()..].trim();
+                if left.len() > 8 && right.len() > 8 {
+                    next.push(left.to_string());
+                    next.push(right.to_string());
+                } else {
+                    next.push(segment);
+                }
+            } else {
+                next.push(segment);
+            }
+        }
+        segments = next;
+    }
+    let mut next = Vec::new();
+    for segment in segments {
+        let mut remainder = segment.as_str();
+        while let Some(index) = remainder.find(" and ") {
+            let right = remainder[index + 5..].trim_start();
+            let is_boundary = [
+                "validates ",
+                "reports ",
+                "preserves ",
+                "preserving ",
+                "avoids ",
+                "avoiding ",
+                "supports ",
+                "emits ",
+                "handles ",
+                "prevents ",
+                "does not ",
+                "keeps ",
+                "includes ",
+            ]
+            .iter()
+            .any(|prefix| right.starts_with(prefix));
+            if !is_boundary {
+                break;
+            }
+            let left = remainder[..index].trim();
+            if left.len() <= 8 {
+                break;
+            }
+            next.push(left.to_string());
+            remainder = right;
+        }
+        if !remainder.is_empty() {
+            next.push(remainder.to_string());
+        }
+    }
+    next
 }
 
 fn contains_constraint_language(clause: &str) -> bool {
@@ -1232,6 +1454,60 @@ fn contains_constraint_language(clause: &str) -> bool {
     ]
     .iter()
     .any(|word| lower.contains(word))
+}
+
+fn is_global_invariant(clause: &str) -> bool {
+    let lower = clause.to_ascii_lowercase();
+    let behavior_bearing = [
+        "validate", "report", "diagnos", "emit", "handle", "support", "return", "render", "presen",
+    ]
+    .iter()
+    .any(|term| lower.contains(term));
+    !behavior_bearing
+        && (lower.contains("compatib")
+            || lower.contains("preserv")
+            || lower.contains("unrelated")
+            || lower.contains("secret")
+            || lower.contains("credential")
+            || (lower.contains("workspace") && lower.contains("mutat"))
+            || lower.contains("without changing"))
+}
+
+fn dependency_cycle(units: &[WorkUnit]) -> bool {
+    fn visit(
+        id: &str,
+        by_id: &BTreeMap<&str, &WorkUnit>,
+        visiting: &mut BTreeSet<String>,
+        visited: &mut BTreeSet<String>,
+    ) -> bool {
+        if visiting.contains(id) {
+            return true;
+        }
+        if visited.contains(id) {
+            return false;
+        }
+        let Some(unit) = by_id.get(id) else {
+            return false;
+        };
+        visiting.insert(id.to_string());
+        let cycle = unit
+            .dependencies
+            .iter()
+            .any(|dependency| visit(dependency, by_id, visiting, visited));
+        visiting.remove(id);
+        visited.insert(id.to_string());
+        cycle
+    }
+
+    let by_id = units
+        .iter()
+        .map(|unit| (unit.id.as_str(), unit))
+        .collect::<BTreeMap<_, _>>();
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    units
+        .iter()
+        .any(|unit| visit(unit.id.as_str(), &by_id, &mut visiting, &mut visited))
 }
 
 fn status_label(status: &PlanItemStatus) -> &'static str {
@@ -1619,10 +1895,10 @@ mod tests {
         let target = plan
             .work_units
             .iter()
-            .find(|unit| unit.contract_ids.iter().any(|id| id == "contract-2"))
+            .find(|unit| unit.owned_contract_ids.iter().any(|id| id == "contract-3"))
             .map(|unit| unit.id.clone())
-            .expect("compatibility unit");
-        plan.reopen_for_evaluation("contract-2", "legacy caller is not covered");
+            .expect("error-path unit");
+        plan.reopen_for_evaluation("contract-3", "invalid input is not covered");
         assert_eq!(plan.current_work_unit_id.as_deref(), Some(target.as_str()));
         assert_eq!(
             plan.work_units
@@ -1641,5 +1917,102 @@ mod tests {
         assert!(!plan.request_replan("third replan would expand without bound"));
         assert_eq!(plan.replan_count, 2);
         assert!(!plan.work_units.is_empty());
+    }
+
+    #[test]
+    fn small_task_keeps_one_explicitly_owned_unit() {
+        let plan = TaskPlan::from_request("Fix the parser output.", Some("src/parser.rs"));
+        assert_eq!(plan.work_units.len(), 1);
+        assert!(plan.validate_executable().is_ok());
+        assert!(!plan.work_units[0].owned_contract_ids.is_empty());
+        assert!(plan.work_units[0].downstream_contract_ids.is_empty());
+        assert!(plan.work_units[0]
+            .completion_evidence
+            .contains(&plan.work_units[0].owned_contract_ids[0]));
+    }
+
+    #[test]
+    fn medium_boundaries_have_owned_and_downstream_contracts() {
+        let plan = TaskPlan::from_request(
+            "Implement core behavior. Expose CLI process behavior. Preserve compatibility. Avoid unrelated changes.",
+            Some("src/lib.rs\nsrc/main.rs\ntests/lib.rs"),
+        );
+        assert!(plan.work_units.len() >= 2);
+        assert!(plan.validate_executable().is_ok());
+        assert!(!plan.global_invariant_ids.is_empty());
+        assert!(!plan.work_units[0].owned_contract_ids.is_empty());
+        assert!(!plan.work_units[0].downstream_contract_ids.is_empty());
+        assert!(plan.work_units[0]
+            .objective
+            .contains("Establish the owned behavior boundary"));
+    }
+
+    #[test]
+    fn malformed_ownership_is_rejected_actionably() {
+        let mut unowned = TaskPlan::from_request(
+            "Implement core behavior. Expose CLI process behavior.",
+            Some("src/lib.rs\nsrc/main.rs"),
+        );
+        unowned.work_units[0].owned_contract_ids.clear();
+        let errors = unowned
+            .validate_executable()
+            .expect_err("unowned WU should fail");
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("no owned contracts")));
+
+        let mut duplicate = TaskPlan::from_request(
+            "Implement core behavior. Expose CLI process behavior.",
+            Some("src/lib.rs\nsrc/main.rs"),
+        );
+        let id = duplicate.work_units[0].owned_contract_ids[0].clone();
+        duplicate.work_units[1].owned_contract_ids.push(id.clone());
+        duplicate.work_units[1].completion_evidence.push_str("; ");
+        duplicate.work_units[1].completion_evidence.push_str(&id);
+        let errors = duplicate
+            .validate_executable()
+            .expect_err("duplicate owner should fail");
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("ambiguous owners")));
+
+        let mut cyclic = TaskPlan::from_request(
+            "Implement core behavior. Expose CLI process behavior.",
+            Some("src/lib.rs\nsrc/main.rs"),
+        );
+        cyclic.work_units[0].dependencies = vec![cyclic.work_units[1].id.clone()];
+        let errors = cyclic.validate_executable().expect_err("cycle should fail");
+        assert!(errors.iter().any(|error| error.contains("cycle")));
+
+        let mut bad_downstream = TaskPlan::from_request("Implement core behavior.", None);
+        bad_downstream.work_units[0]
+            .downstream_contract_ids
+            .push("missing-contract".to_string());
+        let errors = bad_downstream
+            .validate_executable()
+            .expect_err("unknown downstream contract should fail");
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("unknown downstream contract")));
+
+        let mut generic = TaskPlan::from_request("Implement core behavior.", None);
+        generic.work_units[0].objective =
+            "Deliver the first coherent implementation outcome for the requested behavior."
+                .to_string();
+        let errors = generic
+            .validate_executable()
+            .expect_err("generic objective should fail");
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("generic planner objective")));
+
+        let mut weak_evidence = TaskPlan::from_request("Implement core behavior.", None);
+        weak_evidence.work_units[0].completion_evidence = "meaningful mutation".to_string();
+        let errors = weak_evidence
+            .validate_executable()
+            .expect_err("unrelated evidence should fail");
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("completion evidence")));
     }
 }
