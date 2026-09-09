@@ -13224,6 +13224,39 @@ impl CliToolExecutor {
 }
 
 impl CliToolExecutor {
+    fn run_explicit_checkpoint_candidate_checks(
+        &mut self,
+        status: &str,
+    ) -> Result<(Option<bool>, Option<String>), ToolError> {
+        if !matches!(status, "unit_complete" | "bounded_continue")
+            || self.candidate_review_roots().is_none()
+        {
+            return Ok((None, None));
+        }
+        let candidate_changed = self
+            .tool_registry
+            .candidate_has_changes()
+            .map(|changed| changed.unwrap_or(true))
+            .map_err(ToolError::new)?;
+        benchmark_telemetry::work_unit_checkpoint_candidate_state(candidate_changed);
+        if !candidate_changed {
+            return Ok((Some(false), None));
+        }
+        let diagnostics = self
+            .tool_registry
+            .candidate_development_check(&json!({
+                "checks": ["format", "test", "clippy"],
+                "timeout_ms": 120_000_u64,
+            }))
+            .map_err(|error| {
+                benchmark_telemetry::candidate_check_error(&error);
+                ToolError::new(error)
+            })?;
+        benchmark_telemetry::candidate_check_result(&diagnostics);
+        benchmark_telemetry::work_unit_checkpoint_refresh_evidence();
+        Ok((Some(true), Some(diagnostics)))
+    }
+
     #[allow(clippy::too_many_lines)]
     fn execute_candidate_checkpoint(&mut self, value: &Value) -> Result<String, ToolError> {
         let status = value
@@ -13241,27 +13274,15 @@ impl CliToolExecutor {
         if matches!(status, "blocked" | "needs_user_input") {
             benchmark_telemetry::blocked_checkpoint_requested(&message);
         }
+        let (candidate_changed_at_checkpoint, candidate_diagnostics) =
+            self.run_explicit_checkpoint_candidate_checks(status)?;
         if status == "unit_complete" && self.candidate_review_roots().is_some() {
-            let candidate_changed = self
-                .tool_registry
-                .candidate_has_changes()
-                .map(|changed| changed.unwrap_or(true))
-                .map_err(ToolError::new)?;
-            benchmark_telemetry::work_unit_checkpoint_candidate_state(candidate_changed);
+            let candidate_changed = candidate_changed_at_checkpoint.unwrap_or(true);
             if candidate_changed {
-                let diagnostics = self
-                    .tool_registry
-                    .candidate_development_check(&json!({
-                        "checks": ["format", "test", "clippy"],
-                        "timeout_ms": 120_000_u64,
-                    }))
-                    .map_err(|error| {
-                        benchmark_telemetry::candidate_check_error(&error);
-                        ToolError::new(error)
-                    })?;
-                benchmark_telemetry::candidate_check_result(&diagnostics);
-                benchmark_telemetry::work_unit_checkpoint_refresh_evidence();
-                let report = serde_json::from_str::<Value>(&diagnostics).ok();
+                let diagnostics = candidate_diagnostics.as_deref().ok_or_else(|| {
+                    ToolError::new("candidate checkpoint checks returned no diagnostics")
+                })?;
+                let report = serde_json::from_str::<Value>(diagnostics).ok();
                 let check_status = report
                     .as_ref()
                     .and_then(|report| report.get("status"))
@@ -13366,12 +13387,18 @@ impl CliToolExecutor {
             WriterCheckpoint::NeedsUserInput { .. } => "needs_user_input",
         };
         self.pending_checkpoint = Some(checkpoint);
-        Ok(json!({
+        let mut response = json!({
             "accepted": true,
             "status": response_status,
             "message": "The orchestrator will now handle this checkpoint.",
-        })
-        .to_string())
+        });
+        if status == "bounded_continue" {
+            if let Some(diagnostics) = candidate_diagnostics {
+                response["candidate_development_checks"] =
+                    serde_json::from_str(&diagnostics).unwrap_or(Value::String(diagnostics));
+            }
+        }
+        Ok(response.to_string())
     }
 }
 
@@ -17437,6 +17464,109 @@ mod writer_protocol_tests {
         assert!(WRITER_WORKFLOW_GUIDANCE.contains("owned contracts and invariants"));
         assert!(WRITER_WORKFLOW_GUIDANCE
             .contains("Do not treat work-unit completion as semantic approval"));
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_candidate_feedback_tests {
+    use super::{CliToolExecutor, ExecutionBackend};
+    use runtime::ToolExecutor;
+    use serde_json::{json, Value};
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+    use tools::GlobalToolRegistry;
+
+    #[derive(Debug)]
+    struct CheckBackend {
+        changed: bool,
+        checks: usize,
+    }
+
+    impl ExecutionBackend for CheckBackend {
+        fn execute(&mut self, _tool_name: &str, _input: &Value) -> Result<String, String> {
+            Ok("ok".to_string())
+        }
+
+        fn candidate_development_check(&mut self, _input: &Value) -> Result<String, String> {
+            self.checks += 1;
+            Ok(json!({
+                "kind": "candidate_development_check",
+                "candidate_id": "candidate-1",
+                "candidate_id_before": "candidate-1",
+                "candidate_id_after": "candidate-1",
+                "candidate_state_unchanged": true,
+                "candidate_changed": true,
+                "status": "fail",
+                "classification": "candidate_failure",
+                "checks": [{
+                    "name": "cargo test",
+                    "status": "fail",
+                    "classification": "candidate_failure",
+                    "exit_code": 101,
+                    "stderr": "repair required"
+                }]
+            })
+            .to_string())
+        }
+
+        fn candidate_review_roots(&self) -> Option<(PathBuf, PathBuf)> {
+            Some((PathBuf::from("/baseline"), PathBuf::from("/candidate")))
+        }
+
+        fn candidate_has_changes(&mut self) -> Result<Option<bool>, String> {
+            Ok(Some(self.changed))
+        }
+    }
+
+    fn executor(backend: Arc<Mutex<CheckBackend>>) -> CliToolExecutor {
+        CliToolExecutor::new(
+            None,
+            false,
+            GlobalToolRegistry::builtin().with_execution_backend(backend),
+            None,
+        )
+    }
+
+    #[test]
+    fn bounded_continue_checks_changed_candidate_and_returns_feedback() {
+        let backend = Arc::new(Mutex::new(CheckBackend {
+            changed: true,
+            checks: 0,
+        }));
+        let mut executor = executor(Arc::clone(&backend));
+
+        let output = executor
+            .execute_candidate_checkpoint(&json!({
+                "status": "bounded_continue",
+                "message": "repair the candidate",
+            }))
+            .expect("bounded continuation should be accepted");
+        let output: Value = serde_json::from_str(&output).expect("checkpoint response JSON");
+
+        assert_eq!(output["status"], "bounded_continue");
+        assert_eq!(output["candidate_development_checks"]["status"], "fail");
+        assert_eq!(backend.lock().expect("backend lock").checks, 1);
+    }
+
+    #[test]
+    fn bounded_continue_does_not_check_unchanged_candidate() {
+        let backend = Arc::new(Mutex::new(CheckBackend {
+            changed: false,
+            checks: 0,
+        }));
+        let mut executor = executor(Arc::clone(&backend));
+
+        let output = executor
+            .execute_candidate_checkpoint(&json!({
+                "status": "bounded_continue",
+                "message": "find the missing fact",
+            }))
+            .expect("bounded continuation should be accepted");
+        let output: Value = serde_json::from_str(&output).expect("checkpoint response JSON");
+
+        assert_eq!(output["status"], "bounded_continue");
+        assert!(output.get("candidate_development_checks").is_none());
+        assert_eq!(backend.lock().expect("backend lock").checks, 0);
     }
 }
 
