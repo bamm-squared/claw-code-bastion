@@ -5292,7 +5292,7 @@ impl LiveCli {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
         let frozen_plan = load_frozen_plan_from_env()?;
-        let cwd = env::current_dir()?;
+        let cwd = repository_workspace_root()?;
         let config = ConfigLoader::default_for(&cwd).load()?;
         let model_pool = model_router::ModelPool::from_runtime_config(&config, &model);
         let explicit_writer_profile = explicit_profile_for_model(&model_pool, &model)?;
@@ -8788,15 +8788,42 @@ fn routing_scope_count(paths: &[String]) -> usize {
     roots.len()
 }
 
+fn repository_workspace_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    Ok(repository_root_for_cwd(&cwd).unwrap_or(cwd))
+}
+
+fn repository_root_for_cwd(cwd: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8(output.stdout).ok()?;
+    fs::canonicalize(root.trim()).ok()
+}
+
 fn build_repository_context(
     task: &str,
+    retained_backend: Option<&Arc<Mutex<dyn ExecutionBackend>>>,
+) -> Option<ContextSelection> {
+    let cwd = env::current_dir().ok()?;
+    build_repository_context_at(task, &cwd, retained_backend)
+}
+
+fn build_repository_context_at(
+    task: &str,
+    cwd: &Path,
     retained_backend: Option<&Arc<Mutex<dyn ExecutionBackend>>>,
 ) -> Option<ContextSelection> {
     if !benchmark_telemetry::graph_context_enabled() {
         return None;
     }
     benchmark_telemetry::repository_intelligence_attempted();
-    let root = env::current_dir().ok()?;
+    let root = repository_root_for_cwd(cwd).unwrap_or_else(|| cwd.to_path_buf());
     let private = is_private_mode();
     let built = RepositoryIndex::build(&root, None, AnalysisConfig::default(), private).ok()?;
     let mut index = RepositoryIndex {
@@ -8836,12 +8863,12 @@ fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 fn current_session_store() -> Result<runtime::SessionStore, Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
+    let cwd = repository_workspace_root()?;
     runtime::SessionStore::from_cwd(&cwd).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
 fn new_cli_session() -> Result<Session, Box<dyn std::error::Error>> {
-    Ok(Session::new().with_workspace_root(env::current_dir()?))
+    Ok(Session::new().with_workspace_root(repository_workspace_root()?))
 }
 
 fn create_managed_session_handle(
@@ -10504,7 +10531,7 @@ fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
 }
 
 fn build_runtime_plugin_state() -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
+    let cwd = repository_workspace_root()?;
     let loader = ConfigLoader::default_for(&cwd);
     let runtime_config = loader.load()?;
     build_runtime_plugin_state_with_loader(&cwd, &loader, &runtime_config)
@@ -11147,7 +11174,7 @@ fn build_runtime_with_plugin_state_profile(
 fn build_runtime_plugin_state_with_backend(
     execution_backend: Option<Arc<Mutex<dyn ExecutionBackend>>>,
 ) -> Result<RuntimePluginState, Box<dyn std::error::Error>> {
-    let cwd = env::current_dir()?;
+    let cwd = repository_workspace_root()?;
     let loader = ConfigLoader::default_for(&cwd);
     let runtime_config = loader.load()?;
     build_runtime_plugin_state_with_loader_and_backend(
@@ -18108,6 +18135,64 @@ mod frozen_plan_identity_tests {
         let resumed = planning_artifact_hash(&plan, context);
         assert_eq!(audited, resumed);
         assert!(!audited.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod repository_cwd_identity_tests {
+    use super::{build_repository_context_at, planning_artifact_hash, repository_root_for_cwd};
+    use std::env;
+    use std::path::Path;
+
+    const REQUEST: &str = "Improve /doctor so it validates effective merged configuration and emits actionable, secret-safe text and JSON diagnostics while preserving existing checks and avoiding workspace mutation.";
+
+    #[test]
+    fn repository_root_is_stable_from_nested_workspace() {
+        let invocation = env::current_dir().expect("test should have a current directory");
+        let repository = repository_root_for_cwd(&invocation).expect("test runs in a git repo");
+        let nested = repository.join("rust");
+        assert!(
+            nested.is_dir(),
+            "fixture repository should have a rust workspace"
+        );
+        assert_eq!(
+            repository_root_for_cwd(&repository),
+            Some(repository.clone())
+        );
+        assert_eq!(repository_root_for_cwd(&nested), Some(repository));
+    }
+
+    #[test]
+    fn repository_context_and_frozen_hash_are_cwd_independent() {
+        let invocation = env::current_dir().expect("test should have a current directory");
+        let repository = repository_root_for_cwd(&invocation).expect("test runs in a git repo");
+        let nested = repository.join("rust");
+        let root_selection = build_repository_context_at(REQUEST, &repository, None)
+            .expect("root planning should produce repository context");
+        let nested_selection = build_repository_context_at(REQUEST, &nested, None)
+            .expect("nested planning should produce repository context");
+        assert_eq!(root_selection.text, nested_selection.text);
+        assert_eq!(root_selection.seed_files, nested_selection.seed_files);
+        assert_eq!(
+            root_selection.selected_files,
+            nested_selection.selected_files
+        );
+        assert_eq!(
+            root_selection.surface_guidance,
+            nested_selection.surface_guidance
+        );
+
+        let mut plan =
+            crate::task_plan::TaskPlan::from_request(REQUEST, Some(&root_selection.text));
+        plan.set_repository_scope(
+            &root_selection.selected_files,
+            &root_selection.seed_files,
+            &root_selection.surface_guidance,
+        );
+        let root_hash = planning_artifact_hash(&plan, &root_selection.text);
+        let nested_hash = planning_artifact_hash(&plan, &nested_selection.text);
+        assert_eq!(root_hash, nested_hash);
+        assert!(Path::new(&root_selection.seed_files[0]).is_relative());
     }
 }
 
