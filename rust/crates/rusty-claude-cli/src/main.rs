@@ -11156,7 +11156,6 @@ fn render_escalation_package(package: &model_router::EscalationPackage) -> Strin
 impl ApiClient for AnthropicRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
-        benchmark_telemetry::provider_call();
         benchmark_telemetry::model_turn();
         if let Some(progress_reporter) = &self.progress_reporter {
             progress_reporter.mark_model_phase();
@@ -11201,9 +11200,24 @@ impl ApiClient for AnthropicRuntimeClient {
                 let mut provider_recoveries = 0;
 
                 for attempt in 1..=max_attempts {
+                    benchmark_telemetry::provider_call();
                     let result = self
                         .consume_stream(&message_request, is_post_tool && attempt == 1)
                         .await;
+                    match &result {
+                        Ok(_) => benchmark_telemetry::provider_call_finished("completed", None),
+                        Err(error) => {
+                            let status = if error.to_string().contains("timeout") {
+                                "timed_out"
+                            } else {
+                                "failed"
+                            };
+                            benchmark_telemetry::provider_call_finished(
+                                status,
+                                Some(&error.to_string()),
+                            );
+                        }
+                    }
                     match result {
                         Ok(events) => return Ok(events),
                         Err(error)
@@ -11252,17 +11266,6 @@ impl ApiClient for AnthropicRuntimeClient {
                 )))
             })
         });
-        match &result {
-            Ok(_) => benchmark_telemetry::provider_call_finished("completed", None),
-            Err(error) => {
-                let status = if error.to_string().contains("timeout") {
-                    "timed_out"
-                } else {
-                    "failed"
-                };
-                benchmark_telemetry::provider_call_finished(status, Some(&error.to_string()));
-            }
-        }
         result
     }
 
@@ -11491,6 +11494,8 @@ impl AnthropicRuntimeClient {
             return Ok(events);
         }
 
+        benchmark_telemetry::provider_call_finished("completed", None);
+        benchmark_telemetry::provider_call();
         let response = self
             .client
             .send_message(&MessageRequest {
