@@ -100,6 +100,8 @@ enum Scenario {
     PluginToolRoundtrip,
     AutoCompactTriggered,
     TokenCostReporting,
+    CliCheckpointRepair,
+    CliCheckpointNoAllowance,
 }
 
 impl Scenario {
@@ -117,6 +119,8 @@ impl Scenario {
             "plugin_tool_roundtrip" => Some(Self::PluginToolRoundtrip),
             "auto_compact_triggered" => Some(Self::AutoCompactTriggered),
             "token_cost_reporting" => Some(Self::TokenCostReporting),
+            "cli_checkpoint_repair" => Some(Self::CliCheckpointRepair),
+            "cli_checkpoint_no_allowance" => Some(Self::CliCheckpointNoAllowance),
             _ => None,
         }
     }
@@ -135,6 +139,8 @@ impl Scenario {
             Self::PluginToolRoundtrip => "plugin_tool_roundtrip",
             Self::AutoCompactTriggered => "auto_compact_triggered",
             Self::TokenCostReporting => "token_cost_reporting",
+            Self::CliCheckpointRepair => "cli_checkpoint_repair",
+            Self::CliCheckpointNoAllowance => "cli_checkpoint_no_allowance",
         }
     }
 }
@@ -294,6 +300,51 @@ fn tool_results_by_name(request: &MessageRequest) -> HashMap<String, (String, bo
         }
     }
     results
+}
+
+fn tool_use_count(request: &MessageRequest, name: &str) -> usize {
+    request
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter(|block| matches!(block, InputContentBlock::ToolUse { name: tool_name, .. } if tool_name == name))
+        .count()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointRepairStep {
+    Read,
+    IntroduceDefect,
+    RequestContinuation,
+    Repair,
+    Complete,
+    Stop,
+}
+
+fn checkpoint_repair_step(request: &MessageRequest) -> CheckpointRepairStep {
+    let reads = tool_use_count(request, "read_file");
+    let edits = tool_use_count(request, "edit_file");
+    let checkpoints = tool_use_count(request, "candidate_checkpoint");
+    match (reads, edits, checkpoints) {
+        (0, 0, 0) => CheckpointRepairStep::Read,
+        (1, 0, 0) => CheckpointRepairStep::IntroduceDefect,
+        (1, 1, 0) => CheckpointRepairStep::RequestContinuation,
+        (1, 1, 1) => CheckpointRepairStep::Repair,
+        (1, 2, 1) => CheckpointRepairStep::Complete,
+        _ => CheckpointRepairStep::Stop,
+    }
+}
+
+fn checkpoint_no_allowance_step(request: &MessageRequest) -> CheckpointRepairStep {
+    let reads = tool_use_count(request, "read_file");
+    let edits = tool_use_count(request, "edit_file");
+    let checkpoints = tool_use_count(request, "candidate_checkpoint");
+    match (reads, edits, checkpoints) {
+        (0, 0, 0) => CheckpointRepairStep::Read,
+        (1, 0, 0) => CheckpointRepairStep::IntroduceDefect,
+        (1, 1, 0 | 1) => CheckpointRepairStep::RequestContinuation,
+        _ => CheckpointRepairStep::Stop,
+    }
 }
 
 fn flatten_tool_result_content(content: &[api::ToolResultContentBlock]) -> String {
@@ -464,6 +515,73 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
         Scenario::TokenCostReporting => {
             final_text_sse_with_usage("token cost reporting parity complete.", 1_000, 500)
         }
+        Scenario::CliCheckpointRepair => match checkpoint_repair_step(request) {
+            CheckpointRepairStep::Read => tool_use_sse(
+                "toolu_checkpoint_read",
+                "read_file",
+                &[r#"{"path":"src/lib.rs"}"#],
+            ),
+            CheckpointRepairStep::IntroduceDefect => tool_use_sse(
+                "toolu_checkpoint_bad_edit",
+                "edit_file",
+                &[
+                    r#"{"path":"src/lib.rs","old_string":"pub fn value() -> i32 { 1 }\n","new_string":"pub fn value() -> i32 {\n","replace_all":false}"#,
+                ],
+            ),
+            CheckpointRepairStep::RequestContinuation => tool_use_sse(
+                "toolu_checkpoint_continue",
+                "candidate_checkpoint",
+                &[
+                    r#"{"status":"bounded_continue","message":"Repair the candidate defect and rerun the development checks."}"#,
+                ],
+            ),
+            CheckpointRepairStep::Repair => tool_use_sse(
+                "toolu_checkpoint_repair",
+                "edit_file",
+                &[
+                    r#"{"path":"src/lib.rs","old_string":"pub fn value() -> i32 {\n","new_string":"pub fn value() -> i32 {\n    2\n}\n","replace_all":false}"#,
+                ],
+            ),
+            CheckpointRepairStep::Complete => tool_use_sse(
+                "toolu_checkpoint_complete",
+                "candidate_checkpoint",
+                &[
+                    r#"{"status":"unit_complete","message":"The candidate is repaired and development checks pass."}"#,
+                ],
+            ),
+            CheckpointRepairStep::Stop => tool_use_sse(
+                "toolu_checkpoint_stop",
+                "candidate_checkpoint",
+                &[r#"{"status":"blocked","message":"The scripted WU boundary has been reached."}"#],
+            ),
+        },
+        Scenario::CliCheckpointNoAllowance => match checkpoint_no_allowance_step(request) {
+            CheckpointRepairStep::Read => tool_use_sse(
+                "toolu_no_allowance_read",
+                "read_file",
+                &[r#"{"path":"src/lib.rs"}"#],
+            ),
+            CheckpointRepairStep::IntroduceDefect => tool_use_sse(
+                "toolu_no_allowance_bad_edit",
+                "edit_file",
+                &[
+                    r#"{"path":"src/lib.rs","old_string":"pub fn value() -> i32 { 1 }\n","new_string":"pub fn value() -> i32 {\n","replace_all":false}"#,
+                ],
+            ),
+            CheckpointRepairStep::RequestContinuation => tool_use_sse(
+                "toolu_no_allowance_continue",
+                "candidate_checkpoint",
+                &[
+                    r#"{"status":"bounded_continue","message":"Repair the candidate defect and rerun the development checks."}"#,
+                ],
+            ),
+            CheckpointRepairStep::Stop => final_text_sse(
+                "the scripted no-allowance replay should terminate before this response",
+            ),
+            CheckpointRepairStep::Repair | CheckpointRepairStep::Complete => {
+                final_text_sse("unexpected no-allowance replay state")
+            }
+        },
     }
 }
 
@@ -634,6 +752,99 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
             1_000,
             500,
         ),
+        Scenario::CliCheckpointRepair => match checkpoint_repair_step(request) {
+            CheckpointRepairStep::Read => tool_message_response(
+                "msg_checkpoint_read",
+                "toolu_checkpoint_read",
+                "read_file",
+                json!({"path": "src/lib.rs"}),
+            ),
+            CheckpointRepairStep::IntroduceDefect => tool_message_response(
+                "msg_checkpoint_bad_edit",
+                "toolu_checkpoint_bad_edit",
+                "edit_file",
+                json!({
+                    "path": "src/lib.rs",
+                    "old_string": "pub fn value() -> i32 { 1 }\n",
+                    "new_string": "pub fn value() -> i32 {\n",
+                    "replace_all": false
+                }),
+            ),
+            CheckpointRepairStep::RequestContinuation => tool_message_response(
+                "msg_checkpoint_continue",
+                "toolu_checkpoint_continue",
+                "candidate_checkpoint",
+                json!({
+                    "status": "bounded_continue",
+                    "message": "Repair the candidate defect and rerun the development checks."
+                }),
+            ),
+            CheckpointRepairStep::Repair => tool_message_response(
+                "msg_checkpoint_repair",
+                "toolu_checkpoint_repair",
+                "edit_file",
+                json!({
+                    "path": "src/lib.rs",
+                    "old_string": "pub fn value() -> i32 {\n",
+                    "new_string": "pub fn value() -> i32 {\n    2\n}\n",
+                    "replace_all": false
+                }),
+            ),
+            CheckpointRepairStep::Complete => tool_message_response(
+                "msg_checkpoint_complete",
+                "toolu_checkpoint_complete",
+                "candidate_checkpoint",
+                json!({
+                    "status": "unit_complete",
+                    "message": "The candidate is repaired and development checks pass."
+                }),
+            ),
+            CheckpointRepairStep::Stop => tool_message_response(
+                "msg_checkpoint_stop",
+                "toolu_checkpoint_stop",
+                "candidate_checkpoint",
+                json!({
+                    "status": "blocked",
+                    "message": "The scripted WU boundary has been reached."
+                }),
+            ),
+        },
+        Scenario::CliCheckpointNoAllowance => match checkpoint_no_allowance_step(request) {
+            CheckpointRepairStep::Read => tool_message_response(
+                "msg_no_allowance_read",
+                "toolu_no_allowance_read",
+                "read_file",
+                json!({"path": "src/lib.rs"}),
+            ),
+            CheckpointRepairStep::IntroduceDefect => tool_message_response(
+                "msg_no_allowance_bad_edit",
+                "toolu_no_allowance_bad_edit",
+                "edit_file",
+                json!({
+                    "path": "src/lib.rs",
+                    "old_string": "pub fn value() -> i32 { 1 }\n",
+                    "new_string": "pub fn value() -> i32 {\n",
+                    "replace_all": false
+                }),
+            ),
+            CheckpointRepairStep::RequestContinuation => tool_message_response(
+                "msg_no_allowance_continue",
+                "toolu_no_allowance_continue",
+                "candidate_checkpoint",
+                json!({
+                    "status": "bounded_continue",
+                    "message": "Repair the candidate defect and rerun the development checks."
+                }),
+            ),
+            CheckpointRepairStep::Stop => text_message_response(
+                "msg_no_allowance_stop",
+                "the scripted no-allowance replay should terminate before this response",
+            ),
+            CheckpointRepairStep::Repair | CheckpointRepairStep::Complete => text_message_response(
+                "msg_no_allowance_unexpected",
+                "unexpected no-allowance replay state",
+            ),
+        },
     }
 }
 
@@ -651,6 +862,8 @@ fn request_id_for(scenario: Scenario) -> &'static str {
         Scenario::PluginToolRoundtrip => "req_plugin_tool_roundtrip",
         Scenario::AutoCompactTriggered => "req_auto_compact_triggered",
         Scenario::TokenCostReporting => "req_token_cost_reporting",
+        Scenario::CliCheckpointRepair => "req_cli_checkpoint_repair",
+        Scenario::CliCheckpointNoAllowance => "req_cli_checkpoint_no_allowance",
     }
 }
 

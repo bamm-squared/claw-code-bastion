@@ -366,6 +366,249 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
     }
 }
 
+#[test]
+#[allow(clippy::too_many_lines)]
+fn cli_text_and_json_share_checkpoint_repair_lifecycle() {
+    const TASK: &str = "PARITY_SCENARIO:cli_checkpoint_repair Implement the value behavior in src/lib.rs and expose its result through a command-facing integration while preserving existing behavior and adding focused tests. Keep the upstream implementation boundary separate from downstream presentation work.";
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let base_url = server.base_url();
+    let text_workspace = HarnessWorkspace::new(unique_temp_dir("checkpoint-repair-text"));
+    let json_workspace = HarnessWorkspace::new(unique_temp_dir("checkpoint-repair-json"));
+    text_workspace
+        .create()
+        .expect("text workspace should exist");
+    json_workspace
+        .create()
+        .expect("json workspace should exist");
+    prepare_checkpoint_repair_fixture(&text_workspace);
+    prepare_checkpoint_repair_fixture(&json_workspace);
+
+    let mut semantic_traces = Vec::new();
+    for (format, workspace) in [("text", &text_workspace), ("json", &json_workspace)] {
+        let telemetry = unique_temp_dir(&format!("checkpoint-repair-{format}-telemetry"))
+            .with_extension("json");
+        let before = runtime.block_on(server.captured_requests()).len();
+        let output = run_checkpoint_repair_case(TASK, format, workspace, &telemetry, &base_url);
+        let captured = runtime.block_on(server.captured_requests());
+        let requests = captured[before..]
+            .iter()
+            .filter(|request| request.path == "/v1/messages")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            !requests.is_empty(),
+            "{format} run should call the provider\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let trace = requests.iter().map(provider_tool_trace).collect::<Vec<_>>();
+        assert_eq!(trace[0], Vec::<String>::new());
+        assert!(trace.iter().any(|tools| {
+            tools
+                .windows(2)
+                .any(|pair| pair == ["candidate_checkpoint", "edit_file"])
+        }));
+        assert!(requests.iter().any(|request| {
+            request.raw_body.contains("candidate-development-check")
+                || request.raw_body.contains("incomplete")
+                || request.raw_body.contains("failed")
+        }));
+        let telemetry_value: Value =
+            serde_json::from_slice(&fs::read(&telemetry).expect("telemetry artifact should exist"))
+                .expect("telemetry should be valid JSON");
+        assert!(telemetry_value["work_unit_checkpoints"]
+            .as_array()
+            .is_some_and(|checkpoints| {
+                checkpoints
+                    .iter()
+                    .any(|checkpoint| checkpoint["continuation_grants"] == 1)
+            }));
+        assert!(telemetry_value["candidate_check_evidence"]
+            .as_array()
+            .is_some_and(|checks| checks.len() >= 6));
+        assert!(telemetry_value["lifecycle_events"]
+            .as_array()
+            .is_some_and(|events| {
+                events
+                    .iter()
+                    .any(|event| event == "work_unit_bounded_continuation_granted")
+                    && events
+                        .iter()
+                        .any(|event| event == "candidate_check_evidence_recorded")
+            }));
+        assert!(output.status.success(), "{format} output should succeed");
+        assert_eq!(
+            fs::read_to_string(workspace.root.join("src/lib.rs")).expect("fixture should read"),
+            "pub fn value() -> i32 { 1 }\n"
+        );
+        semantic_traces.push(trace);
+        let _ = fs::remove_file(telemetry);
+    }
+    assert_eq!(semantic_traces[0], semantic_traces[1]);
+
+    fs::remove_dir_all(&text_workspace.root).expect("text cleanup should succeed");
+    fs::remove_dir_all(&json_workspace.root).expect("json cleanup should succeed");
+}
+
+#[test]
+fn cli_json_checkpoint_repair_denies_exhausted_continuation() {
+    const TASK: &str = "PARITY_SCENARIO:cli_checkpoint_no_allowance Implement the value behavior in src/lib.rs and expose its result through a command-facing integration while preserving existing behavior and adding focused tests.";
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    let server = runtime
+        .block_on(MockAnthropicService::spawn())
+        .expect("mock service should start");
+    let workspace = HarnessWorkspace::new(unique_temp_dir("checkpoint-no-allowance"));
+    workspace.create().expect("workspace should exist");
+    prepare_checkpoint_repair_fixture(&workspace);
+    let telemetry = unique_temp_dir("checkpoint-no-allowance-telemetry").with_extension("json");
+    let before = runtime.block_on(server.captured_requests()).len();
+    let output =
+        run_checkpoint_repair_case(TASK, "json", &workspace, &telemetry, &server.base_url());
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let captured = runtime.block_on(server.captured_requests());
+    let requests = captured[before..]
+        .iter()
+        .filter(|request| request.path == "/v1/messages")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        requests.len(),
+        4,
+        "no extra provider turn may follow denial"
+    );
+    let telemetry_value: Value =
+        serde_json::from_slice(&fs::read(&telemetry).expect("telemetry artifact should exist"))
+            .expect("telemetry should be valid JSON");
+    assert_eq!(telemetry_value["terminal_status"], "completed");
+    assert_eq!(
+        telemetry_value["work_unit_terminal_reason"],
+        "completion_reconciliation_exhausted"
+    );
+    assert_eq!(
+        telemetry_value["work_unit_checkpoints"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    assert!(telemetry_value["work_unit_checkpoints"]
+        .as_array()
+        .is_some_and(|checkpoints| {
+            checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint["continuation_grants"] == 1)
+                && checkpoints
+                    .iter()
+                    .all(|checkpoint| checkpoint["candidate_changed"] == true)
+        }));
+    assert!(telemetry_value["candidate_check_evidence"]
+        .as_array()
+        .is_some_and(|checks| checks.len() >= 6));
+    assert!(telemetry_value["lifecycle_events"]
+        .as_array()
+        .is_some_and(|events| {
+            events
+                .iter()
+                .any(|event| event == "work_unit_bounded_continuation_granted")
+                && events
+                    .iter()
+                    .any(|event| event == "work_unit_completion_reconciliation_exhausted")
+        }));
+    assert_eq!(
+        fs::read_to_string(workspace.root.join("src/lib.rs")).expect("fixture should read"),
+        "pub fn value() -> i32 { 1 }\n"
+    );
+    let _ = fs::remove_file(telemetry);
+    fs::remove_dir_all(&workspace.root).expect("workspace cleanup should succeed");
+}
+
+fn prepare_checkpoint_repair_fixture(workspace: &HarnessWorkspace) {
+    fs::create_dir_all(workspace.root.join("src")).expect("src dir should exist");
+    fs::write(
+        workspace.root.join("Cargo.toml"),
+        "[package]\nname = \"checkpoint-repair-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("Cargo manifest should write");
+    fs::write(
+        workspace.root.join("Cargo.lock"),
+        "# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 3\n\n[[package]]\nname = \"checkpoint-repair-fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("Cargo lockfile should write");
+    fs::write(
+        workspace.root.join("src/lib.rs"),
+        "pub fn value() -> i32 { 1 }\n",
+    )
+    .expect("fixture source should write");
+    fs::create_dir_all(workspace.root.join(".claw")).expect("project config dir should exist");
+    fs::write(
+        workspace.root.join(".claw/settings.json"),
+        r#"{"routing":{"disableAutomatic":true}}"#,
+    )
+    .expect("project settings should write");
+}
+
+fn run_checkpoint_repair_case(
+    task: &str,
+    format: &str,
+    workspace: &HarnessWorkspace,
+    telemetry: &Path,
+    base_url: &str,
+) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
+    let host_home = std::env::var_os("HOME").expect("test process should have a HOME");
+    command
+        .current_dir(&workspace.root)
+        .env_clear()
+        .env("ANTHROPIC_API_KEY", "test-checkpoint-repair-key")
+        .env("ANTHROPIC_BASE_URL", base_url)
+        .env("CLAW_CONFIG_HOME", &workspace.config_home)
+        .env("CLAW_BENCH_TELEMETRY", telemetry)
+        .env(
+            "CLAW_WORKER_IMAGE",
+            "localhost/claw-bastion-runtime:source-current-20260909-liveness",
+        )
+        .env(
+            "CLAW_VALIDATOR_IMAGE",
+            "localhost/claw-bastion-validator-rust:source-current-20260909-liveness",
+        )
+        // Rootless Podman resolves its local image store from the host user
+        // environment. Keep that identity for the isolated backend while
+        // still directing Claw's config state to the fixture paths above.
+        .env("HOME", host_home)
+        .env("NO_COLOR", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .args(["--model", "sonnet", "--permission-mode", "workspace-write"]);
+    if format == "json" {
+        command.arg("--output-format=json");
+    }
+    command.arg(task);
+    command
+        .output()
+        .expect("checkpoint repair CLI should launch")
+}
+
+fn provider_tool_trace(request: &mock_anthropic_service::CapturedRequest) -> Vec<String> {
+    let body: Value = serde_json::from_str(&request.raw_body).expect("request should be JSON");
+    body["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|message| message["content"].as_array())
+        .flatten()
+        .filter_map(|block| {
+            (block["type"] == "tool_use")
+                .then(|| block["name"].as_str().map(ToOwned::to_owned))
+                .flatten()
+        })
+        .collect()
+}
+
 #[allow(dead_code)]
 fn prepare_auto_compact_fixture(workspace: &HarnessWorkspace) {
     let sessions_dir = workspace.root.join(".claw").join("sessions");
