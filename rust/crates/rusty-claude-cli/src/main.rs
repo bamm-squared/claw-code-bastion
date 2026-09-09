@@ -7255,6 +7255,50 @@ impl LiveCli {
                                 self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
                                 benchmark_telemetry::lifecycle_event("writer_checkpoint_blocked");
                                 println!("Writer checkpoint stopped before Review: {message}");
+                                let declared_contract_ids = self
+                                    .task_plan
+                                    .current_work_unit()
+                                    .map(|unit| unit.owned_contract_ids.clone())
+                                    .unwrap_or_default();
+                                let downstream_contract_ids = self
+                                    .task_plan
+                                    .current_work_unit()
+                                    .map(|unit| unit.downstream_contract_ids.clone())
+                                    .unwrap_or_default();
+                                let global_invariant_ids = self
+                                    .task_plan
+                                    .current_work_unit()
+                                    .map(|unit| unit.global_invariant_ids.clone())
+                                    .unwrap_or_default();
+                                let writer_turns = self.work_unit_writer_turns as u64;
+                                let turn_allowance = self.work_unit_turn_allowance as u64;
+                                benchmark_telemetry::blocked_checkpoint(
+                                    benchmark_telemetry::BlockedCheckpointEvent {
+                                        work_unit: self.task_plan.current_work_unit_id.clone(),
+                                        writer_turns,
+                                        productive_writer_turns: writer_turns.min(turn_allowance),
+                                        turn_allowance,
+                                        checkpoint_turn: writer_turns > turn_allowance,
+                                        turns_remaining: turn_allowance
+                                            .saturating_sub(writer_turns),
+                                        continuation_grants: u64::from(
+                                            self.work_unit_continuation_grants,
+                                        ),
+                                        candidate_identity: format!(
+                                            "candidate-baseline:{}",
+                                            self.session.id
+                                        ),
+                                        category: "writer_reported_blocked".to_string(),
+                                        reason: message,
+                                        declared_contract_ids: declared_contract_ids.clone(),
+                                        owned_contract_ids: declared_contract_ids,
+                                        downstream_contract_ids,
+                                        global_invariant_ids,
+                                        continuation_eligible: false,
+                                        terminal_reason: "writer_checkpoint_blocked".to_string(),
+                                        ..benchmark_telemetry::BlockedCheckpointEvent::default()
+                                    },
+                                );
                                 self.replace_runtime(runtime)?;
                                 self.rework_profile = None;
                                 return Ok(());
