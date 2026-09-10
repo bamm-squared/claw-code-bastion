@@ -1,4 +1,5 @@
 use std::cmp::Reverse;
+use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -7,6 +8,7 @@ use std::time::Instant;
 use glob::Pattern;
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize, Serializer};
+use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 /// Maximum file size that can be read (10 MB).
@@ -136,6 +138,19 @@ impl FilesystemCapability {
         edit_file(path, old_string, new_string, replace_all)
     }
 
+    /// Replace a bounded line range through the capability.
+    pub fn replace_range(
+        &self,
+        path: &str,
+        start_line: usize,
+        end_line: usize,
+        replacement: &str,
+        expected_revision: &str,
+    ) -> io::Result<ReplaceRangeFileOutput> {
+        self.resolve_write_path(path)?;
+        replace_range(path, start_line, end_line, replacement, expected_revision)
+    }
+
     /// Search paths for matching files through the capability.
     pub fn glob_search(&self, pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOutput> {
         let base_dir = path
@@ -250,6 +265,9 @@ pub struct TextFilePayload {
     pub start_line: usize,
     #[serde(rename = "totalLines")]
     pub total_lines: usize,
+    /// SHA-256 of the complete file content used to guard a follow-up edit.
+    #[serde(default)]
+    pub revision: String,
 }
 
 /// Output envelope for the `read_file` tool.
@@ -318,8 +336,39 @@ pub struct EditFileOutput {
     pub git_diff: Option<serde_json::Value>,
 }
 
+/// Output envelope for revision-guarded line-range replacements.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplaceRangeFileOutput {
+    #[serde(rename = "filePath")]
+    pub file_path: String,
+    #[serde(rename = "startLine")]
+    pub start_line: usize,
+    #[serde(rename = "endLine")]
+    pub end_line: usize,
+    #[serde(serialize_with = "serialize_bounded_text")]
+    pub replacement: String,
+    #[serde(rename = "sourceRevision")]
+    pub source_revision: String,
+    #[serde(rename = "resultRevision")]
+    pub result_revision: String,
+    #[serde(rename = "structuredPatch")]
+    #[serde(serialize_with = "serialize_bounded_patch")]
+    pub structured_patch: Vec<StructuredPatchHunk>,
+    #[serde(rename = "gitDiff")]
+    pub git_diff: Option<serde_json::Value>,
+}
+
 const MAX_SERIALIZED_TOOL_TEXT_BYTES: usize = 8 * 1024;
 const MAX_SERIALIZED_PATCH_BYTES: usize = 32 * 1024;
+
+fn file_revision(content: &str) -> String {
+    let digest = Sha256::digest(content.as_bytes());
+    let mut revision = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut revision, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    revision
+}
 
 fn bounded_tool_text(value: &str) -> String {
     if value.len() <= MAX_SERIALIZED_TOOL_TEXT_BYTES {
@@ -487,6 +536,7 @@ fn read_file(
             num_lines: end_index.saturating_sub(start_index),
             start_line: start_index.saturating_add(1),
             total_lines: lines.len(),
+            revision: file_revision(&content),
         },
     })
 }
@@ -564,6 +614,89 @@ fn edit_file(
         replace_all,
         git_diff: None,
     })
+}
+
+/// Replace a 1-based, half-open line range after verifying the source revision.
+/// The end line may equal the line count plus one, which permits insertion at EOF.
+fn replace_range(
+    path: &str,
+    start_line: usize,
+    end_line: usize,
+    replacement: &str,
+    expected_revision: &str,
+) -> io::Result<ReplaceRangeFileOutput> {
+    let absolute_path = normalize_path(path)?;
+    let original_file = fs::read_to_string(&absolute_path)?;
+    let actual_revision = file_revision(&original_file);
+    if actual_revision != expected_revision {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "stale source revision for {path}: expected {expected_revision}, current {actual_revision}; reread the file before retrying"
+            ),
+        ));
+    }
+
+    let line_starts = line_start_offsets(&original_file);
+    let line_count = original_file.lines().count();
+    let max_boundary = line_count.saturating_add(1);
+    if start_line == 0
+        || end_line < start_line
+        || end_line > max_boundary
+        || start_line > max_boundary
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "invalid line range {start_line}..{end_line}; expected a 1-based half-open range within 1..={max_boundary}"
+            ),
+        ));
+    }
+
+    let start_offset = line_starts[start_line - 1];
+    let end_offset = if end_line == max_boundary {
+        original_file.len()
+    } else {
+        line_starts[end_line - 1]
+    };
+    let old_region = &original_file[start_offset..end_offset];
+    if old_region == replacement {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "replacement is a no-op for {path} lines {start_line}..{end_line}; candidate unchanged"
+            ),
+        ));
+    }
+
+    let mut updated =
+        String::with_capacity(original_file.len() - old_region.len() + replacement.len());
+    updated.push_str(&original_file[..start_offset]);
+    updated.push_str(replacement);
+    updated.push_str(&original_file[end_offset..]);
+    fs::write(&absolute_path, &updated)?;
+    let result_revision = file_revision(&updated);
+
+    Ok(ReplaceRangeFileOutput {
+        file_path: absolute_path.to_string_lossy().into_owned(),
+        start_line,
+        end_line,
+        replacement: replacement.to_owned(),
+        source_revision: actual_revision,
+        result_revision,
+        structured_patch: make_patch(&original_file, &updated),
+        git_diff: None,
+    })
+}
+
+fn line_start_offsets(content: &str) -> Vec<usize> {
+    let mut offsets = vec![0];
+    for (index, byte) in content.bytes().enumerate() {
+        if byte == b'\n' {
+            offsets.push(index + 1);
+        }
+    }
+    offsets
 }
 
 /// Expands a glob pattern and returns matching filenames.
@@ -922,6 +1055,24 @@ pub(crate) fn edit_file_in_workspace(
     edit_file(path, old_string, new_string, replace_all)
 }
 
+/// Replace a bounded line range with workspace boundary enforcement.
+#[allow(dead_code)]
+pub(crate) fn replace_range_in_workspace(
+    path: &str,
+    start_line: usize,
+    end_line: usize,
+    replacement: &str,
+    expected_revision: &str,
+    workspace_root: &Path,
+) -> io::Result<ReplaceRangeFileOutput> {
+    let absolute_path = normalize_path(path)?;
+    let canonical_root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    validate_workspace_boundary(&absolute_path, &canonical_root)?;
+    replace_range(path, start_line, end_line, replacement, expected_revision)
+}
+
 /// Check whether a path is a symlink that resolves outside the workspace.
 #[allow(dead_code)]
 pub fn is_symlink_escape(path: &Path, workspace_root: &Path) -> io::Result<bool> {
@@ -961,12 +1112,13 @@ fn expand_braces(pattern: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use crate::FilesystemCapability;
+    use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         edit_file, expand_braces, glob_search, grep_search, is_symlink_escape, read_file,
-        read_file_in_workspace, write_file, GrepSearchInput, MAX_WRITE_SIZE,
+        read_file_in_workspace, replace_range, write_file, GrepSearchInput, MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -997,6 +1149,108 @@ mod tests {
         let output = edit_file(path.to_string_lossy().as_ref(), "alpha", "omega", true)
             .expect("edit should succeed");
         assert!(output.replace_all);
+    }
+
+    #[test]
+    fn replaces_bounded_range_with_read_revision() {
+        let path = temp_path("range-edit.txt");
+        write_file(path.to_string_lossy().as_ref(), "first\nsecond\nthird\n")
+            .expect("initial write should succeed");
+        let read = read_file(path.to_string_lossy().as_ref(), Some(1), Some(1))
+            .expect("bounded read should succeed");
+        let output = replace_range(
+            path.to_string_lossy().as_ref(),
+            2,
+            3,
+            "repaired\n",
+            &read.file.revision,
+        )
+        .expect("range replacement should succeed");
+        assert_eq!(output.source_revision, read.file.revision);
+        assert_ne!(output.result_revision, output.source_revision);
+        assert_eq!(
+            fs::read_to_string(&path).expect("read result"),
+            "first\nrepaired\nthird\n"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_stale_range_and_noop_or_invalid_ranges() {
+        let path = temp_path("range-errors.txt");
+        write_file(path.to_string_lossy().as_ref(), "alpha\nbeta\n")
+            .expect("initial write should succeed");
+        let read =
+            read_file(path.to_string_lossy().as_ref(), None, None).expect("read should succeed");
+        write_file(path.to_string_lossy().as_ref(), "changed\nbeta\n")
+            .expect("concurrent change should succeed");
+        let stale = replace_range(
+            path.to_string_lossy().as_ref(),
+            1,
+            2,
+            "new\n",
+            &read.file.revision,
+        )
+        .expect_err("stale range should fail");
+        assert!(stale.to_string().contains("stale source revision"));
+
+        let current = read_file(path.to_string_lossy().as_ref(), None, None)
+            .expect("current read should succeed");
+        let noop = replace_range(
+            path.to_string_lossy().as_ref(),
+            1,
+            2,
+            "changed\n",
+            &current.file.revision,
+        )
+        .expect_err("identical range should fail");
+        assert!(noop.to_string().contains("no-op"));
+        let invalid = replace_range(
+            path.to_string_lossy().as_ref(),
+            3,
+            2,
+            "bad",
+            &current.file.revision,
+        )
+        .expect_err("reversed range should fail");
+        assert!(invalid.to_string().contains("invalid line range"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn supports_bounded_insertions_and_workspace_containment() {
+        let workspace = temp_path("range-insert-workspace");
+        fs::create_dir_all(&workspace).expect("workspace should be created");
+        let inside = workspace.join("source.rs");
+        write_file(inside.to_string_lossy().as_ref(), "fn main() {}\n")
+            .expect("initial write should succeed");
+        let capability = FilesystemCapability::workspace(&workspace);
+        let read = capability
+            .read_file(inside.to_string_lossy().as_ref(), None, None)
+            .expect("read should succeed");
+        capability
+            .replace_range(
+                inside.to_string_lossy().as_ref(),
+                2,
+                2,
+                "fn helper() {}\n",
+                &read.file.revision,
+            )
+            .expect("insertion should succeed");
+        assert!(fs::read_to_string(&inside)
+            .expect("read result")
+            .contains("fn helper()"));
+        let outside = workspace.join("../outside-range.rs");
+        assert!(capability
+            .replace_range(
+                outside.to_string_lossy().as_ref(),
+                1,
+                1,
+                "escape",
+                &read.file.revision,
+            )
+            .is_err());
+        let _ = fs::remove_dir_all(workspace);
     }
 
     #[test]

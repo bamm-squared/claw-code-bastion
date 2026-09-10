@@ -1448,6 +1448,23 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::WorkspaceWrite,
         },
         ToolSpec {
+            name: "replace_range",
+            description: "Replace a bounded 1-based half-open line range using a revision returned by read_file. Use this for structural edits without reproducing a large exact old string.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "start_line": { "type": "integer", "minimum": 1 },
+                    "end_line": { "type": "integer", "minimum": 1 },
+                    "replacement": { "type": "string" },
+                    "expected_revision": { "type": "string", "minLength": 1 }
+                },
+                "required": ["path", "start_line", "end_line", "replacement", "expected_revision"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
             name: "glob_search",
             description: "Find files by glob pattern in the isolated workspace. Use workspace-relative paths or /workspace/project; never use the host checkout path.",
             input_schema: json!({
@@ -2283,6 +2300,11 @@ fn execute_tool_with_enforcer(
         "edit_file" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
             from_value::<EditFileInput>(input).and_then(|value| run_edit_file(value, &filesystem))
+        }
+        "replace_range" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<ReplaceRangeInput>(input)
+                .and_then(|value| run_replace_range(value, &filesystem))
         }
         "glob_search" => {
             maybe_enforce_permission_check(enforcer, name, input)?;
@@ -3250,6 +3272,24 @@ fn run_edit_file(
 }
 
 #[allow(clippy::needless_pass_by_value)]
+fn run_replace_range(
+    input: ReplaceRangeInput,
+    filesystem: &FilesystemCapability,
+) -> Result<String, String> {
+    to_pretty_json(
+        filesystem
+            .replace_range(
+                &input.path,
+                input.start_line,
+                input.end_line,
+                &input.replacement,
+                &input.expected_revision,
+            )
+            .map_err(io_to_string)?,
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
 fn run_glob_search(
     input: GlobSearchInputValue,
     filesystem: &FilesystemCapability,
@@ -3448,6 +3488,15 @@ struct EditFileInput {
     old_string: String,
     new_string: String,
     replace_all: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplaceRangeInput {
+    path: String,
+    start_line: usize,
+    end_line: usize,
+    replacement: String,
+    expected_revision: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6178,7 +6227,13 @@ fn deferred_tool_specs() -> Vec<ToolSpec> {
         .filter(|spec| {
             !matches!(
                 spec.name,
-                "bash" | "read_file" | "write_file" | "edit_file" | "glob_search" | "grep_search"
+                "bash"
+                    | "read_file"
+                    | "write_file"
+                    | "edit_file"
+                    | "replace_range"
+                    | "glob_search"
+                    | "grep_search"
             )
         })
         .collect()
@@ -7522,6 +7577,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"replace_range"));
         assert!(names.contains(&"WebFetch"));
         assert!(names.contains(&"WebSearch"));
         assert!(names.contains(&"TodoWrite"));
@@ -10302,6 +10358,52 @@ mod tests {
         )
         .expect_err("missing substring should fail");
         assert!(edit_missing.contains("old_string not found"));
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn bounded_range_tool_uses_read_revision() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("range-suite");
+        fs::create_dir_all(&root).expect("create root");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        execute_trusted_tool(
+            "write_file",
+            &json!({ "path": "source.rs", "content": "first\nsecond\nthird\n" }),
+        )
+        .expect("write should succeed");
+        let read = execute_trusted_tool("read_file", &json!({ "path": "source.rs" }))
+            .expect("read should succeed");
+        let revision = serde_json::from_str::<serde_json::Value>(&read).expect("json")["file"]
+            ["revision"]
+            .as_str()
+            .expect("revision should be present")
+            .to_string();
+        let output = execute_trusted_tool(
+            "replace_range",
+            &json!({
+                "path": "source.rs",
+                "start_line": 2,
+                "end_line": 3,
+                "replacement": "repaired\n",
+                "expected_revision": revision
+            }),
+        )
+        .expect("range edit should succeed");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output).expect("json")["startLine"],
+            2
+        );
+        assert_eq!(
+            fs::read_to_string("source.rs").expect("read result"),
+            "first\nrepaired\nthird\n"
+        );
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
         let _ = fs::remove_dir_all(root);
