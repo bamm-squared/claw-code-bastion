@@ -87,6 +87,9 @@ pub struct Snapshot {
     pub evaluator_route_reason: Option<String>,
     pub evaluator_route_rejections: Vec<RoutingRejection>,
     pub writer_selected_profile: Option<String>,
+    pub writer_requested_profile: Option<String>,
+    pub writer_requested_model: Option<String>,
+    pub writer_profile_selection_source: Option<String>,
     pub writer_route_reason: Option<String>,
     pub writer_route_rejections: Vec<RoutingRejection>,
     pub writer_route_estimate: Option<RoutingEstimate>,
@@ -155,6 +158,8 @@ pub struct WriterProfileEvent {
     pub role: String,
     pub previous_profile: Option<String>,
     pub profile: String,
+    pub requested_profile: Option<String>,
+    pub requested_model: Option<String>,
     pub provider: Option<String>,
     pub model: String,
     pub protocol: Option<String>,
@@ -1258,6 +1263,21 @@ pub fn writer_profile_event(mut event: WriterProfileEvent) {
         }
     });
     lifecycle_event("writer_profile_event_recorded");
+}
+
+pub fn writer_profile_preflight(
+    requested_profile: Option<&str>,
+    requested_model: Option<&str>,
+    resolved_profile: Option<&str>,
+    selection_source: &str,
+) {
+    with_state(|s| {
+        s.snapshot.writer_requested_profile = requested_profile.map(str::to_string);
+        s.snapshot.writer_requested_model = requested_model.map(str::to_string);
+        s.snapshot.writer_selected_profile = resolved_profile.map(str::to_string);
+        s.snapshot.writer_profile_selection_source = Some(selection_source.to_string());
+    });
+    persist_snapshot();
 }
 
 pub fn planning_state(plan: &crate::task_plan::TaskPlan) {

@@ -526,6 +526,7 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
 #[allow(clippy::too_many_lines)]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
+    let explicit_writer_model = explicit_model_argument(&args);
     let private = args.iter().any(|arg| arg == "--private");
     let no_isolation = args.iter().any(|arg| arg == "--no-isolation");
     let allow_remote_provider = args.iter().any(|arg| arg == "--allow-remote-provider");
@@ -657,7 +658,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
             let effective_prompt = context_reference::expand_user_references(&effective_prompt)?;
-            let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+            let mut cli = LiveCli::new_with_requested_writer_model(
+                model,
+                true,
+                allowed_tools,
+                permission_mode,
+                explicit_writer_model,
+            )?;
             cli.set_reasoning_effort(reasoning_effort);
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
@@ -685,6 +692,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
+            explicit_writer_model,
         )?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
@@ -1830,14 +1838,29 @@ fn resolve_model_alias_with_config(model: &str) -> String {
     resolve_model_alias(trimmed).to_string()
 }
 
+fn explicit_model_argument(args: &[String]) -> Option<String> {
+    for (index, argument) in args.iter().enumerate() {
+        if argument == "--model" {
+            return args.get(index + 1).cloned();
+        }
+        if let Some(value) = argument.strip_prefix("--model=") {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
 fn explicit_profile_for_model(
     pool: &model_router::ModelPool,
     requested: &str,
 ) -> Result<Option<model_router::ModelProfile>, Box<dyn std::error::Error>> {
+    if let Some(profile) = pool.profiles.iter().find(|profile| profile.id == requested) {
+        return Ok(Some(profile.clone()));
+    }
     let matches = pool
         .profiles
         .iter()
-        .filter(|profile| profile.id == requested || profile.model == requested)
+        .filter(|profile| profile.model == requested)
         .cloned()
         .collect::<Vec<_>>();
     match matches.as_slice() {
@@ -1849,6 +1872,81 @@ fn explicit_profile_for_model(
         )
         .into()),
     }
+}
+
+fn resolve_explicit_writer_profile(
+    pool: &model_router::ModelPool,
+    requested: &str,
+    signals: model_router::TaskSignals,
+    policy: &model_router::RoutingPolicy,
+) -> Result<model_router::ModelProfile, Box<dyn std::error::Error>> {
+    let profile = explicit_profile_for_model(pool, requested)?.ok_or_else(|| {
+        format!(
+            "explicit_writer_profile_mismatch: requested profile/model {requested:?} is not configured"
+        )
+    })?;
+    if profile.id == "legacy-default" {
+        return Err(format!(
+            "explicit_writer_profile_mismatch: requested {requested:?} resolved only to legacy-default; an explicit configured profile is required"
+        )
+        .into());
+    }
+    let decision = model_router::ModelRouter::select_explicit(
+        pool,
+        &profile.id,
+        model_router::ModelRole::Writer,
+        signals,
+        policy,
+    );
+    decision.selected.ok_or_else(|| {
+        let details = decision
+            .rejections
+            .iter()
+            .map(|rejection| format!("{}: {}", rejection.profile_id, rejection.reason))
+            .collect::<Vec<_>>();
+        format!(
+            "explicit_writer_profile_mismatch: profile {} is ineligible{}",
+            profile.id,
+            if details.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", details.join("; "))
+            }
+        )
+        .into()
+    })
+}
+
+fn validate_writer_profile_binding(
+    expected: Option<&model_router::ModelProfile>,
+    selected: Option<&model_router::ModelProfile>,
+    model: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(selected) = selected {
+        if api::resolve_model_alias(&selected.model) != api::resolve_model_alias(model) {
+            return Err(format!(
+                "explicit_writer_profile_mismatch: profile {} resolves model {:?}, request would use {:?}",
+                selected.id, selected.model, model
+            )
+            .into());
+        }
+    }
+    if let Some(expected) = expected {
+        let selected = selected.ok_or_else(|| {
+            format!(
+                "explicit_writer_profile_mismatch: requested profile {} was not selected",
+                expected.id
+            )
+        })?;
+        if selected.id != expected.id {
+            return Err(format!(
+                "explicit_writer_profile_mismatch: requested profile {}, selected {}",
+                expected.id, selected.id
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4197,11 +4295,22 @@ fn run_repl(
     base_commit: Option<String>,
     reasoning_effort: Option<String>,
     allow_broad_cwd: bool,
+    explicit_writer_model: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
-    let resolved_model = resolve_repl_model(model);
-    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
+    let resolved_model = if explicit_writer_model.is_some() {
+        model
+    } else {
+        resolve_repl_model(model)
+    };
+    let mut cli = LiveCli::new_with_requested_writer_model(
+        resolved_model,
+        true,
+        allowed_tools,
+        permission_mode,
+        explicit_writer_model,
+    )?;
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
@@ -4297,6 +4406,7 @@ struct LiveCli {
     calibration: model_router::CalibrationStore,
     routing_policy: model_router::RoutingPolicy,
     explicit_writer_profile: Option<model_router::ModelProfile>,
+    explicit_writer_request: Option<String>,
     last_routing_explanation: Option<String>,
     writer_profile_owner: Option<model_router::ModelProfile>,
     selected_writer_profile: Option<model_router::ModelProfile>,
@@ -5408,19 +5518,38 @@ impl HookAbortMonitor {
 }
 
 impl LiveCli {
-    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
     fn new(
         model: String,
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_requested_writer_model(
+            model,
+            enable_tools,
+            allowed_tools,
+            permission_mode,
+            None,
+        )
+    }
+
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+    fn new_with_requested_writer_model(
+        model: String,
+        enable_tools: bool,
+        allowed_tools: Option<AllowedToolSet>,
+        permission_mode: PermissionMode,
+        requested_writer_model: Option<String>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
         let frozen_plan = load_frozen_plan_from_env()?;
+        let initial_task_plan = frozen_plan
+            .as_ref()
+            .map(|artifact| artifact.task_plan.clone())
+            .unwrap_or_default();
         let cwd = repository_workspace_root()?;
         let config = ConfigLoader::default_for(&cwd).load()?;
         let model_pool = model_router::ModelPool::from_runtime_config(&config, &model);
-        let explicit_writer_profile = explicit_profile_for_model(&model_pool, &model)?;
         let calibration_path = (!is_private_mode()).then(calibration_store_path);
         let calibration = if is_private_mode() {
             model_router::CalibrationStore::new()
@@ -5436,11 +5565,28 @@ impl LiveCli {
             routing_policy.local_only = true;
             routing_policy.allow_remote = false;
         }
+        let explicit_writer_profile = if let Some(requested) = requested_writer_model.as_deref() {
+            benchmark_telemetry::writer_profile_preflight(
+                None,
+                Some(requested),
+                None,
+                "explicit_operator_pin",
+            );
+            Some(resolve_explicit_writer_profile(
+                &model_pool,
+                requested,
+                routing_signals(&initial_task_plan),
+                &routing_policy,
+            )?)
+        } else {
+            explicit_profile_for_model(&model_pool, &model)?
+        };
         // A modern resource pool is authoritative when no explicit model was
         // supplied. Select a policy-eligible bootstrap resource before any
         // provider client is constructed; never let the legacy default model
         // stand in for a configured pool.
-        let bootstrap_profile = if explicit_writer_profile.is_none()
+        let bootstrap_profile = if requested_writer_model.is_none()
+            && explicit_writer_profile.is_none()
             && model == DEFAULT_MODEL
             && model_router::ModelPool::has_configured_resources(&config)
         {
@@ -5463,8 +5609,9 @@ impl LiveCli {
         } else {
             None
         };
-        let effective_model = bootstrap_profile
+        let effective_model = explicit_writer_profile
             .as_ref()
+            .or(bootstrap_profile.as_ref())
             .map_or_else(|| model.clone(), |profile| profile.model.clone());
         let session_state = new_cli_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
@@ -5475,12 +5622,30 @@ impl LiveCli {
         } else {
             session_state.with_persistence_path(session.path.clone())
         };
-        if let Some(profile) = bootstrap_profile
+        if let Some(profile) = explicit_writer_profile
             .as_ref()
-            .or(explicit_writer_profile.as_ref())
+            .or(bootstrap_profile.as_ref())
         {
             set_provider_telemetry_context("startup", profile);
         }
+        benchmark_telemetry::writer_profile_preflight(
+            explicit_writer_profile
+                .as_ref()
+                .filter(|profile| requested_writer_model.as_deref() == Some(profile.id.as_str()))
+                .map(|profile| profile.id.as_str()),
+            requested_writer_model.as_deref(),
+            explicit_writer_profile
+                .as_ref()
+                .or(bootstrap_profile.as_ref())
+                .map(|profile| profile.id.as_str()),
+            if requested_writer_model.is_some() {
+                "explicit_operator_pin"
+            } else if bootstrap_profile.is_some() {
+                "automatic_routing"
+            } else {
+                "legacy_or_implicit"
+            },
+        );
         let runtime = build_runtime_with_backend_profile(
             session_state,
             &session.id,
@@ -5506,10 +5671,7 @@ impl LiveCli {
             review_file_index: None,
             context_tray: Vec::new(),
             attachments: Vec::new(),
-            task_plan: frozen_plan
-                .as_ref()
-                .map(|artifact| artifact.task_plan.clone())
-                .unwrap_or_default(),
+            task_plan: initial_task_plan,
             frozen_plan_hash: frozen_plan
                 .as_ref()
                 .map(|artifact| artifact.plan_hash.clone()),
@@ -5522,6 +5684,7 @@ impl LiveCli {
             calibration,
             routing_policy,
             explicit_writer_profile,
+            explicit_writer_request: requested_writer_model,
             last_routing_explanation: None,
             writer_profile_owner: None,
             selected_writer_profile: None,
@@ -5589,6 +5752,14 @@ impl LiveCli {
         benchmark_telemetry::writer_profile_event(benchmark_telemetry::WriterProfileEvent {
             previous_profile,
             profile: profile.id.clone(),
+            requested_profile: self
+                .explicit_writer_profile
+                .as_ref()
+                .filter(|profile| {
+                    self.explicit_writer_request.as_deref() == Some(profile.id.as_str())
+                })
+                .map(|requested| requested.id.clone()),
+            requested_model: self.explicit_writer_request.clone(),
             provider: provider.map(str::to_string),
             model: profile.model.clone(),
             protocol: protocol.map(str::to_string),
@@ -5622,6 +5793,18 @@ impl LiveCli {
             self.last_routing_explanation = Some(reason.clone());
             self.activate_writer_profile(&profile, "repair_routing", &reason);
             return;
+        }
+        if !self.escalation_requested {
+            if let Some(profile) = self.explicit_writer_profile.clone() {
+                let reason = format!(
+                    "explicit writer selection preserves requested profile {} across the current work unit",
+                    profile.id
+                );
+                self.writer_profile_owner = Some(profile.clone());
+                self.last_routing_explanation = Some(reason.clone());
+                self.activate_writer_profile(&profile, "explicit_operator_pin", &reason);
+                return;
+            }
         }
         if !self.escalation_requested {
             if let Some(profile) = Self::inherited_writer_profile(
@@ -6280,6 +6463,14 @@ impl LiveCli {
         if let Some(effort) = self.reasoning_effort_override.as_deref() {
             benchmark_telemetry::set_provider_reasoning(effort, &format!("explicit_{effort}"));
         }
+        validate_writer_profile_binding(
+            self.explicit_writer_request
+                .is_some()
+                .then_some(self.explicit_writer_profile.as_ref())
+                .flatten(),
+            self.selected_writer_profile.as_ref(),
+            &self.model,
+        )?;
         let runtime = build_runtime_with_backend_profile(
             self.runtime.session().clone(),
             &self.session.id,
@@ -11512,6 +11703,7 @@ impl AnthropicRuntimeClient {
         progress_reporter: Option<InternalPromptProgressReporter>,
         profile: Option<&model_router::ModelProfile>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        validate_writer_profile_binding(None, profile, &model)?;
         // Dispatch to the correct provider at construction time.
         // `ApiProviderClient` (exposed by the api crate as
         // `ProviderClient`) is an enum over Anthropic / xAI / OpenAI
@@ -13953,7 +14145,10 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 
 #[cfg(test)]
 mod tests {
-    use super::{explicit_profile_for_model, model_router};
+    use super::{
+        explicit_model_argument, explicit_profile_for_model, model_router,
+        resolve_explicit_writer_profile, validate_writer_profile_binding,
+    };
 
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
@@ -16035,6 +16230,97 @@ mod tests {
         let error = explicit_profile_for_model(&pool, "shared-model")
             .expect_err("ambiguous model must fail explicitly");
         assert!(error.to_string().contains("multiple execution profiles"));
+    }
+
+    fn capable_profile(id: &str, model: &str) -> model_router::ModelProfile {
+        let mut profile = model_router::ModelProfile::unknown(id, "openai", model);
+        profile.capability = model_router::Capability {
+            coding: 100,
+            reasoning: 100,
+            agent_tool_use: 100,
+            planning: 100,
+            evaluation: 100,
+            context_window: 200_000,
+        };
+        profile
+    }
+
+    #[test]
+    fn explicit_cli_model_argument_is_preserved_for_resolution() {
+        assert_eq!(
+            explicit_model_argument(&["--model".into(), "writer-b".into()]),
+            Some("writer-b".into())
+        );
+        assert_eq!(
+            explicit_model_argument(&["--model=writer-b".into()]),
+            Some("writer-b".into())
+        );
+        assert_eq!(explicit_model_argument(&["prompt".into()]), None);
+    }
+
+    #[test]
+    fn explicit_profile_id_selects_its_opaque_wire_model() {
+        let profile = capable_profile("writer-b", "opaque-b");
+        let resolved = resolve_explicit_writer_profile(
+            &model_router::ModelPool::one(profile),
+            "writer-b",
+            model_router::TaskSignals::default(),
+            &model_router::RoutingPolicy::default(),
+        )
+        .expect("configured explicit profile should resolve");
+        assert_eq!(resolved.id, "writer-b");
+        assert_eq!(resolved.model, "opaque-b");
+    }
+
+    #[test]
+    fn missing_explicit_profile_fails_without_legacy_fallback() {
+        let error = resolve_explicit_writer_profile(
+            &model_router::ModelPool::one(capable_profile("writer-a", "opaque-a")),
+            "writer-b",
+            model_router::TaskSignals::default(),
+            &model_router::RoutingPolicy::default(),
+        )
+        .expect_err("missing explicit profile must fail closed");
+        assert!(error.to_string().contains("not configured"));
+    }
+
+    #[test]
+    fn ineligible_explicit_profile_fails_without_substitution() {
+        let mut profile = capable_profile("writer-b", "opaque-b");
+        let mut compat = api::OpenAiCompatProfile::default();
+        compat.capabilities.function_tools = false;
+        profile.openai_compat = Some(compat);
+        let error = resolve_explicit_writer_profile(
+            &model_router::ModelPool::one(profile),
+            "writer-b",
+            model_router::TaskSignals::default(),
+            &model_router::RoutingPolicy::default(),
+        )
+        .expect_err("writer without tools must fail closed");
+        assert!(error.to_string().contains("ineligible"));
+        assert!(error.to_string().contains("function tools"));
+    }
+
+    #[test]
+    fn explicit_profile_rejects_stale_task_owner_and_accepts_exact_selection() {
+        let owner = capable_profile("writer-a", "opaque-a");
+        let requested = capable_profile("writer-b", "opaque-b");
+        let error = validate_writer_profile_binding(Some(&requested), Some(&owner), "opaque-a")
+            .expect_err("stale owner must not satisfy explicit selection");
+        assert!(error.to_string().contains("requested profile writer-b"));
+        validate_writer_profile_binding(Some(&requested), Some(&requested), "opaque-b")
+            .expect("explicit selection should be accepted");
+    }
+
+    #[test]
+    fn provider_boundary_rejects_corrupted_profile_model_binding() {
+        let profile = capable_profile("writer-a", "opaque-a");
+        let error = validate_writer_profile_binding(None, Some(&profile), "opaque-b")
+            .expect_err("provider request model mismatch must fail before send");
+        assert!(error
+            .to_string()
+            .contains("explicit_writer_profile_mismatch"));
+        assert!(error.to_string().contains("opaque-b"));
     }
 
     #[test]
