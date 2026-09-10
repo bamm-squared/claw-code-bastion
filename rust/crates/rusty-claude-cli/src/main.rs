@@ -5541,8 +5541,11 @@ impl LiveCli {
         permission_mode: PermissionMode,
         requested_writer_model: Option<String>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let system_prompt = build_system_prompt()?;
         let frozen_plan = load_frozen_plan_from_env()?;
+        if let Some(artifact) = frozen_plan.as_ref() {
+            validate_frozen_plan_locally(artifact)?;
+        }
+        let system_prompt = build_system_prompt()?;
         let initial_task_plan = frozen_plan
             .as_ref()
             .map(|artifact| artifact.task_plan.clone())
@@ -6333,18 +6336,7 @@ impl LiveCli {
             }
             benchmark_telemetry::planning_state(&self.task_plan);
         }
-        if let Some(expected_hash) = &self.frozen_plan_hash {
-            let actual_hash =
-                planning_artifact_hash(&self.task_plan, repository_text.unwrap_or_default());
-            if &actual_hash != expected_hash {
-                return Err(format!(
-                    "frozen plan context/hash changed before writer startup: expected {expected_hash}, found {actual_hash}"
-                ).into());
-            }
-            if self.frozen_plan_context.as_deref() != repository_text {
-                return Err("frozen plan repository context changed before writer startup".into());
-            }
-        }
+        self.validate_frozen_context(repository_text)?;
         let continuation_objective = self.work_unit_continuation_objective.take();
         let continuation_context = continuation_objective
             .as_deref()
@@ -7012,10 +7004,53 @@ impl LiveCli {
         &mut self,
         input: &str,
     ) -> Result<(String, Vec<ContentBlock>), Box<dyn std::error::Error>> {
+        self.validate_frozen_context_before_provider(input)?;
         self.prepare_exploration(input);
         let prompt = self.prompt_with_context(input)?;
         let image_blocks = self.image_blocks()?;
         Ok((prompt, image_blocks))
+    }
+
+    fn validate_frozen_context_before_provider(
+        &self,
+        input: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.frozen_plan_hash.is_none() {
+            return Ok(());
+        }
+        let repository_context = build_repository_context(input, None).ok_or_else(|| {
+            "frozen_plan_context_mismatch: repository context could not be reconstructed before provider activation".to_string()
+        })?;
+        self.validate_frozen_context(Some(&repository_context.text))
+    }
+
+    fn validate_frozen_context(
+        &self,
+        repository_text: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(expected_hash) = self.frozen_plan_hash.as_deref() else {
+            return Ok(());
+        };
+        let Some(repository_text) = repository_text else {
+            return Err(format!(
+                "frozen_plan_context_mismatch: repository context unavailable; expected_plan_hash={expected_hash}; observed_plan_hash=<unavailable>"
+            )
+            .into());
+        };
+        let actual_hash = planning_artifact_hash(&self.task_plan, repository_text);
+        if actual_hash != expected_hash {
+            return Err(format!(
+                "frozen_plan_context_mismatch: expected_plan_hash={expected_hash}; observed_plan_hash={actual_hash}"
+            )
+            .into());
+        }
+        if self.frozen_plan_context.as_deref() != Some(repository_text) {
+            return Err(format!(
+                "frozen_plan_context_mismatch: repository context differs from frozen artifact; expected_plan_hash={expected_hash}; observed_plan_hash={actual_hash}"
+            )
+            .into());
+        }
+        Ok(())
     }
 
     fn image_blocks(&self) -> Result<Vec<ContentBlock>, Box<dyn std::error::Error>> {
@@ -8995,6 +9030,10 @@ struct FrozenPlanArtifact {
     requirement: String,
     repository_context: String,
     plan_hash: String,
+    #[serde(default)]
+    source_revision: Option<String>,
+    #[serde(default)]
+    candidate_baseline_identity: Option<String>,
     task_plan: task_plan::TaskPlan,
 }
 
@@ -9018,6 +9057,53 @@ fn current_baseline_identity(source_revision: &str) -> String {
     source_revision.hash(&mut hasher);
     tracked_diff.hash(&mut hasher);
     format!("git:{source_revision}-worktree:{:016x}", hasher.finish())
+}
+
+fn validate_frozen_plan_locally(
+    artifact: &FrozenPlanArtifact,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source_revision = git_output(&["rev-parse", "HEAD"])
+        .unwrap_or_else(|_| "unknown".to_string())
+        .trim()
+        .to_string();
+    if let Some(expected) = artifact.source_revision.as_deref() {
+        if expected != source_revision {
+            return Err(format!(
+                "frozen_plan_context_mismatch: source revision differs; expected_source_revision={expected}; observed_source_revision={source_revision}"
+            )
+            .into());
+        }
+    }
+    if let Some(expected) = artifact.candidate_baseline_identity.as_deref() {
+        let observed = current_baseline_identity(&source_revision);
+        if expected != observed {
+            return Err(format!(
+                "frozen_plan_context_mismatch: candidate baseline differs; expected_baseline={expected}; observed_baseline={observed}"
+            )
+            .into());
+        }
+    }
+    let repository_context =
+        build_repository_context(&artifact.requirement, None).ok_or_else(|| {
+            "frozen_plan_context_mismatch: repository context could not be reconstructed locally"
+                .to_string()
+        })?;
+    let observed_hash = planning_artifact_hash(&artifact.task_plan, &repository_context.text);
+    if observed_hash != artifact.plan_hash {
+        return Err(format!(
+            "frozen_plan_context_mismatch: expected_plan_hash={}; observed_plan_hash={observed_hash}",
+            artifact.plan_hash
+        )
+        .into());
+    }
+    if repository_context.text != artifact.repository_context {
+        return Err(format!(
+            "frozen_plan_context_mismatch: repository context differs from frozen artifact; expected_plan_hash={}; observed_plan_hash={observed_hash}",
+            artifact.plan_hash
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn load_frozen_plan_from_env() -> Result<Option<FrozenPlanArtifact>, Box<dyn std::error::Error>> {
@@ -19201,5 +19287,50 @@ mod candidate_review_diff_tests {
 
         isolated.discard().expect("integration fixture cleanup");
         fs::remove_dir_all(root).expect("integration root cleanup");
+    }
+
+    fn current_frozen_plan_fixture() -> super::FrozenPlanArtifact {
+        let requirement = "Validate the effective configuration without mutating the workspace.";
+        let repository_context = super::build_repository_context(requirement, None)
+            .expect("repository context should be available");
+        let mut task_plan =
+            super::task_plan::TaskPlan::from_request(requirement, Some(&repository_context.text));
+        task_plan.set_repository_scope(
+            &repository_context.selected_files,
+            &repository_context.seed_files,
+            &repository_context.surface_guidance,
+        );
+        let source_revision = super::git_output(&["rev-parse", "HEAD"])
+            .expect("source revision should be available")
+            .trim()
+            .to_string();
+        super::FrozenPlanArtifact {
+            requirement: requirement.to_string(),
+            repository_context: repository_context.text.clone(),
+            plan_hash: super::planning_artifact_hash(&task_plan, &repository_context.text),
+            source_revision: Some(source_revision.clone()),
+            candidate_baseline_identity: Some(super::current_baseline_identity(&source_revision)),
+            task_plan,
+        }
+    }
+
+    #[test]
+    fn frozen_plan_local_validation_accepts_current_repository_state() {
+        let artifact = current_frozen_plan_fixture();
+        assert!(super::validate_frozen_plan_locally(&artifact).is_ok());
+    }
+
+    #[test]
+    fn frozen_plan_context_mismatch_is_classified_before_provider_activation() {
+        let mut artifact = current_frozen_plan_fixture();
+        artifact
+            .repository_context
+            .push_str("\nchanged after freeze");
+        let error = super::validate_frozen_plan_locally(&artifact)
+            .expect_err("changed frozen context must fail locally");
+        let message = error.to_string();
+        assert!(message.starts_with("frozen_plan_context_mismatch:"));
+        assert!(message.contains("expected_plan_hash="));
+        assert!(message.contains("observed_plan_hash="));
     }
 }
