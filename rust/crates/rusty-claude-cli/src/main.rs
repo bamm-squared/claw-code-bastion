@@ -5631,6 +5631,19 @@ impl LiveCli {
         {
             set_provider_telemetry_context("startup", profile);
         }
+        let writer_selection_source = if requested_writer_model.is_some() {
+            explicit_writer_profile
+                .as_ref()
+                .and_then(|profile| config.model_resource_source(&profile.id))
+                .map_or_else(
+                    || "explicit_operator_pin".to_string(),
+                    |source| format!("explicit_operator_pin:{source}"),
+                )
+        } else if bootstrap_profile.is_some() {
+            "automatic_routing".to_string()
+        } else {
+            "legacy_or_implicit".to_string()
+        };
         benchmark_telemetry::writer_profile_preflight(
             explicit_writer_profile
                 .as_ref()
@@ -5641,13 +5654,7 @@ impl LiveCli {
                 .as_ref()
                 .or(bootstrap_profile.as_ref())
                 .map(|profile| profile.id.as_str()),
-            if requested_writer_model.is_some() {
-                "explicit_operator_pin"
-            } else if bootstrap_profile.is_some() {
-                "automatic_routing"
-            } else {
-                "legacy_or_implicit"
-            },
+            &writer_selection_source,
         );
         let runtime = build_runtime_with_backend_profile(
             session_state,

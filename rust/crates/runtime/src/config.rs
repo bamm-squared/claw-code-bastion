@@ -8,6 +8,7 @@ use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 
 /// Schema name advertised by generated settings files.
 pub const CLAW_SETTINGS_SCHEMA_NAME: &str = "SettingsSchema";
+pub const CLAW_EXECUTION_PROFILE_CONFIG_ENV: &str = "CLAW_EXECUTION_PROFILE_CONFIG";
 
 /// Origin of a loaded settings file in the configuration precedence chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -37,6 +38,7 @@ pub struct ConfigEntry {
 pub struct RuntimeConfig {
     merged: BTreeMap<String, JsonValue>,
     loaded_entries: Vec<ConfigEntry>,
+    model_resource_sources: BTreeMap<String, String>,
     feature_config: RuntimeFeatureConfig,
 }
 
@@ -216,6 +218,7 @@ pub struct ConfigLoader {
     cwd: PathBuf,
     config_home: PathBuf,
     project_trusted: bool,
+    execution_profile_overlay: Option<PathBuf>,
 }
 
 impl ConfigLoader {
@@ -225,6 +228,7 @@ impl ConfigLoader {
             cwd: cwd.into(),
             config_home: config_home.into(),
             project_trusted: false,
+            execution_profile_overlay: None,
         }
     }
 
@@ -236,7 +240,18 @@ impl ConfigLoader {
             cwd,
             config_home,
             project_trusted: false,
+            execution_profile_overlay: std::env::var_os(CLAW_EXECUTION_PROFILE_CONFIG_ENV)
+                .map(PathBuf::from),
         }
+    }
+
+    /// Add an execution-only model profile registry. The registry is merged
+    /// only into `modelResources`; it is not a repository configuration entry
+    /// and therefore cannot change repository context identity.
+    #[must_use]
+    pub fn with_execution_profile_overlay(mut self, path: impl Into<PathBuf>) -> Self {
+        self.execution_profile_overlay = Some(path.into());
+        self
     }
 
     /// Mark project-controlled configuration as explicitly trusted by the
@@ -290,6 +305,7 @@ impl ConfigLoader {
     pub fn load(&self) -> Result<RuntimeConfig, ConfigError> {
         let mut merged = BTreeMap::new();
         let mut loaded_entries = Vec::new();
+        let mut model_resource_sources = BTreeMap::new();
         let mut mcp_servers = BTreeMap::new();
         let mut all_warnings = Vec::new();
 
@@ -324,8 +340,23 @@ impl ConfigLoader {
                 &entry.path,
             )?;
             deep_merge_objects(&mut merged, &effective_object);
+            if let Some(resources) = effective_object.get("modelResources") {
+                let resources = model_resources_array(resources, &entry.path)?;
+                model_resource_sources.clear();
+                record_model_resource_sources(
+                    &mut model_resource_sources,
+                    resources,
+                    config_source_label(entry.source),
+                );
+            }
             loaded_entries.push(entry);
         }
+
+        apply_execution_profile_overlay(
+            self.execution_profile_overlay.as_deref(),
+            &mut merged,
+            &mut model_resource_sources,
+        )?;
 
         for warning in &all_warnings {
             eprintln!("warning: {warning}");
@@ -352,9 +383,54 @@ impl ConfigLoader {
         Ok(RuntimeConfig {
             merged,
             loaded_entries,
+            model_resource_sources,
             feature_config,
         })
     }
+}
+
+fn apply_execution_profile_overlay(
+    path: Option<&Path>,
+    merged: &mut BTreeMap<String, JsonValue>,
+    model_resource_sources: &mut BTreeMap<String, String>,
+) -> Result<(), ConfigError> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let parsed = read_optional_json_object(path)?.ok_or_else(|| {
+        ConfigError::Parse(format!(
+            "execution profile overlay does not exist: {}",
+            path.display()
+        ))
+    })?;
+    let validation =
+        crate::config_validate::validate_config_file(&parsed.object, &parsed.source, path);
+    if !validation.is_ok() {
+        let first_error = &validation.errors[0];
+        return Err(ConfigError::Parse(first_error.to_string()));
+    }
+    let resources = parsed.object.get("modelResources").ok_or_else(|| {
+        ConfigError::Parse(format!(
+            "execution profile overlay {} must contain modelResources",
+            path.display()
+        ))
+    })?;
+    let overlay_resources = model_resources_array(resources, path)?;
+    let merged_resources = match merged.get("modelResources") {
+        Some(value) => model_resources_array(value, Path::new("merged settings"))?.to_vec(),
+        None => Vec::new(),
+    };
+    let merged_resources = merge_model_resources(merged_resources, overlay_resources);
+    merged.insert(
+        "modelResources".to_string(),
+        JsonValue::Array(merged_resources),
+    );
+    record_model_resource_sources(
+        model_resource_sources,
+        overlay_resources,
+        "external_execution_overlay",
+    );
+    Ok(())
 }
 
 impl RuntimeConfig {
@@ -363,6 +439,7 @@ impl RuntimeConfig {
         Self {
             merged: BTreeMap::new(),
             loaded_entries: Vec::new(),
+            model_resource_sources: BTreeMap::new(),
             feature_config: RuntimeFeatureConfig::default(),
         }
     }
@@ -375,6 +452,13 @@ impl RuntimeConfig {
     #[must_use]
     pub fn loaded_entries(&self) -> &[ConfigEntry] {
         &self.loaded_entries
+    }
+
+    #[must_use]
+    pub fn model_resource_source(&self, profile_id: &str) -> Option<&str> {
+        self.model_resource_sources
+            .get(profile_id)
+            .map(String::as_str)
     }
 
     #[must_use]
@@ -1280,6 +1364,65 @@ fn deep_merge_objects(
     }
 }
 
+fn config_source_label(source: ConfigSource) -> &'static str {
+    match source {
+        ConfigSource::User => "user",
+        ConfigSource::Project => "project",
+        ConfigSource::Local => "local",
+    }
+}
+
+fn model_resources_array<'a>(
+    value: &'a JsonValue,
+    path: &Path,
+) -> Result<&'a [JsonValue], ConfigError> {
+    value.as_array().ok_or_else(|| {
+        ConfigError::Parse(format!(
+            "{}: modelResources must be an array",
+            path.display()
+        ))
+    })
+}
+
+fn record_model_resource_sources(
+    sources: &mut BTreeMap<String, String>,
+    resources: &[JsonValue],
+    source: &str,
+) {
+    for resource in resources {
+        if let Some(id) = resource
+            .as_object()
+            .and_then(|object| object.get("id"))
+            .and_then(JsonValue::as_str)
+        {
+            sources.insert(id.to_string(), source.to_string());
+        }
+    }
+}
+
+fn merge_model_resources(mut base: Vec<JsonValue>, overlay: &[JsonValue]) -> Vec<JsonValue> {
+    for resource in overlay {
+        let id = resource
+            .as_object()
+            .and_then(|object| object.get("id"))
+            .and_then(JsonValue::as_str);
+        if let Some(id) = id {
+            if let Some(existing) = base.iter_mut().find(|candidate| {
+                candidate
+                    .as_object()
+                    .and_then(|object| object.get("id"))
+                    .and_then(JsonValue::as_str)
+                    == Some(id)
+            }) {
+                *existing = resource.clone();
+                continue;
+            }
+        }
+        base.push(resource.clone());
+    }
+    base
+}
+
 fn extend_unique(target: &mut Vec<String>, values: &[String]) {
     for value in values {
         push_unique(target, value.clone());
@@ -1951,6 +2094,94 @@ mod tests {
         );
         assert_eq!(env.get("C"), Some(&JsonValue::String("3".to_string())));
         assert!(target.contains_key("sandbox"));
+    }
+
+    #[test]
+    fn execution_profile_overlay_merges_by_id_without_changing_project_config() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        let overlay = root.join("execution-profiles.json");
+        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(
+            cwd.join(".claw").join("settings.json"),
+            r#"{"modelResources":[{"id":"profile-a","model":"opaque-a"},{"id":"profile-b","model":"opaque-b"}]}"#,
+        )
+        .expect("write project settings");
+        fs::write(
+            &overlay,
+            r#"{"modelResources":[{"id":"profile-b","model":"opaque-b-external"},{"id":"profile-c","model":"opaque-c"}]}"#,
+        )
+        .expect("write execution overlay");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .with_project_trust(true)
+            .with_execution_profile_overlay(&overlay)
+            .load()
+            .expect("execution overlay should load");
+        let resources = loaded
+            .get("modelResources")
+            .and_then(JsonValue::as_array)
+            .expect("merged model resources");
+        assert_eq!(resources.len(), 3);
+        assert_eq!(
+            resources[1]
+                .as_object()
+                .and_then(|object| object.get("model"))
+                .and_then(JsonValue::as_str),
+            Some("opaque-b-external")
+        );
+        assert_eq!(loaded.model_resource_source("profile-a"), Some("project"));
+        assert_eq!(
+            loaded.model_resource_source("profile-b"),
+            Some("external_execution_overlay")
+        );
+        assert_eq!(
+            loaded.model_resource_source("profile-c"),
+            Some("external_execution_overlay")
+        );
+        assert_eq!(loaded.loaded_entries().len(), 1);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn project_model_resources_keep_existing_array_precedence_without_overlay() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(
+            home.join("settings.json"),
+            r#"{"modelResources":[{"id":"profile-user","model":"opaque-user"}]}"#,
+        )
+        .expect("write user settings");
+        fs::write(
+            cwd.join(".claw").join("settings.json"),
+            r#"{"modelResources":[{"id":"profile-project","model":"opaque-project"}]}"#,
+        )
+        .expect("write project settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .with_project_trust(true)
+            .load()
+            .expect("config should load");
+        let resources = loaded
+            .get("modelResources")
+            .and_then(JsonValue::as_array)
+            .expect("project model resources");
+        assert_eq!(resources.len(), 1);
+        assert_eq!(
+            resources[0]
+                .as_object()
+                .and_then(|object| object.get("id"))
+                .and_then(JsonValue::as_str),
+            Some("profile-project")
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]
