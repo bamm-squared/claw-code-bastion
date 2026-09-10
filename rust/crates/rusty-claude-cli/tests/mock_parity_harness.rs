@@ -593,6 +593,12 @@ fn cli_json_checkpoint_repair_denies_exhausted_continuation() {
     assert!(telemetry_value["candidate_check_evidence"]
         .as_array()
         .is_some_and(|checks| checks.len() >= 6));
+    assert!(telemetry_value["candidate_artifact"]["changed_paths"]
+        .as_array()
+        .is_some_and(|paths| paths.iter().any(|path| path == "src/lib.rs")));
+    assert!(telemetry_value["candidate_artifact"]["diff"]
+        .as_str()
+        .is_some_and(|diff| diff.contains("src/lib.rs")));
     assert!(telemetry_value["lifecycle_events"]
         .as_array()
         .is_some_and(|events| {

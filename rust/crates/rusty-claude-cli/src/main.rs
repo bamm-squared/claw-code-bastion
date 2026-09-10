@@ -4918,6 +4918,35 @@ fn render_candidate_evaluation_diff(
     output
 }
 
+fn record_candidate_artifact(runtime: &BuiltRuntime, changes: &CandidateChangeSet) {
+    if changes.changes.is_empty() {
+        return;
+    }
+    let candidate_id = changes.id.to_string();
+    let changed_paths = changes
+        .changes
+        .iter()
+        .map(|change| change.path().display().to_string())
+        .collect::<Vec<_>>();
+    let candidate_diff = runtime.candidate_review_roots().map_or_else(
+        String::new,
+        |(baseline_root, candidate_root)| {
+            render_candidate_evaluation_diff(changes, &baseline_root, &candidate_root)
+        },
+    );
+    benchmark_telemetry::candidate_artifact(&candidate_id, &changed_paths, &candidate_diff);
+}
+
+fn finish_candidate_for_terminal(
+    runtime: &mut BuiltRuntime,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let changes = runtime.finish_candidate()?;
+    if let Some(changes) = changes.as_ref() {
+        record_candidate_artifact(runtime, changes);
+    }
+    Ok(())
+}
+
 fn render_candidate_file_selection(
     changes: &CandidateChangeSet,
     baseline_root: &Path,
@@ -6423,7 +6452,7 @@ impl LiveCli {
                         self.replace_runtime(runtime)?;
                         return self.run_turn_with_presentation(input, presentation);
                     }
-                    let _ = runtime.finish_candidate()?;
+                    finish_candidate_for_terminal(&mut runtime)?;
                     self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
                     benchmark_telemetry::work_unit_terminal("work_unit_budget_exhausted");
                     benchmark_telemetry::work_unit_checkpoint_reconciled(
@@ -6456,7 +6485,7 @@ impl LiveCli {
                                 if !self.grant_work_unit_continuation(
                                     "Resolve the active work unit before requesting whole-candidate submission.".to_string(),
                                 ) {
-                                    let _ = runtime.finish_candidate()?;
+                                    finish_candidate_for_terminal(&mut runtime)?;
                                     self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
                                     benchmark_telemetry::work_unit_terminal(
                                         "work_unit_budget_exhausted",
@@ -6509,7 +6538,7 @@ impl LiveCli {
                                     "work_unit_completion_deferred_without_candidate",
                                 );
                                 if self.work_unit_no_change_attempts >= 2 {
-                                    let _ = runtime.finish_candidate()?;
+                                    finish_candidate_for_terminal(&mut runtime)?;
                                     self.candidate_state =
                                         CandidateLifecycleState::EvaluationBlocked;
                                     benchmark_telemetry::work_unit_terminal(
@@ -6569,7 +6598,7 @@ impl LiveCli {
                         }
                         WriterCheckpoint::BoundedContinue { objective } => {
                             if objective.trim().is_empty() {
-                                let _ = runtime.finish_candidate()?;
+                                finish_candidate_for_terminal(&mut runtime)?;
                                 self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
                                 benchmark_telemetry::work_unit_terminal(
                                     "continuation_missing_objective",
@@ -6597,7 +6626,7 @@ impl LiveCli {
                                 objective
                             };
                             if !self.grant_work_unit_continuation(objective) {
-                                let _ = runtime.finish_candidate()?;
+                                finish_candidate_for_terminal(&mut runtime)?;
                                 self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
                                 benchmark_telemetry::work_unit_terminal(
                                     "completion_reconciliation_exhausted",
@@ -6625,7 +6654,7 @@ impl LiveCli {
                         WriterCheckpoint::Replan { message } => {
                             self.work_unit_no_change_attempts = 0;
                             if !self.task_plan.request_replan(&message) {
-                                let _ = runtime.finish_candidate()?;
+                                finish_candidate_for_terminal(&mut runtime)?;
                                 self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
                                 benchmark_telemetry::work_unit_terminal(
                                     "work_unit_replan_exhausted",
@@ -6658,7 +6687,7 @@ impl LiveCli {
                         }
                         WriterCheckpoint::Blocked { message }
                         | WriterCheckpoint::NeedsUserInput { message } => {
-                            let _ = runtime.finish_candidate()?;
+                            finish_candidate_for_terminal(&mut runtime)?;
                             self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
                             benchmark_telemetry::work_unit_terminal("writer_checkpoint_blocked");
                             benchmark_telemetry::work_unit_checkpoint_reconciled(
@@ -6902,7 +6931,7 @@ impl LiveCli {
                 render_candidate_evaluation_diff(&changes, &baseline_root, &candidate_root)
             },
         );
-        benchmark_telemetry::candidate_artifact(&candidate_id, &changed_paths, &candidate_diff);
+        record_candidate_artifact(runtime, &changes);
         if self.completion_audit_pending
             && self.completion_audit_candidate_id.as_deref() == Some(candidate_id.as_str())
         {
@@ -7390,7 +7419,7 @@ impl LiveCli {
                             | WriterCheckpoint::Replan { .. } => {}
                             WriterCheckpoint::Blocked { message }
                             | WriterCheckpoint::NeedsUserInput { message } => {
-                                let _ = runtime.finish_candidate()?;
+                                finish_candidate_for_terminal(&mut runtime)?;
                                 self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
                                 benchmark_telemetry::work_unit_terminal(
                                     "writer_checkpoint_blocked",
