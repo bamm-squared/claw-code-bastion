@@ -6338,7 +6338,7 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        self.run_turn_with_presentation(input, TurnPresentation::Text)
+        self.run_turn_with_presentation(input, TurnPresentation::Text, true)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -6346,6 +6346,7 @@ impl LiveCli {
         &mut self,
         input: &str,
         presentation: TurnPresentation,
+        interactive: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (_prompt, image_blocks) = self.prepare_user_turn(input)?;
         self.route_writer_for_current_task();
@@ -6380,7 +6381,7 @@ impl LiveCli {
                 &mut stdout,
             )?;
         }
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode, interactive);
         let result =
             runtime.run_turn_with_images(input, image_blocks, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
@@ -6450,7 +6451,7 @@ impl LiveCli {
                             None,
                         );
                         self.replace_runtime(runtime)?;
-                        return self.run_turn_with_presentation(input, presentation);
+                        return self.run_turn_with_presentation(input, presentation, interactive);
                     }
                     finish_candidate_for_terminal(&mut runtime)?;
                     self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
@@ -6508,7 +6509,11 @@ impl LiveCli {
                                     return Ok(());
                                 }
                                 self.replace_runtime(runtime)?;
-                                return self.run_turn_with_presentation(input, presentation);
+                                return self.run_turn_with_presentation(
+                                    input,
+                                    presentation,
+                                    interactive,
+                                );
                             }
                             benchmark_telemetry::lifecycle_event("writer_checkpoint_submit");
                         }
@@ -6562,7 +6567,11 @@ impl LiveCli {
                                     return Ok(());
                                 }
                                 self.replace_runtime(runtime)?;
-                                return self.run_turn_with_presentation(input, presentation);
+                                return self.run_turn_with_presentation(
+                                    input,
+                                    presentation,
+                                    interactive,
+                                );
                             }
                             self.work_unit_no_change_attempts = 0;
                             self.work_unit_completion_rejections = 0;
@@ -6592,7 +6601,11 @@ impl LiveCli {
                                     );
                                 }
                                 self.replace_runtime(runtime)?;
-                                return self.run_turn_with_presentation(input, presentation);
+                                return self.run_turn_with_presentation(
+                                    input,
+                                    presentation,
+                                    interactive,
+                                );
                             }
                             benchmark_telemetry::lifecycle_event("writer_checkpoint_submit");
                         }
@@ -6649,7 +6662,11 @@ impl LiveCli {
                                 return Ok(());
                             }
                             self.replace_runtime(runtime)?;
-                            return self.run_turn_with_presentation(input, presentation);
+                            return self.run_turn_with_presentation(
+                                input,
+                                presentation,
+                                interactive,
+                            );
                         }
                         WriterCheckpoint::Replan { message } => {
                             self.work_unit_no_change_attempts = 0;
@@ -6841,7 +6858,7 @@ impl LiveCli {
         output_format: CliOutputFormat,
         compact: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.run_turn_with_presentation(input, turn_presentation(output_format, compact))
+        self.run_turn_with_presentation(input, turn_presentation(output_format, compact), false)
     }
 
     fn render_terminal_result(
@@ -7402,7 +7419,10 @@ impl LiveCli {
             let image_blocks = self.image_blocks()?;
             let (mut runtime, hook_abort_monitor) =
                 self.prepare_turn_runtime(emit_output, original_input)?;
-            let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+            let mut permission_prompter = CliPermissionPrompter::new(
+                self.permission_mode,
+                emit_output && io::stdin().is_terminal(),
+            );
             let result = runtime.run_turn_with_images(
                 "Apply the focused correction package to the retained candidate. Do not discard valid existing changes.",
                 image_blocks,
@@ -8630,7 +8650,8 @@ impl LiveCli {
             self.permission_mode,
             progress,
         )?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let mut permission_prompter =
+            CliPermissionPrompter::new(self.permission_mode, io::stdin().is_terminal());
         let summary = runtime.run_turn(prompt, Some(&mut permission_prompter))?;
         let text = final_assistant_text(&summary).trim().to_string();
         runtime.shutdown_plugins()?;
@@ -11388,11 +11409,32 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
 
 struct CliPermissionPrompter {
     current_mode: PermissionMode,
+    interactive: bool,
 }
 
 impl CliPermissionPrompter {
-    fn new(current_mode: PermissionMode) -> Self {
-        Self { current_mode }
+    fn new(current_mode: PermissionMode, interactive: bool) -> Self {
+        Self {
+            current_mode,
+            interactive,
+        }
+    }
+
+    fn decision_from_response(
+        request: &runtime::PermissionRequest,
+        response: &str,
+    ) -> runtime::PermissionPromptDecision {
+        let normalized = response.trim().to_ascii_lowercase();
+        if matches!(normalized.as_str(), "y" | "yes") {
+            runtime::PermissionPromptDecision::Allow
+        } else {
+            runtime::PermissionPromptDecision::Deny {
+                reason: format!(
+                    "tool '{}' denied by user approval prompt",
+                    request.tool_name
+                ),
+            }
+        }
     }
 }
 
@@ -11402,6 +11444,16 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
         request: &runtime::PermissionRequest,
     ) -> runtime::PermissionPromptDecision {
         benchmark_telemetry::lifecycle_event("permission_requested");
+        if !self.interactive {
+            let decision = runtime::PermissionPromptDecision::Deny {
+                reason: format!(
+                    "tool '{}' denied automatically because execution is non-interactive",
+                    request.tool_name
+                ),
+            };
+            benchmark_telemetry::lifecycle_event("permission_denied");
+            return decision;
+        }
         println!();
         println!("Permission approval required");
         println!("  Tool             {}", request.tool_name);
@@ -11416,19 +11468,7 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
 
         let mut response = String::new();
         let decision = match io::stdin().read_line(&mut response) {
-            Ok(_) => {
-                let normalized = response.trim().to_ascii_lowercase();
-                if matches!(normalized.as_str(), "y" | "yes") {
-                    runtime::PermissionPromptDecision::Allow
-                } else {
-                    runtime::PermissionPromptDecision::Deny {
-                        reason: format!(
-                            "tool '{}' denied by user approval prompt",
-                            request.tool_name
-                        ),
-                    }
-                }
-            }
+            Ok(_) => Self::decision_from_response(request, &response),
             Err(error) => runtime::PermissionPromptDecision::Deny {
                 reason: format!("permission approval failed: {error}"),
             },
@@ -13937,10 +13977,10 @@ mod tests {
         slash_command_completion_candidates_with_sessions, status_context,
         summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
         validate_private_flags, write_mcp_server_fixture, CandidateLifecycleState, CliAction,
-        CliOutputFormat, CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
-        InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry,
-        ProviderPrivacyClass, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
-        STUB_COMMANDS,
+        CliOutputFormat, CliPermissionPrompter, CliToolExecutor, GitWorkspaceSummary,
+        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
+        PromptHistoryEntry, ProviderPrivacyClass, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        LATEST_SESSION_REFERENCE, STUB_COMMANDS,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use mock_anthropic_service::{MockAnthropicService, SCENARIO_PREFIX};
@@ -13949,7 +13989,8 @@ mod tests {
     };
     use runtime::{
         load_oauth_credentials, save_oauth_credentials, AssistantEvent, ConfigLoader, ContentBlock,
-        ConversationMessage, MessageRole, OAuthConfig, PermissionMode, Session, ToolExecutor,
+        ConversationMessage, MessageRole, OAuthConfig, PermissionMode, PermissionPromptDecision,
+        PermissionRequest, Session, ToolExecutor,
     };
     use serde_json::json;
     use std::env;
@@ -14897,6 +14938,48 @@ mod tests {
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
+            }
+        );
+    }
+
+    #[test]
+    fn noninteractive_permission_prompter_denies_without_reading_stdin() {
+        let mut prompter = CliPermissionPrompter::new(PermissionMode::WorkspaceWrite, false);
+        let request = PermissionRequest {
+            tool_name: "bash".to_string(),
+            input: r#"{"command":"grep -R doctor"}"#.to_string(),
+            current_mode: PermissionMode::WorkspaceWrite,
+            required_mode: PermissionMode::DangerFullAccess,
+            reason: Some("permission escalation".to_string()),
+        };
+
+        assert_eq!(
+            runtime::PermissionPrompter::decide(&mut prompter, &request),
+            PermissionPromptDecision::Deny {
+                reason: "tool 'bash' denied automatically because execution is non-interactive"
+                    .to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn interactive_permission_response_behavior_is_unchanged() {
+        let request = PermissionRequest {
+            tool_name: "bash".to_string(),
+            input: "{}".to_string(),
+            current_mode: PermissionMode::WorkspaceWrite,
+            required_mode: PermissionMode::DangerFullAccess,
+            reason: None,
+        };
+
+        assert_eq!(
+            CliPermissionPrompter::decision_from_response(&request, "yes\n"),
+            PermissionPromptDecision::Allow
+        );
+        assert_eq!(
+            CliPermissionPrompter::decision_from_response(&request, "no\n"),
+            PermissionPromptDecision::Deny {
+                reason: "tool 'bash' denied by user approval prompt".to_string(),
             }
         );
     }

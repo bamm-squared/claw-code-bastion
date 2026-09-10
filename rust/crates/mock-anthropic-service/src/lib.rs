@@ -97,6 +97,7 @@ enum Scenario {
     BashStdoutRoundtrip,
     BashPermissionPromptApproved,
     BashPermissionPromptDenied,
+    BashPermissionNonInteractiveDenied,
     PluginToolRoundtrip,
     AutoCompactTriggered,
     TokenCostReporting,
@@ -117,6 +118,9 @@ impl Scenario {
             "bash_stdout_roundtrip" => Some(Self::BashStdoutRoundtrip),
             "bash_permission_prompt_approved" => Some(Self::BashPermissionPromptApproved),
             "bash_permission_prompt_denied" => Some(Self::BashPermissionPromptDenied),
+            "bash_permission_noninteractive_denied" => {
+                Some(Self::BashPermissionNonInteractiveDenied)
+            }
             "plugin_tool_roundtrip" => Some(Self::PluginToolRoundtrip),
             "auto_compact_triggered" => Some(Self::AutoCompactTriggered),
             "token_cost_reporting" => Some(Self::TokenCostReporting),
@@ -138,6 +142,7 @@ impl Scenario {
             Self::BashStdoutRoundtrip => "bash_stdout_roundtrip",
             Self::BashPermissionPromptApproved => "bash_permission_prompt_approved",
             Self::BashPermissionPromptDenied => "bash_permission_prompt_denied",
+            Self::BashPermissionNonInteractiveDenied => "bash_permission_noninteractive_denied",
             Self::PluginToolRoundtrip => "plugin_tool_roundtrip",
             Self::AutoCompactTriggered => "auto_compact_triggered",
             Self::TokenCostReporting => "token_cost_reporting",
@@ -553,16 +558,18 @@ fn build_stream_body(request: &MessageRequest, scenario: Scenario) -> String {
                 &[r#"{"command":"printf 'approved via prompt'","timeout":1000}"#],
             ),
         },
-        Scenario::BashPermissionPromptDenied => match latest_tool_result(request) {
-            Some((tool_output, _)) => {
-                final_text_sse(&format!("bash denied as expected: {tool_output}"))
+        Scenario::BashPermissionPromptDenied | Scenario::BashPermissionNonInteractiveDenied => {
+            match latest_tool_result(request) {
+                Some((tool_output, _)) => {
+                    final_text_sse(&format!("bash denied as expected: {tool_output}"))
+                }
+                None => tool_use_sse(
+                    "toolu_bash_prompt_deny",
+                    "bash",
+                    &[r#"{"command":"printf 'should not run'","timeout":1000}"#],
+                ),
             }
-            None => tool_use_sse(
-                "toolu_bash_prompt_deny",
-                "bash",
-                &[r#"{"command":"printf 'should not run'","timeout":1000}"#],
-            ),
-        },
+        }
         Scenario::PluginToolRoundtrip => match latest_tool_result(request) {
             Some((tool_output, _)) => final_text_sse(&format!(
                 "plugin tool completed: {}",
@@ -866,18 +873,20 @@ fn build_message_response(request: &MessageRequest, scenario: Scenario) -> Messa
                 json!({"command": "printf 'approved via prompt'", "timeout": 1000}),
             ),
         },
-        Scenario::BashPermissionPromptDenied => match latest_tool_result(request) {
-            Some((tool_output, _)) => text_message_response(
-                "msg_bash_prompt_deny_final",
-                &format!("bash denied as expected: {tool_output}"),
-            ),
-            None => tool_message_response(
-                "msg_bash_prompt_deny_tool",
-                "toolu_bash_prompt_deny",
-                "bash",
-                json!({"command": "printf 'should not run'", "timeout": 1000}),
-            ),
-        },
+        Scenario::BashPermissionPromptDenied | Scenario::BashPermissionNonInteractiveDenied => {
+            match latest_tool_result(request) {
+                Some((tool_output, _)) => text_message_response(
+                    "msg_bash_prompt_deny_final",
+                    &format!("bash denied as expected: {tool_output}"),
+                ),
+                None => tool_message_response(
+                    "msg_bash_prompt_deny_tool",
+                    "toolu_bash_prompt_deny",
+                    "bash",
+                    json!({"command": "printf 'should not run'", "timeout": 1000}),
+                ),
+            }
+        }
         Scenario::PluginToolRoundtrip => match latest_tool_result(request) {
             Some((tool_output, _)) => text_message_response(
                 "msg_plugin_tool_final",
@@ -1126,6 +1135,7 @@ fn request_id_for(scenario: Scenario) -> &'static str {
         Scenario::BashStdoutRoundtrip => "req_bash_stdout_roundtrip",
         Scenario::BashPermissionPromptApproved => "req_bash_permission_prompt_approved",
         Scenario::BashPermissionPromptDenied => "req_bash_permission_prompt_denied",
+        Scenario::BashPermissionNonInteractiveDenied => "req_bash_permission_noninteractive_denied",
         Scenario::PluginToolRoundtrip => "req_plugin_tool_roundtrip",
         Scenario::AutoCompactTriggered => "req_auto_compact_triggered",
         Scenario::TokenCostReporting => "req_token_cost_reporting",

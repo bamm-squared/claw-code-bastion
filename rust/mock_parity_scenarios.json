@@ -63,9 +63,9 @@
     ]
   },
   {
-    "name": "bash_permission_prompt_approved",
+    "name": "bash_permission_noninteractive_denied",
     "category": "permissions",
-    "description": "Exercises workspace-write to bash escalation with a positive approval response.",
+    "description": "Exercises non-interactive workspace-write to bash escalation with deterministic denial.",
     "parity_refs": [
       "Mock parity harness \u2014 milestone 2 (behavioral expansion)",
       "Permission enforcement across tool paths"

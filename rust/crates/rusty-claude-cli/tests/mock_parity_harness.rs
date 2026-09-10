@@ -99,12 +99,12 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             resume_session: None,
         },
         ScenarioCase {
-            name: "bash_permission_prompt_approved",
+            name: "bash_permission_noninteractive_denied",
             permission_mode: "workspace-write",
             allowed_tools: Some("bash"),
-            stdin: Some("y\n"),
+            stdin: None,
             prepare: prepare_noop,
-            assert: assert_bash_permission_prompt_approved,
+            assert: assert_bash_permission_noninteractive_denied,
             extra_env: None,
             resume_session: None,
         },
@@ -220,8 +220,8 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             "multi_tool_turn_roundtrip",
             "bash_stdout_roundtrip",
             "bash_stdout_roundtrip",
-            "bash_permission_prompt_approved",
-            "bash_permission_prompt_approved",
+            "bash_permission_noninteractive_denied",
+            "bash_permission_noninteractive_denied",
             "bash_permission_prompt_denied",
             "bash_permission_prompt_denied",
             "plugin_tool_roundtrip",
@@ -998,36 +998,32 @@ fn assert_bash_stdout_roundtrip(_: &HarnessWorkspace, run: &ScenarioRun) {
         .contains("alpha from bash"));
 }
 
-fn assert_bash_permission_prompt_approved(_: &HarnessWorkspace, run: &ScenarioRun) {
-    assert!(run.stdout.contains("Permission approval required"));
-    assert!(run.stdout.contains("Approve this tool call? [y/N]:"));
+fn assert_bash_permission_noninteractive_denied(_: &HarnessWorkspace, run: &ScenarioRun) {
+    assert!(!run.stdout.contains("Permission approval required"));
+    assert!(!run.stdout.contains("Approve this tool call? [y/N]:"));
     assert_eq!(run.response["iterations"], Value::from(2));
     assert_eq!(
         run.response["tool_results"][0]["is_error"],
-        Value::Bool(false)
+        Value::Bool(true)
     );
     let tool_output = run.response["tool_results"][0]["output"]
         .as_str()
         .expect("tool output");
-    let parsed: Value = serde_json::from_str(tool_output).expect("bash output json");
-    assert_eq!(
-        parsed["stdout"],
-        Value::String("approved via prompt".to_string())
-    );
+    assert!(tool_output.contains("denied automatically because execution is non-interactive"));
     assert!(run.response["message"]
         .as_str()
         .expect("message text")
-        .contains("approved and executed"));
+        .contains("bash denied as expected"));
 }
 
 fn assert_bash_permission_prompt_denied(_: &HarnessWorkspace, run: &ScenarioRun) {
-    assert!(run.stdout.contains("Permission approval required"));
-    assert!(run.stdout.contains("Approve this tool call? [y/N]:"));
+    assert!(!run.stdout.contains("Permission approval required"));
+    assert!(!run.stdout.contains("Approve this tool call? [y/N]:"));
     assert_eq!(run.response["iterations"], Value::from(2));
     let tool_output = run.response["tool_results"][0]["output"]
         .as_str()
         .expect("tool output");
-    assert!(tool_output.contains("denied by user approval prompt"));
+    assert!(tool_output.contains("denied automatically because execution is non-interactive"));
     assert_eq!(
         run.response["tool_results"][0]["is_error"],
         Value::Bool(true)
