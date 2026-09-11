@@ -412,15 +412,9 @@ fn main() {
             .any(|w| w[0] == "--output-format" && w[1] == "json")
             || argv.iter().any(|a| a == "--output-format=json");
         if json_output {
-            let (short_reason, hint) = split_error_hint(&message);
             eprintln!(
                 "{}",
-                serde_json::json!({
-                    "type": "error",
-                    "error": short_reason,
-                    "kind": classify_error_kind(&message),
-                    "hint": hint,
-                })
+                json_error_value(&message, benchmark_telemetry::current_candidate_artifact(),)
             );
         } else if message.contains("`claw --help`") {
             eprintln!("error: {message}");
@@ -497,6 +491,20 @@ fn split_error_hint(message: &str) -> (String, Option<String>) {
         Some((short, hint)) => (short.to_string(), Some(hint.trim().to_string())),
         None => (message.to_string(), None),
     }
+}
+
+fn json_error_value(
+    message: &str,
+    candidate_artifact: Option<benchmark_telemetry::CandidateArtifact>,
+) -> Value {
+    let (short_reason, hint) = split_error_hint(message);
+    json!({
+        "type": "error",
+        "error": short_reason,
+        "kind": classify_error_kind(message),
+        "hint": hint,
+        "candidate_artifact": candidate_artifact.map_or(Value::Null, |artifact| json!(artifact)),
+    })
 }
 
 /// Read piped stdin content when stdin is not a terminal.
@@ -5356,18 +5364,19 @@ fn render_validation_evidence(validation: &runtime::validator::ValidationResult)
             format_validation_status(check.status),
             check.exit_code
         );
-        let diagnostic = if check.stderr.is_empty() {
-            &check.stdout
-        } else {
-            &check.stderr
+        let diagnostic = match (check.stdout.is_empty(), check.stderr.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => format!("stdout:\n{}", check.stdout),
+            (true, false) => format!("stderr:\n{}", check.stderr),
+            (false, false) => format!("stdout:\n{}\nstderr:\n{}", check.stdout, check.stderr),
         };
         if !diagnostic.is_empty() {
             output.push_str("diagnostic: ");
-            output.push_str(&truncate_for_summary(diagnostic, 2_000));
+            output.push_str(&compact_validation_diagnostic(&diagnostic, 2_000));
             output.push('\n');
         }
     }
-    truncate_for_summary(&output, 12_000)
+    compact_validation_diagnostic(&output, 12_000)
 }
 
 #[derive(Debug, Deserialize)]
@@ -7693,8 +7702,8 @@ impl LiveCli {
                     command: check.command.clone(),
                     status: format_validation_status(check.status).to_string(),
                     exit_code: check.exit_code,
-                    stdout: truncate_for_summary(&check.stdout, 2_000),
-                    stderr: truncate_for_summary(&check.stderr, 4_000),
+                    stdout: compact_validation_diagnostic(&check.stdout, 2_000),
+                    stderr: compact_validation_diagnostic(&check.stderr, 4_000),
                     truncated: check.truncated,
                 })
                 .collect(),
@@ -7760,6 +7769,9 @@ impl LiveCli {
                     self.rework_profile = self.selected_writer_profile.clone();
                     self.pending_rework = Some(model_router::EscalationPackage {
                         original_requirement: self.task_plan.authoritative_request().to_string(),
+                        candidate_identity: changes.id.to_string(),
+                        changed_paths: changed_paths.clone(),
+                        candidate_diff: bounded_rework_candidate_diff(&candidate_diff),
                         candidate_summary: format!("Changed paths: {}", changed_paths.join(", ")),
                         expected_contracts: self
                             .task_plan
@@ -7909,7 +7921,9 @@ impl LiveCli {
             }
             self.record_evaluation_rework(
                 &active_evaluation,
+                &changes.id.to_string(),
                 &changed_paths,
+                &candidate_diff,
                 &validation_diagnostics,
                 normal_apply_allowed,
             );
@@ -8365,7 +8379,9 @@ impl LiveCli {
     fn record_evaluation_rework(
         &mut self,
         evaluation: &requirement_evaluator::EvaluationReport,
+        candidate_identity: &str,
         changed_paths: &[String],
+        candidate_diff: &str,
         validation_evidence: &str,
         validation_passed: bool,
     ) {
@@ -8479,6 +8495,9 @@ impl LiveCli {
         }
         self.pending_rework = Some(model_router::EscalationPackage {
             original_requirement: self.task_plan.authoritative_request().to_string(),
+            candidate_identity: candidate_identity.to_string(),
+            changed_paths: changed_paths.to_vec(),
+            candidate_diff: bounded_rework_candidate_diff(candidate_diff),
             candidate_summary: format!("Changed paths: {}", changed_paths.join(", ")),
             expected_contracts: self
                 .task_plan
@@ -12662,8 +12681,11 @@ fn normalize_profile_reasoning(value: Option<&str>) -> Result<Option<String>, St
 
 fn render_escalation_package(package: &model_router::EscalationPackage) -> String {
     format!(
-        "Original requirement: {}\nCandidate: {}\nValidation: {}\nEvaluation findings:\n{}\nUnresolved questions:\n{}\nRelevant repository facts:\n{}\n",
+        "Original requirement: {}\nCandidate identity: {}\nChanged paths: {}\nCurrent bounded candidate diff:\n{}\nCandidate: {}\nValidation: {}\nEvaluation findings:\n{}\nUnresolved questions:\n{}\nRelevant repository facts:\n{}\n",
         package.original_requirement,
+        package.candidate_identity,
+        package.changed_paths.join(", "),
+        package.candidate_diff,
         package.candidate_summary,
         package.validation_evidence,
         package.evaluation_findings,
@@ -13818,6 +13840,106 @@ fn truncate_for_summary(value: &str, limit: usize) -> String {
     }
 }
 
+const REWORK_CANDIDATE_DIFF_MAX_CHARS: usize = 12_000;
+
+fn bounded_rework_candidate_diff(diff: &str) -> String {
+    let total = diff.chars().count();
+    if total <= REWORK_CANDIDATE_DIFF_MAX_CHARS {
+        return diff.to_string();
+    }
+    let marker = "\n... Candidate diff truncated for bounded rework context ...\n";
+    let available = REWORK_CANDIDATE_DIFF_MAX_CHARS.saturating_sub(marker.chars().count());
+    let head_len = available.saturating_mul(2) / 3;
+    let tail_len = available.saturating_sub(head_len);
+    let head = diff.chars().take(head_len).collect::<String>();
+    let tail = diff
+        .chars()
+        .skip(total.saturating_sub(tail_len))
+        .collect::<String>();
+    format!("{head}{marker}{tail}")
+}
+
+fn render_bounded_diagnostic_lines(lines: &[&str], budget: usize) -> String {
+    let mut output = String::new();
+    for line in lines {
+        let separator = usize::from(!output.is_empty());
+        let available = budget.saturating_sub(output.chars().count() + separator);
+        if available == 0 {
+            break;
+        }
+        if separator != 0 {
+            output.push('\n');
+        }
+        let line_chars = line.chars().count();
+        if line_chars <= available {
+            output.push_str(line);
+        } else {
+            output.extend(line.chars().take(available));
+            break;
+        }
+    }
+    output
+}
+
+fn validation_diagnostic_is_high_signal(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("error[")
+        || lower.contains("error:")
+        || lower.contains("failed")
+        || lower.contains("panic")
+        || lower.contains("assert")
+        || lower.contains("test result")
+        || lower.contains("could not compile")
+        || lower.contains("diff in ")
+        || lower.contains("for more information")
+        || line.trim_start().starts_with("-->")
+}
+
+fn compact_validation_diagnostic(value: &str, limit: usize) -> String {
+    let trimmed = value.trim();
+    if trimmed.chars().count() <= limit {
+        return trimmed.to_string();
+    }
+    if limit < 128 {
+        return truncate_for_summary(trimmed, limit);
+    }
+
+    let lines = trimmed.lines().collect::<Vec<_>>();
+    let head_lines = lines.iter().take(12).copied().collect::<Vec<_>>();
+    let tail_lines = lines.iter().rev().take(12).copied().collect::<Vec<_>>();
+    let tail_lines = tail_lines.into_iter().rev().collect::<Vec<_>>();
+    let signal_lines = lines
+        .iter()
+        .copied()
+        .filter(|line| validation_diagnostic_is_high_signal(line))
+        .filter(|line| !head_lines.contains(line) && !tail_lines.contains(line))
+        .collect::<Vec<_>>();
+
+    let budget = limit.saturating_sub(96);
+    let head = render_bounded_diagnostic_lines(&head_lines, budget / 4);
+    let signal = render_bounded_diagnostic_lines(&signal_lines, budget / 2);
+    let tail = render_bounded_diagnostic_lines(
+        &tail_lines,
+        budget.saturating_sub(budget / 4).saturating_sub(budget / 2),
+    );
+    let mut sections = Vec::new();
+    if !head.is_empty() {
+        sections.push(format!("head:\n{head}"));
+    }
+    if !signal.is_empty() {
+        sections.push(format!("high-signal:\n{signal}"));
+    }
+    if !tail.is_empty() {
+        sections.push(format!("tail:\n{tail}"));
+    }
+    let compact = sections.join("\n");
+    if compact.is_empty() {
+        truncate_for_summary(trimmed, limit)
+    } else {
+        compact
+    }
+}
+
 fn truncate_output_for_display(content: &str, max_lines: usize, max_chars: usize) -> String {
     let original = content.trim_end_matches('\n');
     if original.is_empty() {
@@ -14889,6 +15011,68 @@ mod tests {
         assert_eq!(
             classify_error_kind("plugin manifest is invalid"),
             "plugin_manifest_invalid"
+        );
+    }
+
+    #[test]
+    fn validation_diagnostic_compaction_keeps_high_signal_and_tail() {
+        let mut input = String::from("validator started\n");
+        input.push_str(&"ordinary build output\n".repeat(160));
+        input.push_str("error[E0061]: this function takes 2 arguments but 1 was supplied\n");
+        input.push_str(" --> crates/runtime/src/lib.rs:42:7\n");
+        input.push_str("test result: FAILED. 1 failed; 20 passed\n");
+        input.push_str(&"secondary output\n".repeat(80));
+        input.push_str("final validator summary: failed\n");
+
+        let compact = super::compact_validation_diagnostic(&input, 1_200);
+        assert!(compact.chars().count() <= 1_200);
+        assert!(compact.contains("error[E0061]"));
+        assert!(compact.contains("lib.rs:42:7"));
+        assert!(compact.contains("test result: FAILED"));
+        assert!(compact.contains("final validator summary: failed"));
+    }
+
+    #[test]
+    fn rework_packet_preserves_current_candidate_identity_and_diff() {
+        let package = super::model_router::EscalationPackage {
+            original_requirement: "implement behavior".to_string(),
+            candidate_identity: "candidate-42".to_string(),
+            changed_paths: vec!["src/lib.rs".to_string()],
+            candidate_diff: "+ bounded change".to_string(),
+            candidate_summary: "Changed paths: src/lib.rs".to_string(),
+            expected_contracts: "contract-1".to_string(),
+            evaluation_findings: "missing focused evidence".to_string(),
+            validation_evidence: "cargo test failed".to_string(),
+            repository_intelligence: "src/lib.rs".to_string(),
+            unresolved_questions: Vec::new(),
+        };
+
+        let rendered = super::render_escalation_package(&package);
+        assert!(rendered.contains("Candidate identity: candidate-42"));
+        assert!(rendered.contains("Changed paths: src/lib.rs"));
+        assert!(rendered.contains("+ bounded change"));
+    }
+
+    #[test]
+    fn json_error_projection_retains_terminal_candidate_artifact() {
+        let value = super::json_error_value(
+            "validation failed\nrepair is bounded",
+            Some(super::benchmark_telemetry::CandidateArtifact {
+                candidate_identity: "candidate-42".to_string(),
+                changed_paths: vec!["src/lib.rs".to_string()],
+                truncated: false,
+                diff: "+ bounded change".to_string(),
+            }),
+        );
+
+        assert_eq!(value["type"], "error");
+        assert_eq!(
+            value["candidate_artifact"]["candidate_identity"],
+            "candidate-42"
+        );
+        assert_eq!(
+            value["candidate_artifact"]["changed_paths"][0],
+            "src/lib.rs"
         );
     }
 

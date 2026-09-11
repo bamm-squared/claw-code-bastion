@@ -835,6 +835,9 @@ pub struct RouteDecision {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EscalationPackage {
     pub original_requirement: String,
+    pub candidate_identity: String,
+    pub changed_paths: Vec<String>,
+    pub candidate_diff: String,
     pub candidate_summary: String,
     pub expected_contracts: String,
     pub evaluation_findings: String,
