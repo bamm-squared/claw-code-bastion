@@ -12993,7 +12993,6 @@ const STUB_COMMANDS: &[&str] = &[
     "keybindings",
     "privacy-settings",
     "plan",
-    "review",
     "tasks",
     "theme",
     "voice",
@@ -18403,6 +18402,8 @@ UU conflicted.rs",
                 "stub command {with_slash} should not appear in REPL completions"
             );
         }
+        assert!(candidates.contains(&"/review".to_string()));
+        assert!(!STUB_COMMANDS.contains(&"review"));
     }
 }
 
