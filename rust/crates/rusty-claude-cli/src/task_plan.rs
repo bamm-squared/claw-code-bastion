@@ -1360,7 +1360,7 @@ fn split_request_sentences(request: &str) -> Vec<&str> {
     for (index, character) in request.char_indices() {
         let next = request[index + character.len_utf8()..].chars().next();
         let punctuation_boundary =
-            matches!(character, '.' | '!' | '?') && next.map_or(true, char::is_whitespace);
+            matches!(character, '.' | '!' | '?') && next.is_none_or(char::is_whitespace);
         if character == '\n' || punctuation_boundary {
             clauses.push(&request[start..index]);
             start = index + character.len_utf8();

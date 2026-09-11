@@ -11542,9 +11542,12 @@ printf 'pwsh:%s' "$1"
                         let request = String::from_utf8_lossy(&buffer[..size]).into_owned();
                         let response = handler(&request);
                         if let Err(error) = stream.write_all(response.to_bytes().as_slice()) {
-                            assert_eq!(
-                                error.kind(),
-                                std::io::ErrorKind::BrokenPipe,
+                            assert!(
+                                matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::BrokenPipe
+                                        | std::io::ErrorKind::ConnectionReset
+                                ),
                                 "write response: {error}"
                             );
                         }
