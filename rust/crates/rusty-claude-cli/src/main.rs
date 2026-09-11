@@ -4645,6 +4645,8 @@ struct LiveCli {
     work_unit_turn_allowance: usize,
     work_unit_continuation_grants: u8,
     work_unit_budget_id: Option<String>,
+    work_unit_finalization_pending: bool,
+    work_unit_finalization_used: bool,
 }
 
 #[derive(Clone)]
@@ -5992,6 +5994,8 @@ impl LiveCli {
             work_unit_turn_allowance: 0,
             work_unit_continuation_grants: 0,
             work_unit_budget_id: None,
+            work_unit_finalization_pending: false,
+            work_unit_finalization_used: false,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -6461,6 +6465,8 @@ impl LiveCli {
             self.work_unit_writer_turns = 0;
             self.work_unit_turn_allowance = 0;
             self.work_unit_continuation_grants = 0;
+            self.work_unit_finalization_pending = false;
+            self.work_unit_finalization_used = false;
         }
         if self.exploration_input.as_deref() == Some(input) || self.pending_rework.is_some() {
             return Ok(());
@@ -6582,6 +6588,8 @@ impl LiveCli {
         self.work_unit_budget_id = current_id.clone();
         self.work_unit_writer_turns = 0;
         self.work_unit_continuation_grants = 0;
+        self.work_unit_finalization_pending = false;
+        self.work_unit_finalization_used = false;
         self.work_unit_turn_allowance = current_id.map_or(0, |_| {
             work_unit_iteration_budget(self.task_plan.planning_mode())
                 .saturating_add(WRITER_BASE_RUNWAY_RESERVE)
@@ -6740,7 +6748,20 @@ impl LiveCli {
         let remaining_work_unit_turns = self
             .work_unit_turn_allowance
             .saturating_sub(self.work_unit_writer_turns);
-        if self.task_plan.current_work_unit().is_some() && remaining_work_unit_turns == 0 {
+        let candidate_changed_at_boundary = self.task_plan.current_work_unit().is_some()
+            && remaining_work_unit_turns == 0
+            && self.runtime.candidate_has_changes()?.unwrap_or(false);
+        let finalization_only = self.work_unit_finalization_pending
+            || (candidate_changed_at_boundary && !self.work_unit_finalization_used);
+        self.work_unit_finalization_pending = false;
+        if candidate_changed_at_boundary && !self.work_unit_finalization_used {
+            self.work_unit_finalization_used = true;
+            benchmark_telemetry::lifecycle_event("work_unit_convergence_finalization_requested");
+        }
+        if self.task_plan.current_work_unit().is_some()
+            && remaining_work_unit_turns == 0
+            && !finalization_only
+        {
             return Err(
                 "work unit writer budget exhausted; no further writer request is permitted".into(),
             );
@@ -6829,8 +6850,15 @@ impl LiveCli {
         } else {
             runtime.with_repository_context(plan_text)
         }
-        .with_writer_checkpoint_policy(remaining_work_unit_turns, 1);
-        let runtime = if self.task_plan.current_work_unit().is_some() {
+        .with_writer_checkpoint_policy(
+            if finalization_only {
+                0
+            } else {
+                remaining_work_unit_turns
+            },
+            1,
+        );
+        let runtime = if self.task_plan.current_work_unit().is_some() && !finalization_only {
             runtime.with_orchestrator_checkpointing()
         } else {
             runtime
@@ -6949,41 +6977,117 @@ impl LiveCli {
                         "work_unit_completion_reconciliation_feedback",
                     );
                 }
-                if let Some(reason) = runtime.checkpoint_reason().map(ToOwned::to_owned) {
-                    benchmark_telemetry::lifecycle_event("writer_checkpoint_automatic");
-                    let at_allowance = self.work_unit_writer_turns >= self.work_unit_turn_allowance;
-                    let can_continue = if at_allowance {
-                        self.grant_work_unit_continuation(
-                            "Continue the active work-unit implementation and use the available candidate feedback to reach its owned outcome.".to_string(),
-                        )
-                    } else {
-                        true
-                    };
-                    if can_continue {
-                        benchmark_telemetry::work_unit_checkpoint_reconciled(
-                            "automatic_continue",
-                            Some(&reason),
-                            None,
+                // Candidate checks can be the final event in a normal writer
+                // turn. In that path the runtime returns its checkpoint
+                // before the automatic-boundary branch below runs. Preserve
+                // the same bounded finalization opportunity here so a clean
+                // late candidate is not stranded merely because the check
+                // tool, rather than a turn-budget marker, ended the turn.
+                if summary.checkpoint.is_none()
+                    && runtime.checkpoint_candidate_check_ran()
+                    && self.task_plan.current_work_unit().is_some()
+                    && self.work_unit_writer_turns >= self.work_unit_turn_allowance
+                    && runtime.candidate_has_changes()?.unwrap_or(false)
+                {
+                    if !self.work_unit_finalization_used {
+                        self.work_unit_finalization_used = true;
+                        self.work_unit_finalization_pending = true;
+                        benchmark_telemetry::lifecycle_event(
+                            "work_unit_convergence_finalization_requested",
                         );
                         self.replace_runtime(runtime)?;
                         return self.run_turn_with_presentation(input, presentation, interactive);
                     }
-                    finish_candidate_for_terminal(&mut runtime)?;
-                    self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
-                    benchmark_telemetry::work_unit_terminal("work_unit_budget_exhausted");
-                    benchmark_telemetry::work_unit_checkpoint_reconciled(
-                        "terminated",
-                        Some(&reason),
-                        Some("work_unit_budget_exhausted"),
+                    benchmark_telemetry::lifecycle_event(
+                        "work_unit_implicit_submission_at_boundary",
                     );
+                    let automatic_rework =
+                        self.review_candidate_changes(&mut runtime, interactive)?;
                     self.replace_runtime(runtime)?;
+                    if automatic_rework {
+                        self.run_automatic_rework(input, presentation.emits_tool_output())?;
+                    }
                     self.persist_session()?;
-                    self.render_terminal_result(
-                        presentation,
-                        &summary,
-                        Some("work_unit_budget_exhausted"),
-                    )?;
+                    self.context_tray.clear();
+                    self.attachments.clear();
                     return Ok(());
+                }
+                // A runtime finalization turn can both record the automatic
+                // boundary reason and capture the writer's explicit
+                // candidate_checkpoint. Reconcile the explicit lifecycle
+                // outcome first; otherwise a late, valid submission is
+                // discarded when the outer budget sees the same boundary.
+                if summary.checkpoint.is_none() {
+                    if let Some(reason) = runtime.checkpoint_reason().map(ToOwned::to_owned) {
+                        benchmark_telemetry::lifecycle_event("writer_checkpoint_automatic");
+                        let at_allowance =
+                            self.work_unit_writer_turns >= self.work_unit_turn_allowance;
+                        let can_continue = if at_allowance {
+                            let candidate_changed =
+                                runtime.candidate_has_changes()?.unwrap_or(false);
+                            if candidate_changed {
+                                // A changed candidate at the hard boundary is
+                                // already a bounded submission opportunity.
+                                // Route it through the existing trusted
+                                // review/evaluation path instead of spending
+                                // another model turn rediscovering how to
+                                // submit. Incomplete work is rejected with
+                                // the normal concrete rework package; a
+                                // complete candidate advances normally.
+                                benchmark_telemetry::lifecycle_event(
+                                    "work_unit_implicit_submission_at_boundary",
+                                );
+                                let automatic_rework =
+                                    self.review_candidate_changes(&mut runtime, interactive)?;
+                                self.replace_runtime(runtime)?;
+                                if automatic_rework {
+                                    self.run_automatic_rework(
+                                        input,
+                                        presentation.emits_tool_output(),
+                                    )?;
+                                }
+                                self.persist_session()?;
+                                self.context_tray.clear();
+                                self.attachments.clear();
+                                return Ok(());
+                            } else {
+                                self.grant_work_unit_continuation(
+                                    "Continue the active work-unit implementation and use the available candidate feedback to reach its owned outcome.".to_string(),
+                                )
+                            }
+                        } else {
+                            true
+                        };
+                        if can_continue {
+                            benchmark_telemetry::work_unit_checkpoint_reconciled(
+                                "automatic_continue",
+                                Some(&reason),
+                                None,
+                            );
+                            self.replace_runtime(runtime)?;
+                            return self.run_turn_with_presentation(
+                                input,
+                                presentation,
+                                interactive,
+                            );
+                        }
+                        finish_candidate_for_terminal(&mut runtime)?;
+                        self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
+                        benchmark_telemetry::work_unit_terminal("work_unit_budget_exhausted");
+                        benchmark_telemetry::work_unit_checkpoint_reconciled(
+                            "terminated",
+                            Some(&reason),
+                            Some("work_unit_budget_exhausted"),
+                        );
+                        self.replace_runtime(runtime)?;
+                        self.persist_session()?;
+                        self.render_terminal_result(
+                            presentation,
+                            &summary,
+                            Some("work_unit_budget_exhausted"),
+                        )?;
+                        return Ok(());
+                    }
                 }
                 if let Some(checkpoint) = runtime.take_checkpoint() {
                     match checkpoint {
@@ -7001,26 +7105,28 @@ impl LiveCli {
                                 if !self.grant_work_unit_continuation(
                                     "Resolve the active work unit before requesting whole-candidate submission.".to_string(),
                                 ) {
-                                    finish_candidate_for_terminal(&mut runtime)?;
-                                    self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
-                                    benchmark_telemetry::work_unit_terminal(
-                                        "work_unit_budget_exhausted",
-                                    );
-                                    benchmark_telemetry::work_unit_checkpoint_reconciled(
-                                        "terminated",
-                                        None,
-                                        Some("work_unit_budget_exhausted"),
-                                    );
+                                    // A submit is still a useful convergence
+                                    // signal even when the plan has unresolved
+                                    // downstream units. If no continuation
+                                    // grant remains, preserve the candidate and
+                                    // send it through the existing trusted
+                                    // review path instead of discarding the
+                                    // writer's final engineering state.
                                     benchmark_telemetry::lifecycle_event(
-                                        "work_unit_budget_exhausted",
+                                        "work_unit_submit_reconciled_at_boundary",
                                     );
+                                    let automatic_rework = self
+                                        .review_candidate_changes(&mut runtime, interactive)?;
                                     self.replace_runtime(runtime)?;
+                                    if automatic_rework {
+                                        self.run_automatic_rework(
+                                            input,
+                                            presentation.emits_tool_output(),
+                                        )?;
+                                    }
                                     self.persist_session()?;
-                                    self.render_terminal_result(
-                                        presentation,
-                                        &summary,
-                                        Some("work_unit_budget_exhausted"),
-                                    )?;
+                                    self.context_tray.clear();
+                                    self.attachments.clear();
                                     return Ok(());
                                 }
                                 self.replace_runtime(runtime)?;
