@@ -6404,6 +6404,11 @@ impl LiveCli {
             request: input.to_string(),
             selection: repository_context.clone(),
         });
+        // Mark exploration complete before any optional-stage early return.
+        // Controlled runs commonly disable provider-backed exploration; if
+        // this marker is omitted, every recursive checkpoint/continuation is
+        // mistaken for a new task and resets the WU budget.
+        self.exploration_input = Some(input.to_string());
         if !self.explorer_role_enabled() {
             orchestration_trace("exploration_stage_skipped reason=controlled_provider_roles");
             return Ok(());
@@ -6411,7 +6416,6 @@ impl LiveCli {
         let signals = routing_signals(&self.task_plan);
         let questions = exploration::questions_for(signals);
         orchestration_trace(format!("exploration_decision jobs={}", questions.len()));
-        self.exploration_input = Some(input.to_string());
         if questions.is_empty() || self.routing_policy.disable_automatic {
             return Ok(());
         }
