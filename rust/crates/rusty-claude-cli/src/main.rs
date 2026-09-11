@@ -5759,6 +5759,10 @@ impl HookAbortMonitor {
     }
 }
 
+fn automatic_rework_has_active_work_unit(plan: &task_plan::TaskPlan) -> bool {
+    plan.current_work_unit().is_some() && !plan.all_work_units_resolved()
+}
+
 impl LiveCli {
     fn new(
         model: String,
@@ -8134,6 +8138,44 @@ impl LiveCli {
             if self.pending_rework.is_none() {
                 return Ok(());
             }
+            if !automatic_rework_has_active_work_unit(&self.task_plan) {
+                let reason =
+                    "automatic rework stopped: no active unresolved work unit remains for a bounded writer request";
+                self.pending_rework = None;
+                self.rework_profile = None;
+                self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
+                benchmark_telemetry::evaluation_blocked(reason);
+                benchmark_telemetry::lifecycle_event(
+                    "automatic_rework_blocked_without_active_work_unit",
+                );
+                if emit_output {
+                    println!("Automatic rework stopped: {reason}");
+                }
+                return Ok(());
+            }
+            self.ensure_work_unit_budget();
+            let remaining_work_unit_turns = self
+                .work_unit_turn_allowance
+                .saturating_sub(self.work_unit_writer_turns);
+            if remaining_work_unit_turns == 0 {
+                let candidate_changed = self.runtime.candidate_has_changes()?.unwrap_or(false);
+                if !candidate_changed || self.work_unit_finalization_used {
+                    let reason =
+                        "automatic rework stopped: authoritative work-unit writer budget exhausted";
+                    self.pending_rework = None;
+                    self.rework_profile = None;
+                    self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
+                    benchmark_telemetry::work_unit_terminal("automatic_rework_budget_exhausted");
+                    benchmark_telemetry::evaluation_blocked(reason);
+                    benchmark_telemetry::lifecycle_event(
+                        "automatic_rework_blocked_at_work_unit_budget",
+                    );
+                    if emit_output {
+                        println!("Automatic rework stopped: {reason}");
+                    }
+                    return Ok(());
+                }
+            }
             if let Some(reason) = self.rework_blocked.take() {
                 if emit_output {
                     println!("Automatic rework stopped: {reason}");
@@ -8161,7 +8203,20 @@ impl LiveCli {
             );
             hook_abort_monitor.stop();
             match result {
-                Ok(_) => {
+                Ok(summary) => {
+                    self.work_unit_writer_turns = self
+                        .work_unit_writer_turns
+                        .saturating_add(summary.iterations);
+                    benchmark_telemetry::work_unit_budget(
+                        self.work_unit_writer_turns,
+                        self.work_unit_turn_allowance,
+                        self.work_unit_continuation_grants,
+                    );
+                    benchmark_telemetry::work_unit_checkpoint_runtime_state(
+                        self.work_unit_writer_turns,
+                        self.work_unit_turn_allowance,
+                        self.work_unit_continuation_grants,
+                    );
                     if let Some(checkpoint) = runtime.take_checkpoint() {
                         match checkpoint {
                             WriterCheckpoint::Submit { .. }
@@ -20069,5 +20124,18 @@ mod candidate_review_diff_tests {
         assert!(message.starts_with("frozen_plan_context_mismatch:"));
         assert!(message.contains("expected_plan_hash="));
         assert!(message.contains("observed_plan_hash="));
+    }
+
+    #[test]
+    fn automatic_rework_requires_an_active_unresolved_work_unit() {
+        let mut plan = super::task_plan::TaskPlan::from_request(
+            "Implement a local behavior and preserve compatibility.",
+            None,
+        );
+        assert!(super::automatic_rework_has_active_work_unit(&plan));
+        while plan.current_work_unit().is_some() {
+            plan.complete_current_work_unit("candidate implementation");
+        }
+        assert!(!super::automatic_rework_has_active_work_unit(&plan));
     }
 }
