@@ -830,8 +830,10 @@ impl TaskPlan {
         &self,
         changed_paths: &[String],
         missing_evidence: &[String],
+        candidate_test_evidence: bool,
     ) -> Vec<CompletionAuditGap> {
-        let has_test_change = changed_paths.iter().any(|path| is_test_path(path));
+        let has_test_change =
+            candidate_test_evidence || changed_paths.iter().any(|path| is_test_path(path));
         let evidence_is_incomplete = changed_paths.is_empty() || !has_test_change;
         if !evidence_is_incomplete {
             return Vec::new();
@@ -1704,6 +1706,7 @@ mod tests {
         let gaps = plan.completion_audit_gaps(
             &["src/tool.rs".to_string()],
             &["No interaction evidence".to_string()],
+            false,
         );
 
         assert_eq!(gaps.len(), 1);
@@ -1726,6 +1729,7 @@ mod tests {
             .completion_audit_gaps(
                 &["src/tool.rs".to_string(), "tests/tool.rs".to_string()],
                 &[],
+                false,
             )
             .is_empty());
     }

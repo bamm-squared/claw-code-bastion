@@ -7455,9 +7455,11 @@ impl LiveCli {
             self.completion_audit_candidate_id = None;
             self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
             benchmark_telemetry::lifecycle_event("completion_audit_blocked");
-            println!(
-                "Completion evidence audit stopped: the bounded follow-up did not change the candidate."
-            );
+            if interactive {
+                println!(
+                    "Completion evidence audit stopped: the bounded follow-up did not change the candidate."
+                );
+            }
             return Ok(false);
         }
 
@@ -7523,11 +7525,13 @@ impl LiveCli {
                 .as_ref()
                 .map(|selection| selection.text.as_str()),
             &self.task_plan.contracts,
+            Some(&candidate_diff),
         );
         if normal_apply_allowed {
             let completion_gaps = self.task_plan.completion_audit_gaps(
                 &changed_paths,
                 &validation_intelligence_evidence.missing_evidence,
+                validation_intelligence_evidence.candidate_test_evidence,
             );
             if !completion_gaps.is_empty() {
                 if self.completion_audit_cycles < MAX_COMPLETION_AUDIT_CYCLES {
@@ -7688,7 +7692,7 @@ impl LiveCli {
         if active_evaluation.has_rework_finding() {
             if let Err(error) = self.checkpoint_before_rework(runtime, &changes) {
                 eprintln!("warning: unable to create candidate checkpoint: {error}");
-            } else {
+            } else if interactive {
                 println!("Saved trusted candidate checkpoint before automatic rework.");
             }
             self.record_evaluation_rework(
@@ -7699,12 +7703,16 @@ impl LiveCli {
             );
             if self.pending_rework.is_some() {
                 self.candidate_state = CandidateLifecycleState::Editing;
-                println!("↻ Independent evaluation requested bounded automatic rework.");
+                if interactive {
+                    println!("↻ Independent evaluation requested bounded automatic rework.");
+                }
                 return Ok(true);
             }
         }
         if let Some(reason) = &self.rework_blocked {
-            println!("Automatic correction unavailable: {reason}");
+            if interactive {
+                println!("Automatic correction unavailable: {reason}");
+            }
         }
 
         // Do not let an intermediate evaluation/rework outcome change routing
@@ -7919,12 +7927,16 @@ impl LiveCli {
                 return Ok(());
             }
             if let Some(reason) = self.rework_blocked.take() {
-                println!("Automatic rework stopped: {reason}");
+                if emit_output {
+                    println!("Automatic rework stopped: {reason}");
+                }
                 return Ok(());
             }
             self.route_writer_for_current_task();
             if let Some(reason) = self.rework_blocked.take() {
-                println!("Automatic rework stopped: {reason}");
+                if emit_output {
+                    println!("Automatic rework stopped: {reason}");
+                }
                 return Ok(());
             }
             let image_blocks = self.image_blocks()?;
@@ -7961,7 +7973,9 @@ impl LiveCli {
                                     Some("writer_checkpoint_blocked"),
                                 );
                                 benchmark_telemetry::lifecycle_event("writer_checkpoint_blocked");
-                                println!("Writer checkpoint stopped before Review: {message}");
+                                if emit_output {
+                                    println!("Writer checkpoint stopped before Review: {message}");
+                                }
                                 let declared_contract_ids = self
                                     .task_plan
                                     .current_work_unit()
@@ -8027,9 +8041,11 @@ impl LiveCli {
                     self.completion_audit_pending = false;
                     self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
                     benchmark_telemetry::lifecycle_event("completion_audit_blocked");
-                    println!(
-                        "Completion evidence audit stopped: the bounded follow-up made no candidate changes."
-                    );
+                    if emit_output {
+                        println!(
+                            "Completion evidence audit stopped: the bounded follow-up made no candidate changes."
+                        );
+                    }
                 }
                 self.rework_profile = None;
                 return Ok(());

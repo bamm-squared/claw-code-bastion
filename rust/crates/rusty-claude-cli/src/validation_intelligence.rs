@@ -14,6 +14,7 @@ pub struct ValidationEvidencePlan {
     pub changed_areas: Vec<String>,
     pub known_relationships: Vec<String>,
     pub missing_evidence: Vec<String>,
+    pub candidate_test_evidence: bool,
 }
 
 impl ValidationEvidencePlan {
@@ -46,6 +47,7 @@ pub fn analyze(
     changed_paths: &[String],
     repository_context: Option<&str>,
     contracts: &[ExpectedContract],
+    candidate_diff: Option<&str>,
 ) -> ValidationEvidencePlan {
     let changed_areas = changed_paths
         .iter()
@@ -54,6 +56,7 @@ pub fn analyze(
         .collect::<Vec<_>>();
     let mut known_relationships = Vec::new();
     let mut missing_evidence = Vec::new();
+    let candidate_test_evidence = candidate_diff.is_some_and(contains_candidate_test_evidence);
 
     for path in changed_paths.iter().take(MAX_ITEMS) {
         let lines = repository_context
@@ -65,15 +68,24 @@ pub fn analyze(
             .take(4)
             .collect::<Vec<_>>();
         if lines.is_empty() {
-            missing_evidence.push(format!(
-                "No deterministic repository relationship was found for {path}; relevant test coverage is unknown."
-            ));
+            if candidate_test_evidence {
+                known_relationships.push(format!(
+                    "{path}: candidate diff includes focused test evidence"
+                ));
+            } else {
+                missing_evidence.push(format!(
+                    "No deterministic repository relationship was found for {path}; relevant test coverage is unknown."
+                ));
+            }
         } else {
             for line in lines {
                 known_relationships.push(format!("{path}: {line}"));
             }
         }
-        if !is_test_path(path) && !has_explicit_test_relationship(repository_context, path) {
+        if !is_test_path(path)
+            && !candidate_test_evidence
+            && !has_explicit_test_relationship(repository_context, path)
+        {
             missing_evidence.push(format!(
                 "No explicit deterministic test-to-code relationship is available for {path}."
             ));
@@ -97,6 +109,7 @@ pub fn analyze(
         changed_areas,
         known_relationships,
         missing_evidence,
+        candidate_test_evidence,
     }
 }
 
@@ -128,6 +141,20 @@ fn has_explicit_test_relationship(context: Option<&str>, path: &str) -> bool {
     })
 }
 
+fn contains_candidate_test_evidence(diff: &str) -> bool {
+    let lower = diff.to_ascii_lowercase();
+    [
+        "#[test]",
+        "#[tokio::test]",
+        "mod tests",
+        "describe(",
+        "test(",
+        "it(",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
 fn contains_evidence_expectation(expectation: &str) -> bool {
     let lower = expectation.to_ascii_lowercase();
     ["test", "validation", "evidence", "coverage"]
@@ -145,6 +172,7 @@ mod tests {
             &["src/session.rs".to_string()],
             Some("file: src/session.rs\npackage: app\nreferences: src/provider.rs\n"),
             &[],
+            None,
         );
         assert!(plan
             .missing_evidence
@@ -161,6 +189,7 @@ mod tests {
             &["src/session.rs".to_string()],
             Some("file: src/session.rs\ntests: src/session.rs <- tests/session.rs\n"),
             &[],
+            None,
         );
         assert!(plan
             .known_relationships
@@ -170,5 +199,24 @@ mod tests {
             .missing_evidence
             .iter()
             .any(|item| item.contains("test-to-code")));
+    }
+
+    #[test]
+    fn recognizes_tests_added_inside_a_changed_source_file() {
+        let plan = analyze(
+            &["src/lib.rs".to_string()],
+            None,
+            &[],
+            Some("+#[cfg(test)]\n+mod tests {\n+    #[test]\n+    fn behavior() {}\n+}"),
+        );
+        assert!(plan.candidate_test_evidence);
+        assert!(plan
+            .known_relationships
+            .iter()
+            .any(|item| item.contains("focused test evidence")));
+        assert!(!plan
+            .missing_evidence
+            .iter()
+            .any(|item| item.contains("test coverage is unknown")));
     }
 }
