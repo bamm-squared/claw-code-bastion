@@ -5199,8 +5199,22 @@ fn render_candidate_evaluation_diff(
 }
 
 fn record_candidate_artifact(runtime: &BuiltRuntime, changes: &CandidateChangeSet) {
-    if changes.changes.is_empty() {
+    let Some(artifact) = candidate_artifact_for(runtime, changes) else {
         return;
+    };
+    benchmark_telemetry::candidate_artifact(
+        &artifact.candidate_identity,
+        &artifact.changed_paths,
+        &artifact.diff,
+    );
+}
+
+fn candidate_artifact_for(
+    runtime: &BuiltRuntime,
+    changes: &CandidateChangeSet,
+) -> Option<benchmark_telemetry::CandidateArtifact> {
+    if changes.changes.is_empty() {
+        return None;
     }
     let candidate_id = changes.id.to_string();
     let changed_paths = changes
@@ -5214,7 +5228,12 @@ fn record_candidate_artifact(runtime: &BuiltRuntime, changes: &CandidateChangeSe
             render_candidate_evaluation_diff(changes, &baseline_root, &candidate_root)
         },
     );
-    benchmark_telemetry::candidate_artifact(&candidate_id, &changed_paths, &candidate_diff);
+    Some(benchmark_telemetry::CandidateArtifact {
+        candidate_identity: candidate_id,
+        changed_paths,
+        diff: candidate_diff,
+        truncated: false,
+    })
 }
 
 fn finish_candidate_for_terminal(
@@ -7351,7 +7370,7 @@ impl LiveCli {
     }
 
     fn render_terminal_result(
-        &self,
+        &mut self,
         presentation: TurnPresentation,
         summary: &runtime::TurnSummary,
         lifecycle_status: Option<&str>,
@@ -7405,8 +7424,16 @@ impl LiveCli {
                     self.candidate_state,
                     CandidateLifecycleState::ReviewReady
                 ));
-                result["candidate_artifact"] = benchmark_telemetry::current_candidate_artifact()
-                    .map_or(Value::Null, |artifact| json!(artifact));
+                let candidate_artifact =
+                    benchmark_telemetry::current_candidate_artifact().or_else(|| {
+                        self.runtime
+                            .finish_candidate()
+                            .ok()
+                            .flatten()
+                            .and_then(|changes| candidate_artifact_for(&self.runtime, &changes))
+                    });
+                result["candidate_artifact"] =
+                    candidate_artifact.map_or(Value::Null, |artifact| json!(artifact));
                 println!("{result}");
             }
         }
