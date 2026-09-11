@@ -484,7 +484,11 @@ impl ExecutionBackend for IsolatedExecutionBackend {
                 let stdout = truncate_development_output(&check.stdout, 4_000);
                 let stderr = truncate_development_output(&check.stderr, 8_000);
                 let (classification, code_failure) =
-                    validation_check_classification_for_candidate(check.status, candidate_changed);
+                    validation_check_classification_for_candidate_with_root(
+                        check,
+                        candidate_changed,
+                        &self.workspace.candidate.root,
+                    );
                 json!({
                     "name": check.name,
                     "command": check.command,
@@ -500,8 +504,11 @@ impl ExecutionBackend for IsolatedExecutionBackend {
                 })
             })
             .collect::<Vec<_>>();
-        let (classification, code_failure) =
-            development_check_classification(&validation, candidate_changed);
+        let (classification, code_failure) = development_check_classification_for_candidate(
+            &validation,
+            candidate_changed,
+            &self.workspace.candidate.root,
+        );
         let status = if classification == "infrastructure_failure" {
             "infrastructure_error"
         } else if classification == "success" {
@@ -519,7 +526,11 @@ impl ExecutionBackend for IsolatedExecutionBackend {
             "status": status,
             "classification": classification,
             "code_failure": code_failure,
-            "diagnostic": development_check_diagnostic(&validation, candidate_changed),
+            "diagnostic": development_check_diagnostic_for_candidate(
+                &validation,
+                candidate_changed,
+                &self.workspace.candidate.root,
+            ),
             "checks": checks,
             "authorizes_review": false,
             "authoritative": false,
@@ -805,9 +816,33 @@ fn development_check_classification(
     }
 }
 
-fn development_check_diagnostic(
+fn development_check_classification_for_candidate(
     validation: &runtime::validator::ValidationResult,
     candidate_changed: bool,
+    candidate_root: &Path,
+) -> (&'static str, bool) {
+    if validation.has_infrastructure_failure() {
+        return ("infrastructure_failure", false);
+    }
+    let failures = validation
+        .checks
+        .iter()
+        .filter(|check| check.status != runtime::ValidationStatus::Pass)
+        .collect::<Vec<_>>();
+    if !failures.is_empty()
+        && failures
+            .iter()
+            .all(|check| missing_locked_cargo_lock(check, candidate_root))
+    {
+        return ("infrastructure_failure", false);
+    }
+    development_check_classification(validation, candidate_changed)
+}
+
+fn development_check_diagnostic_for_candidate(
+    validation: &runtime::validator::ValidationResult,
+    candidate_changed: bool,
+    candidate_root: &Path,
 ) -> Option<String> {
     let diagnostics = validation
         .checks
@@ -819,8 +854,11 @@ fn development_check_diagnostic(
             } else {
                 check.stderr.trim()
             };
-            let (classification, _) =
-                validation_check_classification_for_candidate(check.status, candidate_changed);
+            let (classification, _) = validation_check_classification_for_candidate_with_root(
+                check,
+                candidate_changed,
+                candidate_root,
+            );
             format!(
                 "{} classification={} exit_code={:?}: {}",
                 check.name,
@@ -831,6 +869,34 @@ fn development_check_diagnostic(
         })
         .collect::<Vec<_>>();
     (!diagnostics.is_empty()).then(|| diagnostics.join("\n\n"))
+}
+
+fn validation_check_classification_for_candidate_with_root(
+    check: &runtime::validator::ValidationCheckResult,
+    candidate_changed: bool,
+    candidate_root: &Path,
+) -> (&'static str, bool) {
+    if missing_locked_cargo_lock(check, candidate_root) {
+        ("infrastructure_failure", false)
+    } else {
+        validation_check_classification_for_candidate(check.status, candidate_changed)
+    }
+}
+
+fn missing_locked_cargo_lock(
+    check: &runtime::validator::ValidationCheckResult,
+    candidate_root: &Path,
+) -> bool {
+    if check.status != runtime::ValidationStatus::Fail
+        || !check.command.contains("cargo ")
+        || !check.command.contains("--locked")
+        || candidate_root.join("Cargo.lock").is_file()
+    {
+        return false;
+    }
+    let output = format!("{}\n{}", check.stdout, check.stderr).to_ascii_lowercase();
+    output.contains("cannot create the lock file")
+        || output.contains("could not create the lock file")
 }
 
 fn validation_check_classification(status: runtime::ValidationStatus) -> (&'static str, bool) {
@@ -11026,6 +11092,31 @@ printf 'pwsh:%s' "$1"
             ),
             ("candidate_failure", true)
         );
+    }
+
+    #[test]
+    fn missing_locked_cargo_lock_is_infrastructure_feedback() {
+        let directory =
+            std::env::temp_dir().join(format!("claw-tools-missing-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("temporary candidate root");
+        let check = runtime::validator::ValidationCheckResult {
+            name: "cargo test --workspace".to_string(),
+            command: "cargo test --workspace --locked".to_string(),
+            required: true,
+            status: runtime::ValidationStatus::Fail,
+            exit_code: Some(101),
+            stdout: String::new(),
+            stderr: "error: cannot create the lock file because --locked was passed".to_string(),
+            truncated: false,
+        };
+
+        assert_eq!(
+            super::validation_check_classification_for_candidate_with_root(
+                &check, true, &directory,
+            ),
+            ("infrastructure_failure", false)
+        );
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
