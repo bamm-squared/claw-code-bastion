@@ -105,6 +105,9 @@ pub struct Snapshot {
     pub terminal_status: String,
     pub lifecycle_events: Vec<String>,
     pub provider_call_records: Vec<ProviderCallRecord>,
+    pub controlled_provider_profiles: Vec<String>,
+    pub controlled_provider_roles: Option<Vec<String>>,
+    pub controlled_provider_events: Vec<ControlledProviderEvent>,
     pub execution_stages: Vec<ExecutionStage>,
 }
 
@@ -136,6 +139,22 @@ pub struct ProviderCallRecord {
     pub cache_write_tokens: u64,
     pub estimated_cost_usd: Option<f64>,
     pub price_source: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Default)]
+pub struct ControlledProviderEvent {
+    pub sequence: u64,
+    pub timestamp_ms: u128,
+    pub role: String,
+    pub requested_profiles: Vec<String>,
+    pub requested_roles: Option<Vec<String>>,
+    pub resolved_profile: String,
+    pub provider: String,
+    pub model: String,
+    pub protocol: String,
+    pub selection_source: String,
+    pub allowed: bool,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Serialize, Default)]
@@ -1278,6 +1297,28 @@ pub fn writer_profile_preflight(
         s.snapshot.writer_profile_selection_source = Some(selection_source.to_string());
     });
     persist_snapshot();
+}
+
+pub fn controlled_provider_constraint(profiles: &[String], roles: Option<&[String]>) {
+    with_state(|s| {
+        s.snapshot.controlled_provider_profiles = profiles.to_vec();
+        s.snapshot.controlled_provider_roles = roles.map(<[String]>::to_vec);
+    });
+    persist_snapshot();
+}
+
+pub fn controlled_provider_event(mut event: ControlledProviderEvent) {
+    with_state(|s| {
+        event.sequence = s.snapshot.controlled_provider_events.len() as u64 + 1;
+        event.timestamp_ms = now_ms();
+        event.reason = bounded_diagnostic(&event.reason);
+        s.snapshot.controlled_provider_events.push(event);
+        if s.snapshot.controlled_provider_events.len() > 128 {
+            let excess = s.snapshot.controlled_provider_events.len() - 128;
+            s.snapshot.controlled_provider_events.drain(0..excess);
+        }
+    });
+    lifecycle_event("controlled_provider_role_preflight");
 }
 
 pub fn planning_state(plan: &crate::task_plan::TaskPlan) {

@@ -77,6 +77,8 @@ use tools::{
 };
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
+const CONTROLLED_PROVIDER_PROFILES_ENV: &str = "CLAW_CONTROLLED_PROVIDER_PROFILES";
+const CONTROLLED_PROVIDER_ROLES_ENV: &str = "CLAW_CONTROLLED_PROVIDER_ROLES";
 const WRITER_INSTRUCTION_VERSION: &str = "writer-workflow-v2";
 const WRITER_TOOL_SCHEMA_VERSION: &str = "runtime-tools-v2";
 const WRITER_WORKFLOW_GUIDANCE: &str = "[Engineering workflow]\nThe candidate workspace is isolated from the canonical repository. Candidate edits are reversible and non-authoritative until trusted Apply. When a plausible coherent implementation boundary is identified within the active work unit, make the smallest scoped candidate edit that tests the hypothesis; do not wait for proof that the first edit is final. Use candidate checks and focused tests as development feedback, then repair or refine within the existing bounds. For a structural edit based on a bounded read, prefer replace_range with that read's revision token; use edit_file for an unambiguous local replacement and write_file for a small fully-read file. Keep edits within the owned contracts and global invariants; do not bypass permissions, checks, validation, or authority gates.\n\nWork on the active executable work unit. Use its objective, owned contracts, downstream boundary, repository facts, and completion evidence as the engineering scope. The orchestrator owns budgets, checkpoints, continuation, reconciliation, validation, evaluation, and unit transitions. When the owned outcome is ready, use candidate_checkpoint with status unit_complete. Use submit only when all planned work units are complete. Report blocked or needs_user_input only when a required input, permission, repository surface, external dependency, plausible implementation boundary, requirement, or infrastructure is genuinely unavailable. Ordinary engineering uncertainty, multiple reasonable designs, compiler refinement, or tests exposing edge cases normally call for a bounded candidate hypothesis and feedback, not blocking.";
@@ -1464,6 +1466,11 @@ fn execute_calibration_case(
 ) -> Result<model_router::CalibrationCaseResult, String> {
     let started = Instant::now();
     let result = (|| -> Result<bool, String> {
+        if let Some(constraint) =
+            ControlledProviderConstraint::from_env().map_err(|error| error.to_string())?
+        {
+            constraint.validate("calibration", profile, "automatic_routing")?;
+        }
         let resolved_model = api::resolve_model_alias(&profile.model);
         let client = client_for_model_profile(profile)?;
         let system = match case.role {
@@ -4385,6 +4392,151 @@ struct ManagedSessionSummary {
     branch_name: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ControlledProviderConstraint {
+    allowed_profiles: BTreeSet<String>,
+    allowed_roles: Option<BTreeSet<String>>,
+}
+
+impl ControlledProviderConstraint {
+    fn from_env() -> Result<Option<Self>, Box<dyn std::error::Error>> {
+        let Some(raw_profiles) = env::var_os(CONTROLLED_PROVIDER_PROFILES_ENV) else {
+            return Ok(None);
+        };
+        let allowed_profiles = parse_controlled_provider_values(
+            CONTROLLED_PROVIDER_PROFILES_ENV,
+            raw_profiles.to_str().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{CONTROLLED_PROVIDER_PROFILES_ENV} must be valid UTF-8"),
+                )
+            })?,
+        )?;
+        let allowed_roles = env::var_os(CONTROLLED_PROVIDER_ROLES_ENV)
+            .map(|raw_roles| {
+                parse_controlled_provider_values(
+                    CONTROLLED_PROVIDER_ROLES_ENV,
+                    raw_roles.to_str().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("{CONTROLLED_PROVIDER_ROLES_ENV} must be valid UTF-8"),
+                        )
+                    })?,
+                )
+            })
+            .transpose()?;
+        if allowed_profiles.is_empty() {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{CONTROLLED_PROVIDER_PROFILES_ENV} must not be empty"),
+            )));
+        }
+        if allowed_roles.as_ref().is_some_and(BTreeSet::is_empty) {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{CONTROLLED_PROVIDER_ROLES_ENV} must not be empty"),
+            )));
+        }
+        Ok(Some(Self {
+            allowed_profiles,
+            allowed_roles,
+        }))
+    }
+
+    fn validate(
+        &self,
+        role: &str,
+        profile: &model_router::ModelProfile,
+        selection_source: &str,
+    ) -> Result<(), String> {
+        let requested_profiles = self.allowed_profiles.iter().cloned().collect::<Vec<_>>();
+        let requested_roles = self
+            .allowed_roles
+            .as_ref()
+            .map(|roles| roles.iter().cloned().collect::<Vec<_>>());
+        let result = if self
+            .allowed_roles
+            .as_ref()
+            .is_some_and(|roles| !roles.contains(role))
+        {
+            Err(format!(
+                "controlled_provider_role_mismatch: role {role} is not permitted for controlled execution"
+            ))
+        } else if !self.allowed_profiles.contains(&profile.id) {
+            Err(format!(
+                "controlled_provider_role_mismatch: role {role} resolved profile {} but controlled execution permits {:?}",
+                profile.id, requested_profiles
+            ))
+        } else {
+            Ok(())
+        };
+        let allowed = result.is_ok();
+        benchmark_telemetry::controlled_provider_event(
+            benchmark_telemetry::ControlledProviderEvent {
+                role: role.to_string(),
+                requested_profiles,
+                requested_roles,
+                resolved_profile: profile.id.clone(),
+                provider: profile.provider.clone(),
+                model: profile.model.clone(),
+                protocol: configured_provider_protocol(profile),
+                selection_source: selection_source.to_string(),
+                allowed,
+                reason: result
+                    .as_ref()
+                    .err()
+                    .cloned()
+                    .unwrap_or_else(|| "controlled provider constraint accepted".to_string()),
+                ..benchmark_telemetry::ControlledProviderEvent::default()
+            },
+        );
+        result
+    }
+
+    fn role_allowed(&self, role: &str) -> bool {
+        self.allowed_roles
+            .as_ref()
+            .is_none_or(|roles| roles.contains(role))
+    }
+}
+
+fn parse_controlled_provider_values(
+    variable: &str,
+    raw: &str,
+) -> Result<BTreeSet<String>, Box<dyn std::error::Error>> {
+    let values = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    if values.is_empty() {
+        return Err(Box::new(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{variable} must contain at least one value"),
+        )));
+    }
+    Ok(values)
+}
+
+fn configured_provider_protocol(profile: &model_router::ModelProfile) -> String {
+    profile.openai_compat.as_ref().map_or_else(
+        || "legacy".to_string(),
+        |compat| match compat.protocol {
+            api::OpenAiCompatProtocol::Responses => "responses".to_string(),
+            api::OpenAiCompatProtocol::ChatCompletions => "chat_completions".to_string(),
+        },
+    )
+}
+
+fn configured_exploration_budget() -> Option<Duration> {
+    env::var("CLAW_EXPLORATION_BUDGET_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+}
+
 struct LiveCli {
     model: String,
     allowed_tools: Option<AllowedToolSet>,
@@ -4415,6 +4567,7 @@ struct LiveCli {
     calibration_path: Option<PathBuf>,
     pending_rework: Option<model_router::EscalationPackage>,
     rework_profile: Option<model_router::ModelProfile>,
+    controlled_provider_constraint: Option<ControlledProviderConstraint>,
     rework_cycles: u8,
     validation_repair_cycles: u8,
     evaluator_rework_cycles: u8,
@@ -5553,6 +5706,19 @@ impl LiveCli {
         let cwd = repository_workspace_root()?;
         let config = ConfigLoader::default_for(&cwd).load()?;
         let model_pool = model_router::ModelPool::from_runtime_config(&config, &model);
+        let controlled_provider_constraint = ControlledProviderConstraint::from_env()?;
+        if let Some(constraint) = controlled_provider_constraint.as_ref() {
+            let profiles = constraint
+                .allowed_profiles
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            let roles = constraint
+                .allowed_roles
+                .as_ref()
+                .map(|values| values.iter().cloned().collect::<Vec<_>>());
+            benchmark_telemetry::controlled_provider_constraint(&profiles, roles.as_deref());
+        }
         let calibration_path = (!is_private_mode()).then(calibration_store_path);
         let calibration = if is_private_mode() {
             model_router::CalibrationStore::new()
@@ -5612,6 +5778,28 @@ impl LiveCli {
         } else {
             None
         };
+        if let Some(constraint) = controlled_provider_constraint.as_ref() {
+            let profile = explicit_writer_profile
+                .as_ref()
+                .or(bootstrap_profile.as_ref())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "controlled_provider_role_mismatch: writer has no concrete configured profile",
+                    )
+                })?;
+            constraint
+                .validate(
+                    "writer",
+                    profile,
+                    if requested_writer_model.is_some() {
+                        "explicit_operator_pin"
+                    } else {
+                        "automatic_routing"
+                    },
+                )
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        }
         let effective_model = explicit_writer_profile
             .as_ref()
             .or(bootstrap_profile.as_ref())
@@ -5703,6 +5891,7 @@ impl LiveCli {
             calibration_path,
             pending_rework: None,
             rework_profile: None,
+            controlled_provider_constraint,
             rework_cycles: 0,
             validation_repair_cycles: 0,
             evaluator_rework_cycles: 0,
@@ -6173,7 +6362,7 @@ impl LiveCli {
         Ok(expanded)
     }
 
-    fn prepare_exploration(&mut self, input: &str) {
+    fn prepare_exploration(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         orchestration_trace("exploration_started");
         if self.exploration_input.as_deref() != Some(input) && self.pending_rework.is_none() {
             self.writer_profile_owner = None;
@@ -6192,7 +6381,7 @@ impl LiveCli {
             self.work_unit_continuation_grants = 0;
         }
         if self.exploration_input.as_deref() == Some(input) || self.pending_rework.is_some() {
-            return;
+            return Ok(());
         }
         // Findings are scoped to the request that produced them. Clear them
         // before any later early return so a new task cannot inherit stale
@@ -6200,7 +6389,7 @@ impl LiveCli {
         self.exploration_context = None;
         let Some(repository_context) = build_repository_context(input, None) else {
             self.exploration_input = Some(input.to_string());
-            return;
+            return Ok(());
         };
         if self.frozen_plan_hash.is_none() {
             self.task_plan.update(input, Some(&repository_context.text));
@@ -6215,12 +6404,16 @@ impl LiveCli {
             request: input.to_string(),
             selection: repository_context.clone(),
         });
+        if !self.explorer_role_enabled() {
+            orchestration_trace("exploration_stage_skipped reason=controlled_provider_roles");
+            return Ok(());
+        }
         let signals = routing_signals(&self.task_plan);
         let questions = exploration::questions_for(signals);
         orchestration_trace(format!("exploration_decision jobs={}", questions.len()));
         self.exploration_input = Some(input.to_string());
         if questions.is_empty() || self.routing_policy.disable_automatic {
-            return;
+            return Ok(());
         }
         let mut jobs = Vec::new();
         for question in questions {
@@ -6236,8 +6429,9 @@ impl LiveCli {
             }
         }
         if jobs.is_empty() {
-            return;
+            return Ok(());
         }
+        self.validate_controlled_explorer_jobs(&jobs)?;
         let same_endpoint = jobs.windows(2).all(|pair| {
             pair[0].1.provider == pair[1].1.provider && pair[0].1.endpoint == pair[1].1.endpoint
         });
@@ -6247,17 +6441,21 @@ impl LiveCli {
             .unwrap_or(3);
         let max_concurrent = if same_endpoint { 1 } else { configured_limit };
         let evidence = format!("Requirement: {}\n{}", input, repository_context.text);
-        let exploration_budget = env::var("CLAW_EXPLORATION_BUDGET_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .map(std::time::Duration::from_millis);
+        let exploration_budget = configured_exploration_budget();
+        let controlled_provider_constraint = self.controlled_provider_constraint.clone();
         let synthesis = exploration::run_parallel_with_budget(
             jobs,
             evidence,
             max_concurrent,
             exploration_budget,
-            |question, profile, evidence| execute_explorer_profile(profile, question, evidence),
+            |question, profile, evidence| {
+                execute_explorer_profile(
+                    profile,
+                    question,
+                    evidence,
+                    controlled_provider_constraint.as_ref(),
+                )
+            },
         );
         orchestration_trace(format!(
             "exploration_stage_completed launched={} results={}",
@@ -6267,6 +6465,27 @@ impl LiveCli {
         if synthesis.launched > 0 {
             self.exploration_context = Some(synthesis.context);
         }
+        Ok(())
+    }
+
+    fn explorer_role_enabled(&self) -> bool {
+        self.controlled_provider_constraint
+            .as_ref()
+            .is_none_or(|constraint| constraint.role_allowed("explorer"))
+    }
+
+    fn validate_controlled_explorer_jobs(
+        &self,
+        jobs: &[(exploration::ExplorerQuestion, model_router::ModelProfile)],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(constraint) = self.controlled_provider_constraint.as_ref() {
+            for (_, profile) in jobs {
+                constraint
+                    .validate("explorer", profile, "automatic_routing")
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            }
+        }
+        Ok(())
     }
 
     fn reset_work_unit_budget(&mut self) {
@@ -6458,6 +6677,19 @@ impl LiveCli {
             });
         if let Some(profile) = self.selected_writer_profile.as_ref() {
             set_provider_telemetry_context("writer", profile);
+            if let Some(constraint) = self.controlled_provider_constraint.as_ref() {
+                constraint
+                    .validate(
+                        "writer",
+                        profile,
+                        if self.explicit_writer_request.is_some() {
+                            "explicit_operator_pin"
+                        } else {
+                            "automatic_routing"
+                        },
+                    )
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            }
         }
         if let Some(effort) = self.reasoning_effort_override.as_deref() {
             benchmark_telemetry::set_provider_reasoning(effort, &format!("explicit_{effort}"));
@@ -7012,7 +7244,7 @@ impl LiveCli {
         input: &str,
     ) -> Result<(String, Vec<ContentBlock>), Box<dyn std::error::Error>> {
         self.validate_frozen_context_before_provider(input)?;
-        self.prepare_exploration(input);
+        self.prepare_exploration(input)?;
         let prompt = self.prompt_with_context(input)?;
         let image_blocks = self.image_blocks()?;
         Ok((prompt, image_blocks))
@@ -11922,6 +12154,11 @@ fn execute_evaluator_profile(
     profile: &model_router::ModelProfile,
     request: &requirement_evaluator::EvaluationRequest,
 ) -> Result<String, String> {
+    if let Some(constraint) =
+        ControlledProviderConstraint::from_env().map_err(|error| error.to_string())?
+    {
+        constraint.validate("evaluator", profile, "automatic_routing")?;
+    }
     set_provider_telemetry_context("evaluator", profile);
     let resolved_model = api::resolve_model_alias(&profile.model);
     let client = client_for_model_profile(profile)?;
@@ -12002,7 +12239,11 @@ fn execute_explorer_profile(
     profile: &model_router::ModelProfile,
     question: &exploration::ExplorerQuestion,
     evidence: &str,
+    controlled_provider_constraint: Option<&ControlledProviderConstraint>,
 ) -> Result<Vec<exploration::ExplorerFinding>, String> {
+    if let Some(constraint) = controlled_provider_constraint {
+        constraint.validate("explorer", profile, "automatic_routing")?;
+    }
     set_provider_telemetry_context("explorer", profile);
     let resolved_model = api::resolve_model_alias(&profile.model);
     let client = client_for_model_profile(profile)?;
@@ -14241,6 +14482,7 @@ mod tests {
     use super::{
         explicit_model_argument, explicit_profile_for_model, model_router,
         resolve_explicit_writer_profile, validate_writer_profile_binding,
+        ControlledProviderConstraint,
     };
 
     use super::{
@@ -16461,6 +16703,76 @@ mod tests {
             .to_string()
             .contains("explicit_writer_profile_mismatch"));
         assert!(error.to_string().contains("opaque-b"));
+    }
+
+    #[test]
+    fn controlled_writer_explorer_mismatch_rejects_before_fake_provider_dispatch() {
+        let constraint = ControlledProviderConstraint {
+            allowed_profiles: [String::from("writer-b")].into_iter().collect(),
+            allowed_roles: Some(
+                [String::from("writer"), String::from("explorer")]
+                    .into_iter()
+                    .collect(),
+            ),
+        };
+        let explorer_profile = capable_profile("writer-a", "opaque-a");
+        let mut provider_calls = 0;
+
+        let result = (|| {
+            constraint.validate("explorer", &explorer_profile, "automatic_routing")?;
+            provider_calls += 1;
+            Ok::<(), String>(())
+        })();
+
+        assert!(result
+            .expect_err("disallowed explorer profile must fail closed")
+            .contains("controlled_provider_role_mismatch"));
+        assert_eq!(provider_calls, 0);
+    }
+
+    #[test]
+    fn controlled_constraint_accepts_same_profile_for_writer_and_explorer() {
+        let constraint = ControlledProviderConstraint {
+            allowed_profiles: [String::from("writer-b")].into_iter().collect(),
+            allowed_roles: Some(
+                [String::from("writer"), String::from("explorer")]
+                    .into_iter()
+                    .collect(),
+            ),
+        };
+        let profile = capable_profile("writer-b", "opaque-b");
+
+        constraint
+            .validate("explorer", &profile, "automatic_routing")
+            .expect("allowed explorer profile should pass");
+        constraint
+            .validate("writer", &profile, "explicit_operator_pin")
+            .expect("allowed writer profile should pass");
+    }
+
+    #[test]
+    fn controlled_constraint_rejects_later_role_corruption() {
+        let constraint = ControlledProviderConstraint {
+            allowed_profiles: [String::from("writer-b")].into_iter().collect(),
+            allowed_roles: None,
+        };
+        let corrupted_profile = capable_profile("writer-a", "opaque-a");
+
+        let error = constraint
+            .validate("writer", &corrupted_profile, "explicit_operator_pin")
+            .expect_err("provider-boundary profile corruption must fail closed");
+        assert!(error.contains("controlled_provider_role_mismatch"));
+    }
+
+    #[test]
+    fn controlled_writer_only_scope_disables_optional_exploration() {
+        let constraint = ControlledProviderConstraint {
+            allowed_profiles: [String::from("writer-b")].into_iter().collect(),
+            allowed_roles: Some([String::from("writer")].into_iter().collect()),
+        };
+
+        assert!(constraint.role_allowed("writer"));
+        assert!(!constraint.role_allowed("explorer"));
     }
 
     #[test]
