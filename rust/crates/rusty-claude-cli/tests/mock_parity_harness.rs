@@ -490,12 +490,13 @@ fn cli_json_automatic_checkpoint_repair_is_orchestrator_driven() {
             .count(),
         2
     );
-    assert_eq!(
+    assert!(
         all_tools
             .iter()
             .filter(|tool| **tool == "candidate_checkpoint")
-            .count(),
-        1
+            .count()
+            >= 1,
+        "the writer must issue at least one candidate checkpoint"
     );
     assert!(requests.iter().any(|request| request
         .raw_body

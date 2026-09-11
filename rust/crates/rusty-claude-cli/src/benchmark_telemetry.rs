@@ -1433,6 +1433,14 @@ pub fn candidate_artifact(candidate_identity: &str, changed_paths: &[String], di
     persist_snapshot();
 }
 
+pub fn current_candidate_artifact() -> Option<CandidateArtifact> {
+    let lock = STATE.get()?;
+    let guard = lock.lock().ok()?;
+    guard
+        .as_ref()
+        .and_then(|state| state.snapshot.candidate_artifact.clone())
+}
+
 pub fn evaluation_blocked(reason: &str) {
     with_state(|s| {
         s.snapshot.evaluation_blocked_reason = Some(reason.chars().take(1_000).collect());

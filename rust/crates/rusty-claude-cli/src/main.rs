@@ -7222,7 +7222,7 @@ impl LiveCli {
                         }
                     }
                 }
-                let automatic_rework = self.review_candidate_changes(&mut runtime)?;
+                let automatic_rework = self.review_candidate_changes(&mut runtime, interactive)?;
                 self.replace_runtime(runtime)?;
                 if automatic_rework {
                     self.run_automatic_rework(input, presentation.emits_tool_output())?;
@@ -7397,7 +7397,16 @@ impl LiveCli {
                 });
                 if let Some(status) = lifecycle_status {
                     result["lifecycle_status"] = json!(status);
+                } else {
+                    result["lifecycle_status"] = json!(candidate_state_label(self.candidate_state));
                 }
+                result["candidate_state"] = json!(candidate_state_label(self.candidate_state));
+                result["review_ready"] = json!(matches!(
+                    self.candidate_state,
+                    CandidateLifecycleState::ReviewReady
+                ));
+                result["candidate_artifact"] = benchmark_telemetry::current_candidate_artifact()
+                    .map_or(Value::Null, |artifact| json!(artifact));
                 println!("{result}");
             }
         }
@@ -7408,6 +7417,7 @@ impl LiveCli {
     fn review_candidate_changes(
         &mut self,
         runtime: &mut BuiltRuntime,
+        interactive: bool,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let Some(changes) = runtime.finish_candidate()? else {
             return Ok(false);
@@ -7455,13 +7465,6 @@ impl LiveCli {
         self.completion_audit_candidate_id = None;
 
         benchmark_telemetry::lifecycle_event("candidate_review_started");
-        if !io::stdin().is_terminal() {
-            benchmark_telemetry::lifecycle_event("interactive_review_unavailable");
-            runtime.discard_candidate()?;
-            self.candidate_state = CandidateLifecycleState::Discarded;
-            return Ok(false);
-        }
-
         benchmark_telemetry::lifecycle_event("validation_started");
         let validation = runtime.validate_candidate(&changes)?;
         let validation_diagnostics = render_validation_evidence(&validation);
@@ -7486,17 +7489,19 @@ impl LiveCli {
         benchmark_telemetry::lifecycle_event("validation_completed");
         if validation.has_infrastructure_failure() {
             self.candidate_state = CandidateLifecycleState::ValidationBlocked;
-            println!(
-                "Validation blocked by infrastructure; candidate retained and no evaluator or rework was started."
-            );
-            for check in &validation.checks {
-                if matches!(
-                    check.status,
-                    runtime::ValidationStatus::Blocked
-                        | runtime::ValidationStatus::Error
-                        | runtime::ValidationStatus::Timeout
-                ) {
-                    println!("  {}: {}", check.name, check.stderr);
+            if interactive {
+                println!(
+                    "Validation blocked by infrastructure; candidate retained and no evaluator or rework was started."
+                );
+                for check in &validation.checks {
+                    if matches!(
+                        check.status,
+                        runtime::ValidationStatus::Blocked
+                            | runtime::ValidationStatus::Error
+                            | runtime::ValidationStatus::Timeout
+                    ) {
+                        println!("  {}: {}", check.name, check.stderr);
+                    }
                 }
             }
             return Ok(false);
@@ -7558,10 +7563,12 @@ impl LiveCli {
                     });
                     benchmark_telemetry::lifecycle_event("completion_audit_followup_requested");
                     self.candidate_state = CandidateLifecycleState::Editing;
-                    println!(
-                        "↻ Completion evidence audit requested one bounded writer follow-up for {} contract(s).",
-                        completion_gaps.len()
-                    );
+                    if interactive {
+                        println!(
+                            "↻ Completion evidence audit requested one bounded writer follow-up for {} contract(s).",
+                            completion_gaps.len()
+                        );
+                    }
                     return Ok(true);
                 }
                 for gap in &completion_gaps {
@@ -7569,9 +7576,11 @@ impl LiveCli {
                 }
                 self.record_requirement_coverage();
                 benchmark_telemetry::lifecycle_event("completion_audit_unresolved");
-                println!(
-                    "Completion evidence remains unresolved after the bounded writer follow-up; continuing to independent evaluation."
-                );
+                if interactive {
+                    println!(
+                        "Completion evidence remains unresolved after the bounded writer follow-up; continuing to independent evaluation."
+                    );
+                }
             }
         }
         let evaluation = requirement_evaluator::RequirementEvaluator::deterministic(
@@ -7621,11 +7630,13 @@ impl LiveCli {
                     .collect(),
             );
             let evidence = requirement_evaluator::RequirementEvaluator::render_request(&request);
-            println!(
-                "Evaluator routing: {}\nEvidence package: {} bytes; writer conversation excluded",
-                evaluator_route.reason,
-                evidence.len()
-            );
+            if interactive {
+                println!(
+                    "Evaluator routing: {}\nEvidence package: {} bytes; writer conversation excluded",
+                    evaluator_route.reason,
+                    evidence.len()
+                );
+            }
             self.evaluation = Some(match evaluator_route.selected {
                 Some(profile) => match execute_evaluator_profile(&profile, &request) {
                     Ok(response) => {
@@ -7670,7 +7681,9 @@ impl LiveCli {
         }
         self.task_plan.reconcile_work_units();
         self.record_requirement_coverage();
-        println!("\nRequirement evaluation\n{}", active_evaluation.summary());
+        if interactive {
+            println!("\nRequirement evaluation\n{}", active_evaluation.summary());
+        }
 
         if active_evaluation.has_rework_finding() {
             if let Err(error) = self.checkpoint_before_rework(runtime, &changes) {
@@ -7715,7 +7728,9 @@ impl LiveCli {
             };
             benchmark_telemetry::evaluation_blocked(reason);
             self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
-            println!("Review blocked: {reason}");
+            if interactive {
+                println!("Review blocked: {reason}");
+            }
             return Ok(false);
         }
 
@@ -7724,6 +7739,13 @@ impl LiveCli {
         // and any independent evaluation/rework decision have completed.
         self.candidate_state = CandidateLifecycleState::ReviewReady;
         benchmark_telemetry::lifecycle_event("review_ready");
+
+        // Non-interactive and JSON invocations still run trusted validation
+        // and independent evaluation, but stop at review_ready. Applying to
+        // the canonical workspace remains an explicit review action.
+        if !interactive {
+            return Ok(false);
+        }
 
         let action = loop {
             println!("\n{}", render_review_overview(&changes, &validation));
@@ -7997,7 +8019,8 @@ impl LiveCli {
                     return Err(Box::new(error));
                 }
             }
-            let continue_rework = self.review_candidate_changes(&mut runtime)?;
+            let continue_rework = self
+                .review_candidate_changes(&mut runtime, emit_output && io::stdin().is_terminal())?;
             self.replace_runtime(runtime)?;
             if !continue_rework {
                 if self.completion_audit_pending {
