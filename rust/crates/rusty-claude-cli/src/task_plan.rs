@@ -1281,7 +1281,8 @@ fn infer_verification_boundary(expectation: &str) -> VerificationBoundary {
         "process",
         "cli",
         "eof",
-        "input",
+        "user input",
+        "input stream",
     ]
     .iter()
     .any(|term| lower.contains(term))
@@ -1342,15 +1343,29 @@ fn infer_verification_boundary(expectation: &str) -> VerificationBoundary {
 }
 
 fn clauses(request: &str) -> Vec<String> {
-    request
-        .split(|character: char| {
-            character == '.' || character == '!' || character == '?' || character == '\n'
-        })
+    split_request_sentences(request)
+        .into_iter()
         .flat_map(expand_requirement_clause)
         .map(|clause| clause.trim().to_string())
         .filter(|clause| clause.len() > 8)
         .map(|clause| truncate(&clause, MAX_STATEMENT_BYTES))
         .collect()
+}
+
+fn split_request_sentences(request: &str) -> Vec<&str> {
+    let mut clauses = Vec::new();
+    let mut start = 0;
+    for (index, character) in request.char_indices() {
+        let next = request[index + character.len_utf8()..].chars().next();
+        let punctuation_boundary =
+            matches!(character, '.' | '!' | '?') && next.map_or(true, char::is_whitespace);
+        if character == '\n' || punctuation_boundary {
+            clauses.push(&request[start..index]);
+            start = index + character.len_utf8();
+        }
+    }
+    clauses.push(&request[start..]);
+    clauses
 }
 
 fn expand_requirement_clause(clause: &str) -> Vec<String> {
@@ -1790,6 +1805,22 @@ mod tests {
             plan.current_work_unit().map(|unit| unit.id.as_str()),
             Some("WU-1")
         );
+    }
+
+    #[test]
+    fn file_extensions_and_api_signatures_stay_in_one_contract() {
+        let plan = TaskPlan::from_request(
+            "Create src/slug.rs and expose pub fn slugify(input: &str) -> String from the crate root. Add focused unit tests.",
+            None,
+        );
+        assert!(plan
+            .contracts
+            .iter()
+            .any(|contract| contract.expectation.contains("src/slug.rs")
+                && contract.expectation.contains("pub fn slugify(input")));
+        assert!(!plan.contracts.iter().any(|contract| contract.expectation
+            == "rs and expose pub fn slugify(input: &str) -> String from the crate root"));
+        assert_eq!(plan.work_units.len(), 1);
     }
 
     #[test]
