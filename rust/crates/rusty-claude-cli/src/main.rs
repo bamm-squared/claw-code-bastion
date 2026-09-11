@@ -16366,6 +16366,53 @@ mod tests {
     }
 
     #[test]
+    fn external_execution_profile_resolves_from_overlay_without_project_mutation() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        let overlay = root.join("execution-profiles.json");
+        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(
+            cwd.join(".claw").join("settings.json"),
+            r#"{"modelResources":[{"id":"project-writer","model":"opaque-project"}]}"#,
+        )
+        .expect("write project settings");
+        fs::write(
+            &overlay,
+            r#"{"modelResources":[{"id":"writer-b","provider":"openai","model":"opaque-b","enabled":true}]}"#,
+        )
+        .expect("write execution profile overlay");
+
+        let config = ConfigLoader::new(&cwd, &home)
+            .with_project_trust(true)
+            .with_execution_profile_overlay(&overlay)
+            .load()
+            .expect("execution profile overlay should load");
+        let pool = model_router::ModelPool::from_runtime_config(&config, "legacy");
+        let resolved = explicit_profile_for_model(&pool, "writer-b")
+            .expect("profile lookup should succeed")
+            .expect("external profile should be visible");
+
+        assert_eq!(resolved.model, "opaque-b");
+        assert_eq!(
+            config.model_resource_source("writer-b"),
+            Some("external_execution_overlay")
+        );
+        let merged: serde_json::Value =
+            serde_json::from_str(&config.as_json().render()).expect("merged config JSON");
+        assert_eq!(
+            merged
+                .get("modelResources")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
     fn missing_explicit_profile_fails_without_legacy_fallback() {
         let error = resolve_explicit_writer_profile(
             &model_router::ModelPool::one(capable_profile("writer-a", "opaque-a")),
