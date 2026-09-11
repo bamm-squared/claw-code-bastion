@@ -1297,15 +1297,24 @@ fn parse_calibration_args(
     })
 }
 
-fn calibration_store_path() -> PathBuf {
-    env::var_os("CLAW_CALIBRATION_PATH").map_or_else(
-        || {
-            env::var_os("HOME").map_or_else(
-                || PathBuf::from(".claw/calibration.json"),
-                |home| PathBuf::from(home).join(".config/claw/calibration.json"),
+fn calibration_store_path() -> (PathBuf, &'static str) {
+    if let Some(path) = env::var_os("CLAW_CALIBRATION_PATH") {
+        return (PathBuf::from(path), "explicit_environment");
+    }
+    if let Some(config_home) = env::var_os("CLAW_CONFIG_HOME") {
+        return (
+            PathBuf::from(config_home).join("calibration.json"),
+            "config_home",
+        );
+    }
+    env::var_os("HOME").map_or_else(
+        || (PathBuf::from(".claw/calibration.json"), "project_default"),
+        |home| {
+            (
+                PathBuf::from(home).join(".config/claw/calibration.json"),
+                "home_default",
             )
         },
-        PathBuf::from,
     )
 }
 
@@ -1319,7 +1328,7 @@ fn run_calibration_command(
     if is_private_mode() && matches!(action, "clear" | "import") {
         return Err("calibration persistence is disabled in private mode".into());
     }
-    let store_path = calibration_store_path();
+    let (store_path, _) = calibration_store_path();
     if action == "cases" {
         let cases = model_router::default_calibration_cases();
         if output_format == CliOutputFormat::Json {
@@ -5800,15 +5809,31 @@ impl LiveCli {
                 .map(|values| values.iter().cloned().collect::<Vec<_>>());
             benchmark_telemetry::controlled_provider_constraint(&profiles, roles.as_deref());
         }
-        let calibration_path = (!is_private_mode()).then(calibration_store_path);
+        let calibration_location = (!is_private_mode()).then(calibration_store_path);
         let calibration = if is_private_mode() {
+            benchmark_telemetry::calibration_source("private_empty");
             model_router::CalibrationStore::new()
         } else {
-            calibration_path
-                .as_deref()
-                .and_then(|path| model_router::CalibrationStore::load(path).ok())
-                .unwrap_or_else(|| model_router::CalibrationStore::from_runtime_config(&config))
+            let (path, source) = calibration_location
+                .as_ref()
+                .expect("non-private mode must have a calibration location");
+            if path.exists() {
+                benchmark_telemetry::calibration_source(source);
+                model_router::CalibrationStore::load(path).map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "failed to load calibration from {}: {error}",
+                            path.display()
+                        ),
+                    )
+                })?
+            } else {
+                benchmark_telemetry::calibration_source("runtime_config_or_none");
+                model_router::CalibrationStore::from_runtime_config(&config)
+            }
         };
+        let calibration_path = calibration_location.map(|(path, _)| path);
         let mut routing_policy = model_router::RoutingPolicy::from_runtime_config(&config);
         if is_private_mode() && env::var("CLAW_PRIVATE_ALLOW_REMOTE_PROVIDER").as_deref() != Ok("1")
         {
@@ -15341,6 +15366,58 @@ mod tests {
                 allow_broad_cwd: false,
             }
         );
+    }
+
+    #[test]
+    fn calibration_path_prefers_explicit_environment_over_config_home() {
+        let _guard = env_lock();
+        let original_path = std::env::var_os("CLAW_CALIBRATION_PATH");
+        let original_home = std::env::var_os("CLAW_CONFIG_HOME");
+        std::env::set_var("CLAW_CALIBRATION_PATH", "/tmp/explicit-calibration.json");
+        std::env::set_var("CLAW_CONFIG_HOME", "/tmp/config-home");
+
+        assert_eq!(
+            super::calibration_store_path(),
+            (
+                PathBuf::from("/tmp/explicit-calibration.json"),
+                "explicit_environment"
+            )
+        );
+
+        match original_path {
+            Some(value) => std::env::set_var("CLAW_CALIBRATION_PATH", value),
+            None => std::env::remove_var("CLAW_CALIBRATION_PATH"),
+        }
+        match original_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+    }
+
+    #[test]
+    fn calibration_path_follows_external_config_home_without_explicit_override() {
+        let _guard = env_lock();
+        let original_path = std::env::var_os("CLAW_CALIBRATION_PATH");
+        let original_home = std::env::var_os("CLAW_CONFIG_HOME");
+        std::env::remove_var("CLAW_CALIBRATION_PATH");
+        std::env::set_var("CLAW_CONFIG_HOME", "/tmp/config-home");
+
+        assert_eq!(
+            super::calibration_store_path(),
+            (
+                PathBuf::from("/tmp/config-home/calibration.json"),
+                "config_home"
+            )
+        );
+
+        match original_path {
+            Some(value) => std::env::set_var("CLAW_CALIBRATION_PATH", value),
+            None => std::env::remove_var("CLAW_CALIBRATION_PATH"),
+        }
+        match original_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
     }
 
     #[test]

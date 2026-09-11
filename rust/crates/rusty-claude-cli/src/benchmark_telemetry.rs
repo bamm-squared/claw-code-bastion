@@ -86,6 +86,7 @@ pub struct Snapshot {
     pub evaluator_selected_profile: Option<String>,
     pub evaluator_route_reason: Option<String>,
     pub evaluator_route_rejections: Vec<RoutingRejection>,
+    pub calibration_source: Option<String>,
     pub writer_selected_profile: Option<String>,
     pub writer_requested_profile: Option<String>,
     pub writer_requested_model: Option<String>,
@@ -1250,6 +1251,13 @@ pub fn evaluator_routing(
         s.snapshot.evaluator_selected_profile = selected_profile.map(str::to_string);
         s.snapshot.evaluator_route_reason = Some(reason.to_string());
         s.snapshot.evaluator_route_rejections = rejections;
+    });
+    persist_snapshot();
+}
+
+pub fn calibration_source(source: &str) {
+    with_state(|s| {
+        s.snapshot.calibration_source = Some(source.to_string());
     });
     persist_snapshot();
 }
