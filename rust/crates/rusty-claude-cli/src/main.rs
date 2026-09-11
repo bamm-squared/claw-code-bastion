@@ -81,7 +81,20 @@ const CONTROLLED_PROVIDER_PROFILES_ENV: &str = "CLAW_CONTROLLED_PROVIDER_PROFILE
 const CONTROLLED_PROVIDER_ROLES_ENV: &str = "CLAW_CONTROLLED_PROVIDER_ROLES";
 const WRITER_INSTRUCTION_VERSION: &str = "writer-workflow-v2";
 const WRITER_TOOL_SCHEMA_VERSION: &str = "runtime-tools-v2";
-const WRITER_WORKFLOW_GUIDANCE: &str = "[Engineering workflow]\nThe candidate workspace is isolated from the canonical repository. Candidate edits are reversible and non-authoritative until trusted Apply. When a plausible coherent implementation boundary is identified within the active work unit, make the smallest scoped candidate edit that tests the hypothesis; do not wait for proof that the first edit is final. Use candidate checks and focused tests as development feedback, then repair or refine within the existing bounds. For a structural edit based on a bounded read, prefer replace_range with that read's revision token; use edit_file for an unambiguous local replacement and write_file for a small fully-read file. Keep edits within the owned contracts and global invariants; do not bypass permissions, checks, validation, or authority gates.\n\nWork on the active executable work unit. Use its objective, owned contracts, downstream boundary, repository facts, and completion evidence as the engineering scope. The orchestrator owns budgets, checkpoints, continuation, reconciliation, validation, evaluation, and unit transitions. When the owned outcome is ready, use candidate_checkpoint with status unit_complete. Use submit only when all planned work units are complete. Report blocked or needs_user_input only when a required input, permission, repository surface, external dependency, plausible implementation boundary, requirement, or infrastructure is genuinely unavailable. Ordinary engineering uncertainty, multiple reasonable designs, compiler refinement, or tests exposing edge cases normally call for a bounded candidate hypothesis and feedback, not blocking.";
+const WRITER_WORKFLOW_GUIDANCE: &str = "[Engineering workflow]\nWork in the isolated candidate, isolated from the canonical repository; candidate edits are reversible and non-authoritative until trusted Apply. Inspect enough to form a plausible implementation hypothesis, then make the smallest scoped candidate edit, run a focused check, and use the development feedback to repair or refine. Prefer replace_range after a bounded read for structural edits, edit_file for a local replacement, and write_file only for a small fully-read file. Keep the change within the active objective; owned contracts and global invariants remain in force. The orchestrator owns budgets, checkpoints, continuation, validation, evaluation, and transitions. When the owned outcome is ready, submit it; report blocked or needs_user_input only for a genuine required input, permission, repository surface, dependency, contradictory requirement, or infrastructure failure. Ordinary engineering uncertainty, multiple reasonable designs, compiler refinement, and tests exposing edge cases call for a bounded implementation hypothesis and feedback, not blocking.\n";
+const DEFAULT_WRITER_TOOLS: &[&str] = &[
+    "read_file",
+    "grep_search",
+    "glob_search",
+    "edit_file",
+    "replace_range",
+    "write_file",
+    "bash",
+    "candidate_check",
+    "candidate_checkpoint",
+];
+const WRITER_BASE_RUNWAY_RESERVE: usize = 8;
+const WRITER_CONTINUATION_RUNWAY_RESERVE: usize = 4;
 const MAX_VALIDATION_REPAIR_CYCLES: u8 = 2;
 const MAX_EVALUATOR_REWORK_CYCLES: u8 = 1;
 const MAX_TOTAL_CORRECTION_CYCLES: u8 = MAX_VALIDATION_REPAIR_CYCLES + MAX_EVALUATOR_REWORK_CYCLES;
@@ -2162,7 +2175,35 @@ fn filter_tool_specs(
     tool_registry: &GlobalToolRegistry,
     allowed_tools: Option<&AllowedToolSet>,
 ) -> Vec<ToolDefinition> {
-    tool_registry.definitions(allowed_tools)
+    let mut definitions = tool_registry.definitions(allowed_tools);
+    if let Some(checkpoint) = definitions
+        .iter_mut()
+        .find(|definition| definition.name == "candidate_checkpoint")
+    {
+        checkpoint.description = Some(
+            "Submit the current implementation when it is ready, or report a genuine blocker. The orchestrator handles checkpoints and bounded continuation."
+                .to_string(),
+        );
+        if let Some(statuses) = checkpoint
+            .input_schema
+            .pointer_mut("/properties/status/enum")
+        {
+            *statuses = json!(["unit_complete", "submit", "blocked", "needs_user_input"]);
+        }
+    }
+    definitions
+}
+
+fn writer_allowed_tools(requested: Option<&AllowedToolSet>) -> AllowedToolSet {
+    requested.map_or_else(
+        || {
+            DEFAULT_WRITER_TOOLS
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect()
+        },
+        Clone::clone,
+    )
 }
 
 fn parse_system_prompt_args(
@@ -4603,6 +4644,7 @@ struct LiveCli {
     work_unit_writer_turns: usize,
     work_unit_turn_allowance: usize,
     work_unit_continuation_grants: u8,
+    work_unit_budget_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -5949,6 +5991,7 @@ impl LiveCli {
             work_unit_writer_turns: 0,
             work_unit_turn_allowance: 0,
             work_unit_continuation_grants: 0,
+            work_unit_budget_id: None,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -6531,11 +6574,17 @@ impl LiveCli {
         Ok(())
     }
 
-    fn reset_work_unit_budget(&mut self) {
+    fn ensure_work_unit_budget(&mut self) {
+        let current_id = self.task_plan.current_work_unit_id.clone();
+        if self.work_unit_budget_id == current_id {
+            return;
+        }
+        self.work_unit_budget_id = current_id.clone();
         self.work_unit_writer_turns = 0;
         self.work_unit_continuation_grants = 0;
-        self.work_unit_turn_allowance = self.task_plan.current_work_unit().map_or(0, |_| {
+        self.work_unit_turn_allowance = current_id.map_or(0, |_| {
             work_unit_iteration_budget(self.task_plan.planning_mode())
+                .saturating_add(WRITER_BASE_RUNWAY_RESERVE)
         });
     }
 
@@ -6545,11 +6594,10 @@ impl LiveCli {
         {
             return false;
         }
-        self.work_unit_turn_allowance =
-            self.work_unit_turn_allowance
-                .saturating_add(work_unit_continuation_budget(
-                    self.task_plan.planning_mode(),
-                ));
+        self.work_unit_turn_allowance = self.work_unit_turn_allowance.saturating_add(
+            work_unit_continuation_budget(self.task_plan.planning_mode())
+                .saturating_add(WRITER_CONTINUATION_RUNWAY_RESERVE),
+        );
         self.work_unit_continuation_grants = self.work_unit_continuation_grants.saturating_add(1);
         self.work_unit_continuation_objective = Some(objective);
         benchmark_telemetry::lifecycle_event("work_unit_bounded_continuation_granted");
@@ -6688,13 +6736,15 @@ impl LiveCli {
             packet_hash,
             ..benchmark_telemetry::WriterPacketEvent::default()
         });
-        if self.work_unit_turn_allowance == 0 && self.task_plan.current_work_unit().is_some() {
-            self.reset_work_unit_budget();
-        }
+        self.ensure_work_unit_budget();
         let remaining_work_unit_turns = self
             .work_unit_turn_allowance
-            .saturating_sub(self.work_unit_writer_turns)
-            .max(1);
+            .saturating_sub(self.work_unit_writer_turns);
+        if self.task_plan.current_work_unit().is_some() && remaining_work_unit_turns == 0 {
+            return Err(
+                "work unit writer budget exhausted; no further writer request is permitted".into(),
+            );
+        }
         benchmark_telemetry::work_unit_state(
             self.task_plan.work_units.len(),
             self.task_plan
@@ -6752,7 +6802,7 @@ impl LiveCli {
             self.system_prompt.clone(),
             true,
             emit_output,
-            self.allowed_tools.clone(),
+            Some(writer_allowed_tools(self.allowed_tools.as_ref())),
             self.permission_mode,
             None,
             retained_backend,
@@ -7056,7 +7106,7 @@ impl LiveCli {
                             benchmark_telemetry::work_unit_checkpoint_reconciled(
                                 "accepted", None, None,
                             );
-                            self.reset_work_unit_budget();
+                            self.ensure_work_unit_budget();
                             if self.task_plan.has_unresolved_work_units() {
                                 if let Some(compaction) = runtime.compact_for_work_unit() {
                                     benchmark_telemetry::writer_checkpoint_context(
@@ -13873,7 +13923,7 @@ impl ToolExecutor for CliToolExecutor {
             return Ok(None);
         }
         let input = json!({
-            "checks": ["format", "test", "clippy"],
+            "checks": ["format", "check"],
             "timeout_ms": 120_000,
         });
         let output = match self
@@ -14066,7 +14116,7 @@ impl CliToolExecutor {
         let diagnostics = self
             .tool_registry
             .candidate_development_check(&json!({
-                "checks": ["format", "test", "clippy"],
+                "checks": ["format", "check"],
                 "timeout_ms": 120_000_u64,
             }))
             .map_err(|error| {
@@ -14233,9 +14283,9 @@ fn writer_iteration_budget(mode: task_plan::PlanningMode) -> usize {
 
 fn work_unit_iteration_budget(mode: task_plan::PlanningMode) -> usize {
     match mode {
-        task_plan::PlanningMode::Minimal => 8,
-        task_plan::PlanningMode::Standard => 10,
-        task_plan::PlanningMode::Milestone => 12,
+        task_plan::PlanningMode::Minimal => 16,
+        task_plan::PlanningMode::Standard => 24,
+        task_plan::PlanningMode::Milestone => 32,
     }
 }
 
@@ -14243,9 +14293,9 @@ const MAX_WORK_UNIT_CONTINUATIONS: u8 = 1;
 
 fn work_unit_continuation_budget(mode: task_plan::PlanningMode) -> usize {
     match mode {
-        task_plan::PlanningMode::Minimal => 3,
-        task_plan::PlanningMode::Standard => 5,
-        task_plan::PlanningMode::Milestone => 8,
+        task_plan::PlanningMode::Minimal => 7,
+        task_plan::PlanningMode::Standard => 9,
+        task_plan::PlanningMode::Milestone => 12,
     }
 }
 
@@ -14284,11 +14334,11 @@ mod empty_response_recovery_tests {
     fn work_unit_continuation_is_small_and_bounded() {
         assert_eq!(
             work_unit_iteration_budget(super::task_plan::PlanningMode::Standard),
-            10
+            24
         );
         assert_eq!(
             work_unit_continuation_budget(super::task_plan::PlanningMode::Standard),
-            5
+            9
         );
         assert_eq!(MAX_WORK_UNIT_CONTINUATIONS, 1);
     }
@@ -14299,9 +14349,15 @@ fn permission_policy(
     feature_config: &runtime::RuntimeFeatureConfig,
     tool_registry: &GlobalToolRegistry,
 ) -> Result<PermissionPolicy, String> {
+    let isolated = env::var("CLAW_EXECUTION_MODE").as_deref() == Ok("isolated");
     Ok(tool_registry.permission_specs(None)?.into_iter().fold(
         PermissionPolicy::new(mode).with_permission_rules(feature_config.permission_rules()),
         |policy, (name, required_permission)| {
+            let required_permission = if isolated && name == "bash" {
+                PermissionMode::WorkspaceWrite
+            } else {
+                required_permission
+            };
             policy.with_tool_requirement(name, required_permission)
         },
     ))
@@ -14571,7 +14627,7 @@ mod tests {
     use super::{
         explicit_model_argument, explicit_profile_for_model, model_router,
         resolve_explicit_writer_profile, resolve_requested_writer_profile,
-        validate_writer_profile_binding, ControlledProviderConstraint,
+        validate_writer_profile_binding, writer_allowed_tools, ControlledProviderConstraint,
     };
 
     use super::{
@@ -16457,6 +16513,31 @@ mod tests {
             .map(|spec| spec.name)
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["read_file", "grep_search"]);
+    }
+
+    #[test]
+    fn default_writer_surface_is_coding_focused() {
+        let allowed = writer_allowed_tools(None);
+        assert!(allowed.contains("read_file"));
+        assert!(allowed.contains("edit_file"));
+        assert!(allowed.contains("bash"));
+        assert!(!allowed.contains("WebFetch"));
+
+        let definitions = filter_tool_specs(&GlobalToolRegistry::builtin(), Some(&allowed));
+        let checkpoint = definitions
+            .iter()
+            .find(|definition| definition.name == "candidate_checkpoint")
+            .expect("writer surface should retain submission control");
+        let statuses = checkpoint
+            .input_schema
+            .pointer("/properties/status/enum")
+            .and_then(serde_json::Value::as_array)
+            .expect("checkpoint status enum should be present");
+        assert!(!statuses.iter().any(|status| status == "bounded_continue"));
+        assert!(checkpoint
+            .description
+            .as_deref()
+            .is_some_and(|description| description.contains("orchestrator")));
     }
 
     #[test]

@@ -581,6 +581,88 @@ pub fn detect_validation_plan(root: &Path) -> ValidationPlan {
     ValidationPlan::new(checks)
 }
 
+/// Detect fast, candidate-only feedback checks for the coding loop.
+///
+/// Trusted validation intentionally remains broad and is built by
+/// [`detect_validation_plan`].  Development feedback should instead answer
+/// whether the current edit still formats and type-checks without forcing the
+/// writer to wait for the full workspace test and lint matrix after every
+/// checkpoint.
+#[must_use]
+pub fn detect_development_validation_plan(root: &Path) -> ValidationPlan {
+    detect_development_validation_plan_for_changes(root, &[])
+}
+
+/// Detect fast feedback checks scoped to the packages touched by a candidate.
+#[must_use]
+pub fn detect_development_validation_plan_for_changes(
+    root: &Path,
+    changed_paths: &[PathBuf],
+) -> ValidationPlan {
+    let mut checks = Vec::new();
+    if let Some(manifest) = find_manifest(root, "Cargo.toml") {
+        let manifest_arg = shell_quote(&manifest);
+        checks.push(check(
+            "cargo fmt",
+            format!("cargo fmt --check --all --manifest-path {manifest_arg}"),
+        ));
+        let packages = changed_paths
+            .iter()
+            .filter_map(|path| package_name_for_path(root, path))
+            .collect::<std::collections::BTreeSet<_>>();
+        let package_args = packages
+            .iter()
+            .map(|package| format!(" -p {}", shell_quote(package)))
+            .collect::<String>();
+        let scope = if package_args.is_empty() {
+            " --workspace".to_string()
+        } else {
+            package_args
+        };
+        checks.push(check(
+            "cargo check",
+            format!("cargo check{scope} --manifest-path {manifest_arg}"),
+        ));
+    }
+    if let Ok(package) = fs::read_to_string(root.join("package.json")) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&package) {
+            if value
+                .get("scripts")
+                .and_then(|scripts| scripts.get("typecheck"))
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+            {
+                checks.push(check("npm typecheck", "npm run typecheck"));
+            }
+        }
+    }
+    if root.join("pytest.ini").is_file() || root.join("pyproject.toml").is_file() {
+        checks.push(check("python compile", "python -m compileall -q ."));
+    }
+    ValidationPlan::new(checks)
+}
+
+fn package_name_for_path(root: &Path, path: &Path) -> Option<String> {
+    let mut current = root.join(path);
+    if !current.is_dir() {
+        current.pop();
+    }
+    loop {
+        let manifest = current.join("Cargo.toml");
+        if let Ok(contents) = fs::read_to_string(&manifest) {
+            for line in contents.lines() {
+                let trimmed = line.trim();
+                if let Some(value) = trimmed.strip_prefix("name = \"") {
+                    return value.strip_suffix('"').map(ToOwned::to_owned);
+                }
+            }
+        }
+        if current == root || !current.pop() {
+            return None;
+        }
+    }
+}
+
 fn find_manifest(root: &Path, name: &str) -> Option<String> {
     if root.join(name).is_file() {
         return Some(name.to_string());
@@ -823,6 +905,69 @@ mod tests {
             .checks
             .iter()
             .all(|check| check.command.contains("--manifest-path 'rust/Cargo.toml'")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn development_plan_is_fast_and_keeps_trusted_checks_broad() {
+        let root = std::env::temp_dir().join(format!("claw-development-plan-{}", unique_stamp()));
+        fs::create_dir_all(root.join("rust")).unwrap();
+        fs::write(root.join("rust/Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+
+        let plan = detect_development_validation_plan(&root);
+        assert_eq!(plan.checks.len(), 2);
+        assert!(plan.checks.iter().any(|check| check.name == "cargo fmt"));
+        assert!(plan.checks.iter().any(|check| check.name == "cargo check"));
+        assert!(plan
+            .checks
+            .iter()
+            .all(|check| !check.command.contains("cargo test")));
+        assert!(plan
+            .checks
+            .iter()
+            .all(|check| !check.command.contains("clippy")));
+
+        let trusted = detect_validation_plan(&root);
+        assert_eq!(trusted.checks.len(), 3);
+        assert!(trusted
+            .checks
+            .iter()
+            .any(|check| check.command.contains("cargo test")));
+        assert!(trusted
+            .checks
+            .iter()
+            .any(|check| check.command.contains("clippy")));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn development_plan_scopes_cargo_check_to_changed_package() {
+        let root = std::env::temp_dir().join(format!("claw-development-scope-{}", unique_stamp()));
+        fs::create_dir_all(root.join("rust/crates/demo/src")).unwrap();
+        fs::write(
+            root.join("rust/Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/demo\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("rust/crates/demo/Cargo.toml"),
+            "[package]\nname = \"demo\"\n",
+        )
+        .unwrap();
+
+        let plan = detect_development_validation_plan_for_changes(
+            &root,
+            &[PathBuf::from("rust/crates/demo/src/lib.rs")],
+        );
+        let check = plan
+            .checks
+            .iter()
+            .find(|check| check.name == "cargo check")
+            .expect("development plan should include cargo check");
+        assert!(check.command.contains("-p 'demo'"));
+        assert!(!check.command.contains("--workspace"));
 
         fs::remove_dir_all(root).unwrap();
     }

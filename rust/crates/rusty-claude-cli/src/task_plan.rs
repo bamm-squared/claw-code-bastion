@@ -1114,30 +1114,24 @@ impl TaskPlan {
     #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn render_for_writer(&self) -> String {
-        let mut output = String::from("[Task working map]\nMode: ");
-        output.push_str(self.planning_mode().label());
-        output.push_str("\nGoal: ");
+        let mut output = String::from("[Engineering task]\nGoal: ");
         output.push_str(&self.original_request);
-        output.push_str("\nObligations:\n");
+        output.push_str("\nRequired outcomes:\n");
         for item in self.items.iter().take(MAX_ITEMS) {
             output.push_str("- ");
             output.push_str(&item.id);
             output.push_str(": ");
             output.push_str(&item.statement);
-            output.push_str(" [");
-            output.push_str(status_label(&item.status));
-            output.push_str("]\n");
+            output.push('\n');
         }
         for contract in self.contracts.iter().take(MAX_CONTRACTS) {
             output.push_str("- ");
             output.push_str(&contract.id);
             output.push_str(": ");
             output.push_str(&contract.expectation);
-            output.push_str(" [boundary: ");
+            output.push_str(" (boundary: ");
             output.push_str(contract.verification_boundary.label());
-            output.push_str("; ");
-            output.push_str(contract.status.label());
-            output.push_str("]\n");
+            output.push_str(")\n");
             if !contract.evidence.is_empty() {
                 output.push_str("  evidence: ");
                 output.push_str(&contract.evidence);
@@ -1762,7 +1756,7 @@ mod tests {
     fn writer_packet_is_compact_and_complexity_adaptive() {
         let small = TaskPlan::from_request("Fix one local behavior.", None);
         let rendered = small.render_for_writer();
-        assert!(rendered.contains("Mode: minimal"));
+        assert!(rendered.contains("[Engineering task]"));
         assert!(!rendered.contains("Verification planning:"));
 
         let mut medium = TaskPlan::from_request(

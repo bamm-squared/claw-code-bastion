@@ -421,7 +421,28 @@ impl ExecutionBackend for IsolatedExecutionBackend {
                 "candidate_check requires at least one named check",
             ));
         }
-        let detected = runtime::detect_validation_plan(&self.workspace.candidate.root);
+        let broad_requested = request.checks.iter().any(|name| {
+            matches!(
+                name.trim().to_ascii_lowercase().as_str(),
+                "test" | "tests" | "clippy" | "lint"
+            )
+        });
+        let changes = self
+            .workspace
+            .scan()
+            .map_err(|error| format!("unable to scan candidate for development check: {error}"))?;
+        let detected = if broad_requested {
+            runtime::detect_validation_plan(&self.workspace.candidate.root)
+        } else {
+            runtime::detect_development_validation_plan_for_changes(
+                &self.workspace.candidate.root,
+                &changes
+                    .changes
+                    .iter()
+                    .map(|change| change.path().to_owned())
+                    .collect::<Vec<_>>(),
+            )
+        };
         if detected.checks.is_empty() {
             return development_check_infrastructure_error(
                 "no repository validation checks were discovered for the candidate",
@@ -439,10 +460,6 @@ impl ExecutionBackend for IsolatedExecutionBackend {
         if plan.checks.is_empty() {
             return development_check_infrastructure_error("candidate check plan is empty");
         }
-        let changes = self
-            .workspace
-            .scan()
-            .map_err(|error| format!("unable to scan candidate for development check: {error}"))?;
         let candidate_changed = !changes.changes.is_empty();
         let snapshot = runtime::ValidationSnapshot::create_verified(
             &self.workspace.candidate,
@@ -710,6 +727,7 @@ fn development_check_for_name(
     let requested = requested.trim().to_ascii_lowercase();
     let aliases: &[&str] = match requested.as_str() {
         "format" | "fmt" => &["cargo fmt"],
+        "check" => &["cargo check"],
         "test" | "tests" => &["cargo test --workspace"],
         "clippy" | "lint" => &["cargo clippy"],
         _ => &[],
@@ -727,7 +745,10 @@ fn development_check_for_name(
             if let Some(timeout_ms) = timeout_ms {
                 check.timeout = Duration::from_millis(timeout_ms.clamp(1, 120_000));
             }
-            if matches!(requested.as_str(), "test" | "tests" | "clippy" | "lint") {
+            if matches!(
+                requested.as_str(),
+                "check" | "test" | "tests" | "clippy" | "lint"
+            ) {
                 check.command = lock_cargo_dependency_resolution(&check.command);
             }
             check
@@ -1546,7 +1567,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "candidate_check",
-            description: "Run a bounded named development check against the isolated candidate after substantial edits or before candidate_checkpoint when useful. The orchestrator may also run it when an implementation work unit is completed. Supported checks are format, test, and clippy. It returns actionable feedback only, is candidate-only, and never authorizes Review or Apply.",
+            description: "Run a bounded named development check against the isolated candidate after substantial edits or before candidate_checkpoint when useful. The orchestrator uses fast format and type-check feedback; request test or clippy explicitly when a broader check is needed. It returns actionable feedback only, is candidate-only, and never authorizes Review or Apply.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1554,7 +1575,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                         "type": "array",
                         "items": {
                             "type": "string",
-                            "enum": ["format", "test", "clippy"]
+                            "enum": ["format", "check", "test", "clippy"]
                         },
                         "minItems": 1,
                         "maxItems": 3

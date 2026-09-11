@@ -183,6 +183,7 @@ pub use usage::{
     PricingResolution, PricingSource, TokenUsage, UsageCostEstimate, UsageTracker,
 };
 pub use validator::{
+    detect_development_validation_plan, detect_development_validation_plan_for_changes,
     detect_validation_plan, PodmanValidatorBackend, ValidatedCandidateInput, ValidationCheck,
     ValidationCheckResult, ValidationIdentity, ValidationPlan, ValidationPolicy,
     ValidationSnapshot, ValidationStatus, ValidatorBackend,
