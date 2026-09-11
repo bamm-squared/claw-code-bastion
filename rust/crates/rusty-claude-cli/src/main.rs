@@ -1924,6 +1924,23 @@ fn resolve_explicit_writer_profile(
     })
 }
 
+fn resolve_requested_writer_profile(
+    pool: &model_router::ModelPool,
+    requested: &str,
+    legacy_model: &str,
+    has_configured_resources: bool,
+    signals: model_router::TaskSignals,
+    policy: &model_router::RoutingPolicy,
+) -> Result<model_router::ModelProfile, Box<dyn std::error::Error>> {
+    if !has_configured_resources {
+        // Preserve the established --model selector behavior when no modern
+        // profile registry exists. Once modelResources is present, explicit
+        // selection remains fail-closed and must resolve a concrete profile.
+        return Ok(model_router::ModelProfile::legacy(legacy_model));
+    }
+    resolve_explicit_writer_profile(pool, requested, signals, policy)
+}
+
 fn validate_writer_profile_binding(
     expected: Option<&model_router::ModelProfile>,
     selected: Option<&model_router::ModelProfile>,
@@ -5706,6 +5723,7 @@ impl LiveCli {
         let cwd = repository_workspace_root()?;
         let config = ConfigLoader::default_for(&cwd).load()?;
         let model_pool = model_router::ModelPool::from_runtime_config(&config, &model);
+        let has_configured_resources = model_router::ModelPool::has_configured_resources(&config);
         let controlled_provider_constraint = ControlledProviderConstraint::from_env()?;
         if let Some(constraint) = controlled_provider_constraint.as_ref() {
             let profiles = constraint
@@ -5741,9 +5759,11 @@ impl LiveCli {
                 None,
                 "explicit_operator_pin",
             );
-            Some(resolve_explicit_writer_profile(
+            Some(resolve_requested_writer_profile(
                 &model_pool,
                 requested,
+                &model,
+                has_configured_resources,
                 routing_signals(&initial_task_plan),
                 &routing_policy,
             )?)
@@ -14485,8 +14505,8 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 mod tests {
     use super::{
         explicit_model_argument, explicit_profile_for_model, model_router,
-        resolve_explicit_writer_profile, validate_writer_profile_binding,
-        ControlledProviderConstraint,
+        resolve_explicit_writer_profile, resolve_requested_writer_profile,
+        validate_writer_profile_binding, ControlledProviderConstraint,
     };
 
     use super::{
@@ -16609,6 +16629,22 @@ mod tests {
         .expect("configured explicit profile should resolve");
         assert_eq!(resolved.id, "writer-b");
         assert_eq!(resolved.model, "opaque-b");
+    }
+
+    #[test]
+    fn legacy_model_selector_remains_compatible_without_profile_registry() {
+        let resolved = resolve_requested_writer_profile(
+            &model_router::ModelPool::one(model_router::ModelProfile::legacy("claude-sonnet-4-6")),
+            "sonnet",
+            "claude-sonnet-4-6",
+            false,
+            model_router::TaskSignals::default(),
+            &model_router::RoutingPolicy::default(),
+        )
+        .expect("legacy model selection should remain compatible");
+
+        assert_eq!(resolved.id, "legacy-default");
+        assert_eq!(resolved.model, "claude-sonnet-4-6");
     }
 
     #[test]
