@@ -92,10 +92,18 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$REPLAY_ROOT/baseline/rust"
+          set +e
           HOME="$HOME" \
           CLAW_WORKER_IMAGE="$WORKER_IMAGE" \
           CLAW_VALIDATOR_IMAGE="$VALIDATOR_IMAGE" \
-          cargo test -p rusty-claude-cli --test mock_parity_harness -- --nocapture
+          cargo test -p rusty-claude-cli --test mock_parity_harness -- --nocapture 2>&1 | tee "$RUNNER_TEMP/mock-parity.log"
+          test_rc="${PIPESTATUS[0]}"
+          set -e
+          if grep -Eqi "Secure isolation is unavailable|rootless Podman.*unavailable|No such file or directory.*podman" "$RUNNER_TEMP/mock-parity.log"; then
+            echo "secure-isolation prerequisite failed"
+            exit 1
+          fi
+          printf "mock_parity_exit=%s; secure isolation prerequisite remained available\n" "$test_rc"
 
       - name: Fetch dependencies before offline validation
         run: |
