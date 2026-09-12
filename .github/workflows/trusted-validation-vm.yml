@@ -43,6 +43,8 @@ jobs:
           printf '[engine]\ncgroup_manager = "cgroupfs"\n' > "$RUNNER_TEMP/containers.conf"
 
       - name: Verify supported disposable worker
+        env:
+          CLAW_REAL_PODMAN_IMAGE: alpine:3.20
         run: |
           ./scripts/security-runner-preflight.sh
           podman info
