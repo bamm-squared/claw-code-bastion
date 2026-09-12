@@ -237,6 +237,7 @@ impl ValidationSnapshot {
             let _ = fs::remove_dir_all(&task_root);
             return Err(error);
         }
+        initialize_validation_repository(&root)?;
         Ok(Self {
             root,
             candidate_identity: identity,
@@ -691,6 +692,39 @@ fn shell_quote(path: &str) -> String {
     format!("'{}'", path.replace('\'', "'\\''"))
 }
 
+fn initialize_validation_repository(root: &Path) -> io::Result<()> {
+    run_git(root, &["init"])?;
+    run_git(root, &["config", "user.name", "Claw Validator"])?;
+    run_git(root, &["config", "user.email", "validator@claw.invalid"])?;
+    run_git(root, &["add", "--all"])?;
+    run_git(
+        root,
+        &[
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "validation snapshot",
+        ],
+    )
+}
+
+fn run_git(root: &Path, args: &[&str]) -> io::Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
+}
+
 fn check(name: impl Into<String>, command: impl Into<String>) -> ValidationCheck {
     ValidationCheck {
         name: name.into(),
@@ -825,6 +859,47 @@ mod tests {
         ] {
             assert!(!command.contains(forbidden), "forbidden {forbidden}");
         }
+    }
+
+    #[test]
+    fn validation_snapshot_has_isolated_git_context_and_candidate_content() {
+        let source = std::env::temp_dir().join(format!("claw-validator-git-{}", unique_stamp()));
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("candidate.txt"), "candidate content").unwrap();
+        let candidate = UntrustedCandidate {
+            root: source.clone(),
+        };
+
+        let snapshot = ValidationSnapshot::create(&candidate, CandidateChangeSetId::zero())
+            .expect("validation snapshot should be created");
+        let top_level = Command::new("git")
+            .args([
+                "-C",
+                snapshot.root.to_str().unwrap(),
+                "rev-parse",
+                "--show-toplevel",
+            ])
+            .output()
+            .unwrap();
+        assert!(top_level.status.success());
+        assert_eq!(
+            PathBuf::from(String::from_utf8_lossy(&top_level.stdout).trim())
+                .canonicalize()
+                .unwrap(),
+            snapshot.root.canonicalize().unwrap()
+        );
+        let head = Command::new("git")
+            .args(["-C", snapshot.root.to_str().unwrap(), "rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+        assert_eq!(
+            fs::read_to_string(snapshot.root.join("candidate.txt")).unwrap(),
+            "candidate content"
+        );
+        assert!(!source.join(".git").exists());
+        drop(snapshot);
+        fs::remove_dir_all(source).unwrap();
     }
 
     #[test]
@@ -1042,7 +1117,12 @@ mod tests {
         let snapshot =
             ValidationSnapshot::create(&candidate, CandidateChangeSetId::zero()).unwrap();
         assert!(snapshot.root.join("source.txt").is_file());
-        assert!(!snapshot.root.join(".git/config").exists());
+        assert!(snapshot.root.join(".git/config").is_file());
+        let head = Command::new("git")
+            .args(["-C", snapshot.root.to_str().unwrap(), "rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(head.status.success());
         fs::write(snapshot.root.join("source.txt"), b"validator artifact").unwrap();
         fs::write(
             snapshot.root.join("Cargo.lock"),

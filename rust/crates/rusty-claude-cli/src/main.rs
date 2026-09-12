@@ -4627,6 +4627,8 @@ struct LiveCli {
     frozen_plan_context: Option<String>,
     reasoning_effort_override: Option<String>,
     evaluation: Option<requirement_evaluator::EvaluationReport>,
+    last_validation_status: Option<String>,
+    last_validation_evidence: Option<String>,
     model_pool: model_router::ModelPool,
     calibration: model_router::CalibrationStore,
     routing_policy: model_router::RoutingPolicy,
@@ -6012,6 +6014,8 @@ impl LiveCli {
                 .map(|artifact| artifact.repository_context.clone()),
             reasoning_effort_override: None,
             evaluation: None,
+            last_validation_status: None,
+            last_validation_evidence: None,
             model_pool,
             calibration,
             routing_policy,
@@ -7067,6 +7071,7 @@ impl LiveCli {
                     self.persist_session()?;
                     self.context_tray.clear();
                     self.attachments.clear();
+                    self.render_terminal_result(presentation, &summary, None)?;
                     return Ok(());
                 }
                 // A runtime finalization turn can both record the automatic
@@ -7106,6 +7111,7 @@ impl LiveCli {
                                 self.persist_session()?;
                                 self.context_tray.clear();
                                 self.attachments.clear();
+                                self.render_terminal_result(presentation, &summary, None)?;
                                 return Ok(());
                             } else {
                                 self.grant_work_unit_continuation(
@@ -7184,6 +7190,7 @@ impl LiveCli {
                                     self.persist_session()?;
                                     self.context_tray.clear();
                                     self.attachments.clear();
+                                    self.render_terminal_result(presentation, &summary, None)?;
                                     return Ok(());
                                 }
                                 self.replace_runtime(runtime)?;
@@ -7658,12 +7665,54 @@ impl LiveCli {
                             .flatten()
                             .and_then(|changes| candidate_artifact_for(&self.runtime, &changes))
                     });
-                result["candidate_artifact"] =
-                    candidate_artifact.map_or(Value::Null, |artifact| json!(artifact));
+                let projection = Self::terminal_json_projection(
+                    lifecycle_status.unwrap_or(candidate_state_label(self.candidate_state)),
+                    candidate_state_label(self.candidate_state),
+                    matches!(self.candidate_state, CandidateLifecycleState::ReviewReady),
+                    candidate_artifact,
+                    self.last_validation_status.as_deref(),
+                    self.last_validation_evidence.as_deref(),
+                );
+                if let Some(fields) = projection.as_object() {
+                    for (key, value) in fields {
+                        result[key] = value.clone();
+                    }
+                }
+                result["task_state"] = json!({
+                    "current_work_unit": self.task_plan.current_work_unit_id,
+                    "work_units_total": self.task_plan.work_units.len(),
+                    "all_work_units_resolved": self.task_plan.all_work_units_resolved(),
+                    "writer_turns": self.work_unit_writer_turns,
+                    "writer_turn_allowance": self.work_unit_turn_allowance,
+                });
                 println!("{result}");
             }
         }
         Ok(())
+    }
+
+    fn terminal_json_projection(
+        lifecycle_status: &str,
+        candidate_state: &str,
+        review_ready: bool,
+        candidate_artifact: Option<benchmark_telemetry::CandidateArtifact>,
+        validation_status: Option<&str>,
+        validation_evidence: Option<&str>,
+    ) -> Value {
+        let mut projection = json!({
+        "lifecycle_status": lifecycle_status,
+        "terminal_status": lifecycle_status,
+        "candidate_state": candidate_state,
+            "review_ready": review_ready,
+            "candidate_artifact": candidate_artifact.map_or(Value::Null, |artifact| json!(artifact)),
+        });
+        if validation_status.is_some() || validation_evidence.is_some() {
+            projection["validation"] = json!({
+                "status": validation_status,
+                "evidence": validation_evidence,
+            });
+        }
+        projection
     }
 
     #[allow(clippy::too_many_lines)]
@@ -7723,6 +7772,8 @@ impl LiveCli {
         benchmark_telemetry::lifecycle_event("validation_started");
         let validation = runtime.validate_candidate(&changes)?;
         let validation_diagnostics = render_validation_evidence(&validation);
+        self.last_validation_status = Some(validation_status(&validation).to_string());
+        self.last_validation_evidence = Some(validation_diagnostics.clone());
         benchmark_telemetry::validation_details(
             &changes.id.to_string(),
             &validation.validation_identity.to_string(),
@@ -15162,6 +15213,48 @@ mod tests {
             value["candidate_artifact"]["changed_paths"][0],
             "src/lib.rs"
         );
+    }
+
+    #[test]
+    fn terminal_json_projection_retains_validation_and_candidate_state() {
+        let value = super::LiveCli::terminal_json_projection(
+            "validation_blocked",
+            "validation-blocked",
+            false,
+            Some(super::benchmark_telemetry::CandidateArtifact {
+                candidate_identity: "candidate-42".to_string(),
+                changed_paths: vec!["src/lib.rs".to_string()],
+                truncated: false,
+                diff: "+ bounded change".to_string(),
+            }),
+            Some("BLOCKED"),
+            Some("git rev-parse failed"),
+        );
+
+        assert_eq!(value["lifecycle_status"], "validation_blocked");
+        assert_eq!(value["terminal_status"], "validation_blocked");
+        assert_eq!(value["candidate_state"], "validation-blocked");
+        assert_eq!(
+            value["candidate_artifact"]["candidate_identity"],
+            "candidate-42"
+        );
+        assert_eq!(value["validation"]["status"], "BLOCKED");
+        assert_eq!(value["validation"]["evidence"], "git rev-parse failed");
+    }
+
+    #[test]
+    fn terminal_json_projection_does_not_fabricate_candidate_artifact() {
+        let value = super::LiveCli::terminal_json_projection(
+            "completed",
+            "editing",
+            false,
+            None,
+            None,
+            None,
+        );
+
+        assert!(value["candidate_artifact"].is_null());
+        assert!(value.get("validation").is_none());
     }
 
     fn registry_with_plugin_tool() -> GlobalToolRegistry {
