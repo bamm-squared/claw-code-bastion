@@ -4771,6 +4771,15 @@ impl BuiltRuntime {
         self
     }
 
+    fn with_provider_request_budget(mut self, budget: usize) -> Self {
+        let runtime = self
+            .runtime
+            .take()
+            .expect("runtime should exist before installing provider budget");
+        self.runtime = Some(runtime.with_provider_request_budget(budget));
+        self
+    }
+
     fn with_orchestrator_checkpointing(mut self) -> Self {
         let runtime = self
             .runtime
@@ -6786,16 +6795,8 @@ impl LiveCli {
         let remaining_work_unit_turns = self
             .work_unit_turn_allowance
             .saturating_sub(self.work_unit_writer_turns);
-        let candidate_changed_at_boundary = self.task_plan.current_work_unit().is_some()
-            && remaining_work_unit_turns == 0
-            && self.runtime.candidate_has_changes()?.unwrap_or(false);
-        let finalization_only = self.work_unit_finalization_pending
-            || (candidate_changed_at_boundary && !self.work_unit_finalization_used);
+        let finalization_only = false;
         self.work_unit_finalization_pending = false;
-        if candidate_changed_at_boundary && !self.work_unit_finalization_used {
-            self.work_unit_finalization_used = true;
-            benchmark_telemetry::lifecycle_event("work_unit_convergence_finalization_requested");
-        }
         if self.task_plan.current_work_unit().is_some()
             && remaining_work_unit_turns == 0
             && !finalization_only
@@ -6888,14 +6889,8 @@ impl LiveCli {
         } else {
             runtime.with_repository_context(plan_text)
         }
-        .with_writer_checkpoint_policy(
-            if finalization_only {
-                0
-            } else {
-                remaining_work_unit_turns
-            },
-            1,
-        );
+        .with_writer_checkpoint_policy(remaining_work_unit_turns, 0)
+        .with_provider_request_budget(remaining_work_unit_turns);
         let runtime = if self.task_plan.current_work_unit().is_some() && !finalization_only {
             runtime.with_orchestrator_checkpointing()
         } else {
@@ -6918,6 +6913,12 @@ impl LiveCli {
         Ok(())
     }
 
+    fn preserve_current_candidate_artifact(&mut self) {
+        if let Ok(Some(changes)) = self.runtime.finish_candidate() {
+            record_candidate_artifact(&self.runtime, &changes);
+        }
+    }
+
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         self.run_turn_with_presentation(input, TurnPresentation::Text, true)
     }
@@ -6929,7 +6930,13 @@ impl LiveCli {
         presentation: TurnPresentation,
         interactive: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (_prompt, image_blocks) = self.prepare_user_turn(input)?;
+        let (_prompt, image_blocks) = match self.prepare_user_turn(input) {
+            Ok(value) => value,
+            Err(error) => {
+                self.preserve_current_candidate_artifact();
+                return Err(error);
+            }
+        };
         self.route_writer_for_current_task();
         if let Some(reason) = self.rework_blocked.take() {
             return Err(reason.into());
@@ -6946,7 +6953,13 @@ impl LiveCli {
             }
         }
         let (mut runtime, hook_abort_monitor) =
-            self.prepare_turn_runtime(presentation.emits_tool_output(), input)?;
+            match self.prepare_turn_runtime(presentation.emits_tool_output(), input) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.preserve_current_candidate_artifact();
+                    return Err(error);
+                }
+            };
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         let hud = trusted_hud_line(
@@ -6968,6 +6981,18 @@ impl LiveCli {
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
+                let available_writer_turns = self
+                    .work_unit_turn_allowance
+                    .saturating_sub(self.work_unit_writer_turns);
+                if summary.iterations > available_writer_turns {
+                    let _ = finish_candidate_for_terminal(&mut runtime);
+                    self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
+                    return Err(format!(
+                        "writer request accounting exceeded WorkUnit allowance: requested={}, available={available_writer_turns}",
+                        summary.iterations
+                    )
+                    .into());
+                }
                 self.work_unit_writer_turns = self
                     .work_unit_writer_turns
                     .saturating_add(summary.iterations);
@@ -7027,15 +7052,6 @@ impl LiveCli {
                     && self.work_unit_writer_turns >= self.work_unit_turn_allowance
                     && runtime.candidate_has_changes()?.unwrap_or(false)
                 {
-                    if !self.work_unit_finalization_used {
-                        self.work_unit_finalization_used = true;
-                        self.work_unit_finalization_pending = true;
-                        benchmark_telemetry::lifecycle_event(
-                            "work_unit_convergence_finalization_requested",
-                        );
-                        self.replace_runtime(runtime)?;
-                        return self.run_turn_with_presentation(input, presentation, interactive);
-                    }
                     benchmark_telemetry::lifecycle_event(
                         "work_unit_implicit_submission_at_boundary",
                     );
@@ -7461,8 +7477,13 @@ impl LiveCli {
                 Ok(())
             }
             Err(error) => {
-                let _ = runtime.discard_candidate();
-                self.candidate_state = CandidateLifecycleState::Discarded;
+                let preserved = finish_candidate_for_terminal(&mut runtime).is_ok();
+                self.candidate_state = if preserved {
+                    CandidateLifecycleState::EvaluationBlocked
+                } else {
+                    let _ = runtime.discard_candidate();
+                    CandidateLifecycleState::Discarded
+                };
                 runtime.shutdown_plugins()?;
                 if presentation.is_text() {
                     spinner.fail(
@@ -9625,12 +9646,48 @@ fn planning_artifact_hash(plan: &task_plan::TaskPlan, repository_context: &str) 
     use std::hash::{Hash, Hasher};
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    serde_json::to_string(plan)
+    serde_json::to_string(&immutable_plan_identity(plan))
         .unwrap_or_default()
         .hash(&mut hasher);
     repository_context.hash(&mut hasher);
     task_plan::PLANNER_VERSION.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+fn immutable_plan_identity(plan: &task_plan::TaskPlan) -> serde_json::Value {
+    json!({
+        "full_request": plan.full_request,
+        "original_request": plan.original_request,
+        "items": plan.items.iter().map(|item| json!({
+            "id": item.id,
+            "statement": item.statement,
+        })).collect::<Vec<_>>(),
+        "contracts": plan.contracts.iter().map(|contract| json!({
+            "id": contract.id,
+            "expectation": contract.expectation,
+            "basis": contract.basis,
+            "verification_boundary": contract.verification_boundary,
+            "verification_basis": contract.verification_basis,
+        })).collect::<Vec<_>>(),
+        "global_invariant_ids": plan.global_invariant_ids,
+        "known_impact": plan.known_impact,
+        "repository_files": plan.repository_files,
+        "primary_repository_files": plan.primary_repository_files,
+        "implementation_surface_guidance": plan.implementation_surface_guidance,
+        "work_units": plan.work_units.iter().map(|unit| json!({
+            "id": unit.id,
+            "objective": unit.objective,
+            "owned_contract_ids": unit.owned_contract_ids,
+            "downstream_contract_ids": unit.downstream_contract_ids,
+            "fact_refs": unit.fact_refs,
+            "likely_scope": unit.likely_scope,
+            "dependencies": unit.dependencies,
+            "invariants": unit.invariants,
+            "global_invariant_ids": unit.global_invariant_ids,
+            "completion_evidence": unit.completion_evidence,
+            "requires_candidate_change": unit.requires_candidate_change,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 fn current_baseline_identity(source_revision: &str) -> String {
@@ -19914,6 +19971,37 @@ mod frozen_plan_identity_tests {
         let resumed = planning_artifact_hash(&plan, context);
         assert_eq!(audited, resumed);
         assert!(!audited.is_empty());
+    }
+
+    #[test]
+    fn execution_progress_does_not_change_frozen_plan_identity() {
+        let mut plan = task_plan::TaskPlan::from_request(
+            "Implement the behavior. Preserve compatibility.",
+            Some("src/lib.rs"),
+        );
+        let context = "selected: src/lib.rs";
+        let frozen = planning_artifact_hash(&plan, context);
+
+        plan.revision = plan.revision.saturating_add(1);
+        plan.record_work_unit_completion_feedback("candidate checks are ready");
+        plan.complete_current_work_unit("candidate implementation and validation evidence");
+
+        assert_eq!(planning_artifact_hash(&plan, context), frozen);
+    }
+
+    #[test]
+    fn semantic_plan_changes_still_invalidate_frozen_identity() {
+        let mut plan = task_plan::TaskPlan::from_request(
+            "Implement the behavior. Preserve compatibility.",
+            Some("src/lib.rs"),
+        );
+        let context = "selected: src/lib.rs";
+        let frozen = planning_artifact_hash(&plan, context);
+        plan.work_units[0]
+            .objective
+            .push_str(" and add compatibility tests");
+
+        assert_ne!(planning_artifact_hash(&plan, context), frozen);
     }
 }
 

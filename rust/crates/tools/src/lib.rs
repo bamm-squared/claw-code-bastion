@@ -461,6 +461,15 @@ impl ExecutionBackend for IsolatedExecutionBackend {
             return development_check_infrastructure_error("candidate check plan is empty");
         }
         let candidate_changed = !changes.changes.is_empty();
+        let validator_image = match validator_image_for_plan(&plan) {
+            Ok(image) => image,
+            Err(error) => {
+                return development_check_infrastructure_error_for_candidate(
+                    &error,
+                    &changes.id.to_string(),
+                );
+            }
+        };
         let snapshot = runtime::ValidationSnapshot::create_verified(
             &self.workspace.candidate,
             &self.workspace.baseline,
@@ -468,9 +477,7 @@ impl ExecutionBackend for IsolatedExecutionBackend {
         )
         .map_err(|error| format!("unable to snapshot candidate for development check: {error}"))?;
         let backend = runtime::PodmanValidatorBackend {
-            image: std::env::var("CLAW_VALIDATOR_IMAGE")
-                .or_else(|_| std::env::var("CLAW_WORKER_IMAGE"))
-                .unwrap_or_else(|_| runtime::DEFAULT_RUNTIME_IMAGE.to_string()),
+            image: validator_image,
             ..runtime::PodmanValidatorBackend::default()
         };
         let validation_result =
@@ -620,6 +627,9 @@ impl ExecutionBackend for IsolatedExecutionBackend {
     ) -> Result<runtime::validator::ValidationResult, String> {
         self.stop_worker();
         let plan = runtime::detect_validation_plan(&self.workspace.candidate.root);
+        let validator_image = validator_image_for_plan(&plan).map_err(|error| {
+            format!("candidate trusted validation infrastructure failure: {error}")
+        })?;
         let snapshot = runtime::ValidationSnapshot::create_verified(
             &self.workspace.candidate,
             &self.workspace.baseline,
@@ -627,9 +637,7 @@ impl ExecutionBackend for IsolatedExecutionBackend {
         )
         .map_err(|error| error.to_string())?;
         let backend = runtime::PodmanValidatorBackend {
-            image: std::env::var("CLAW_VALIDATOR_IMAGE")
-                .or_else(|_| std::env::var("CLAW_WORKER_IMAGE"))
-                .unwrap_or_else(|_| runtime::DEFAULT_RUNTIME_IMAGE.to_string()),
+            image: validator_image,
             ..runtime::PodmanValidatorBackend::default()
         };
         match runtime::ValidatorBackend::validate(&backend, &snapshot.input(), &plan) {
@@ -752,6 +760,40 @@ fn development_check_for_name(
                 check.command = lock_cargo_dependency_resolution(&check.command);
             }
             check
+        })
+}
+
+fn validator_image_for_plan(plan: &runtime::ValidationPlan) -> Result<String, String> {
+    let validator_image = std::env::var("CLAW_VALIDATOR_IMAGE").ok();
+    let worker_image = std::env::var("CLAW_WORKER_IMAGE").ok();
+    validator_image_for_plan_values(plan, validator_image.as_deref(), worker_image.as_deref())
+}
+
+fn validator_image_for_plan_values(
+    plan: &runtime::ValidationPlan,
+    validator_image: Option<&str>,
+    worker_image: Option<&str>,
+) -> Result<String, String> {
+    let requires_rust_toolchain = plan
+        .checks
+        .iter()
+        .any(|check| check.command.contains("cargo"));
+    if requires_rust_toolchain {
+        return validator_image
+            .filter(|image| !image.trim().is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                String::from(
+                    "Rust candidate checks require CLAW_VALIDATOR_IMAGE pointing to a Rust-capable contained validator",
+                )
+            });
+    }
+    validator_image
+        .or(worker_image)
+        .filter(|image| !image.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            String::from("candidate checks require a configured contained validator image")
         })
 }
 
@@ -11000,6 +11042,41 @@ printf 'pwsh:%s' "$1"
             .expect_err("candidate checks need an isolated candidate");
 
         assert!(error.contains("isolated candidate backend"));
+    }
+
+    #[test]
+    fn rust_candidate_checks_require_a_rust_capable_validator_image() {
+        let plan = runtime::ValidationPlan::new(vec![runtime::validator::ValidationCheck {
+            name: "check".to_string(),
+            command: "cargo check --workspace".to_string(),
+            timeout: std::time::Duration::from_secs(30),
+            required: true,
+        }]);
+
+        let missing = super::validator_image_for_plan_values(&plan, None, Some("worker"))
+            .expect_err("Cargo checks must not fall back to a generic worker image");
+        assert!(missing.contains("CLAW_VALIDATOR_IMAGE"));
+        assert_eq!(
+            super::validator_image_for_plan_values(&plan, Some("rust-validator"), Some("worker"))
+                .expect("configured validator should be selected"),
+            "rust-validator"
+        );
+    }
+
+    #[test]
+    fn non_rust_candidate_checks_preserve_contained_image_fallback() {
+        let plan = runtime::ValidationPlan::new(vec![runtime::validator::ValidationCheck {
+            name: "custom".to_string(),
+            command: "./check-script".to_string(),
+            timeout: std::time::Duration::from_secs(30),
+            required: true,
+        }]);
+
+        assert_eq!(
+            super::validator_image_for_plan_values(&plan, None, Some("worker"))
+                .expect("non-Rust checks may use the contained worker image"),
+            "worker"
+        );
     }
 
     #[test]

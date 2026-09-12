@@ -274,6 +274,7 @@ pub struct ConversationRuntime<C, T> {
     configured_max_iterations: usize,
     checkpoint_finalization_turns: usize,
     checkpoint_turns_remaining: usize,
+    provider_request_budget: Option<usize>,
     pre_candidate_continuation_turns: usize,
     context_checkpoint_tokens: usize,
     checkpoint: Option<WriterCheckpoint>,
@@ -333,6 +334,7 @@ where
             configured_max_iterations: usize::MAX,
             checkpoint_finalization_turns: 0,
             checkpoint_turns_remaining: 0,
+            provider_request_budget: None,
             pre_candidate_continuation_turns: 4,
             context_checkpoint_tokens: DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD as usize,
             checkpoint: None,
@@ -370,6 +372,15 @@ where
         self.configured_max_iterations = max_iterations;
         self.checkpoint_finalization_turns = finalization_turns;
         self.checkpoint_turns_remaining = finalization_turns;
+        self
+    }
+
+    /// Bound the number of provider requests made by this runtime instance.
+    /// The caller owns cumulative WorkUnit accounting; this guard prevents a
+    /// reconstructed or finalization runtime from sending past its allowance.
+    #[must_use]
+    pub fn with_provider_request_budget(mut self, budget: usize) -> Self {
+        self.provider_request_budget = Some(budget);
         self
     }
 
@@ -709,6 +720,14 @@ where
                 return Err(error);
             }
 
+            if let Some(remaining) = self.provider_request_budget.as_mut() {
+                if *remaining == 0 {
+                    let error = RuntimeError::new("provider request budget exhausted");
+                    self.record_turn_failed(iterations, &error);
+                    return Err(error);
+                }
+                *remaining -= 1;
+            }
             let events = match self.api_client.stream(request) {
                 Ok(events) => events,
                 Err(error) => {
@@ -2294,6 +2313,52 @@ mod tests {
         assert!(error
             .to_string()
             .contains("conversation loop exceeded the maximum number of iterations"));
+    }
+
+    #[test]
+    fn provider_request_budget_rejects_the_next_request_locally() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct CountingApi(Rc<Cell<usize>>);
+
+        impl ApiClient for CountingApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let call = self.0.get().saturating_add(1);
+                self.0.set(call);
+                Ok(vec![
+                    AssistantEvent::ToolUse {
+                        id: format!("tool-{call}"),
+                        name: "echo".to_string(),
+                        input: format!("payload-{call}"),
+                    },
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let calls = Rc::new(Cell::new(0));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            CountingApi(Rc::clone(&calls)),
+            StaticToolExecutor::new().register("echo", |input| Ok(input.to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_max_iterations(100)
+        .with_provider_request_budget(40);
+
+        let error = runtime
+            .run_turn("bounded", None)
+            .expect_err("the forty-first provider request must be rejected");
+
+        assert_eq!(calls.get(), 40);
+        assert!(error
+            .to_string()
+            .contains("provider request budget exhausted"));
     }
 
     #[test]
