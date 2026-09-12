@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as FmtWrite;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -24,6 +24,22 @@ use telemetry::{MemoryTelemetrySink, SessionTracer, TelemetryEvent};
 
 pub const BENCHMARK_SCHEMA_VERSION: u32 = 1;
 const PARTIAL_TELEMETRY_MARKER: &str = "\n__CLAW_BENCH_PARTIAL_TELEMETRY__";
+
+fn read_child_output<R: Read>(mut reader: R, limit: usize) -> io::Result<Vec<u8>> {
+    let mut retained = Vec::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        if retained.len() < limit {
+            let keep = (limit - retained.len()).min(count);
+            retained.extend_from_slice(&buffer[..keep]);
+        }
+    }
+    Ok(retained)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkTask {
@@ -737,6 +753,16 @@ fn run_production_one(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| format!("production CLI failed to start: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "production CLI stdout unavailable".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "production CLI stderr unavailable".to_string())?;
+    let stdout_reader = std::thread::spawn(move || read_child_output(stdout, 8 * 1024 * 1024));
+    let stderr_reader = std::thread::spawn(move || read_child_output(stderr, 256 * 1024));
     let mut interactive_input = child.stdin.take();
     let mut apply_sent = false;
     let permission_response = std::env::var("CLAW_BENCH_PERMISSION_RESPONSE")
@@ -777,23 +803,13 @@ fn run_production_one(
             .try_wait()
             .map_err(|error| format!("production CLI wait failed: {error}"))?
         {
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| "production CLI stdout unavailable".to_string())?;
-            let stderr = child
-                .stderr
-                .take()
-                .ok_or_else(|| "production CLI stderr unavailable".to_string())?;
-            let mut output = Vec::new();
-            stdout
-                .take(8 * 1024 * 1024)
-                .read_to_end(&mut output)
+            let output = stdout_reader
+                .join()
+                .map_err(|_| "production CLI stdout reader panicked".to_string())?
                 .map_err(|error| error.to_string())?;
-            let mut error_output = Vec::new();
-            stderr
-                .take(256 * 1024)
-                .read_to_end(&mut error_output)
+            let error_output = stderr_reader
+                .join()
+                .map_err(|_| "production CLI stderr reader panicked".to_string())?
                 .map_err(|error| error.to_string())?;
             break std::process::Output {
                 status,
@@ -810,6 +826,8 @@ fn run_production_one(
             }
             let _ = child.kill();
             let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
             return Err(with_timeout_telemetry(
                 &format!(
                     "production task {} timed out after {} seconds",
@@ -2194,5 +2212,12 @@ mod tests {
         assert_eq!(telemetry.unwrap()["terminal_status"], "failed");
         let persisted = fs::read_to_string(path).unwrap();
         assert!(persisted.contains(r#""terminal_status":"failed""#));
+    }
+
+    #[test]
+    fn child_output_reader_retains_a_bound_while_draining() {
+        let input = std::io::Cursor::new(vec![b'x'; 64]);
+        let retained = read_child_output(input, 8).unwrap();
+        assert_eq!(retained, vec![b'x'; 8]);
     }
 }
