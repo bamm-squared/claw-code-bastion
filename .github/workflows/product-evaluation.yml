@@ -207,7 +207,12 @@ jobs:
                   "--repetitions", "1", "--output", str(result_file),
               ]
               print(f"=== {task_id} ({category}) ===", flush=True)
-              completed = subprocess.run(command, env=env, text=True)
+              try:
+                  completed = subprocess.run(command, env=env, text=True, timeout=900)
+              except subprocess.TimeoutExpired:
+                  print(f"task {task_id} exceeded the external 900-second task watchdog; terminating", flush=True)
+                  (out / f"{task_id}.exit").write_text("124")
+                  continue
               (out / f"{task_id}.exit").write_text(str(completed.returncode))
               if completed.returncode != 0:
                   print(f"task {task_id} exited {completed.returncode}; continuing batch", flush=True)
