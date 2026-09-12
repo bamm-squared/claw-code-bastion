@@ -427,13 +427,7 @@ fn failure_fingerprints(check: &ValidationCheckResult) -> Vec<String> {
             .join(" ");
         let lower = normalized.to_ascii_lowercase();
         let normalized = if lower.starts_with("thread '") && lower.contains(" panicked at") {
-            format!(
-                "{} panicked",
-                normalized
-                    .split(" panicked at")
-                    .next()
-                    .unwrap_or(&normalized)
-            )
+            normalize_thread_panic(&normalized)
         } else if lower.starts_with("test result: failed") {
             String::from("test result: FAILED")
         } else {
@@ -465,6 +459,21 @@ fn failure_fingerprints(check: &ValidationCheckResult) -> Vec<String> {
         ));
     }
     fingerprints
+}
+
+fn normalize_thread_panic(line: &str) -> String {
+    let thread = line.split(" panicked at").next().unwrap_or(line);
+    let stable_thread = thread
+        .rfind(" (")
+        .and_then(|start| {
+            let suffix = &thread[start + 2..];
+            suffix
+                .strip_suffix(')')
+                .filter(|value| !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()))
+                .map(|_| &thread[..start])
+        })
+        .unwrap_or(thread);
+    format!("{stable_thread} panicked")
 }
 
 fn strip_ansi(input: &str) -> String {
@@ -1232,6 +1241,34 @@ mod tests {
         assert!(truncated);
         assert!(output.contains("validator output truncated; tail retained"));
         assert!(output.contains("final compiler diagnostic: expected item"));
+    }
+
+    #[test]
+    fn thread_panic_fingerprints_ignore_runtime_thread_ids() {
+        let first = ValidationCheckResult {
+            name: String::from("test"),
+            command: String::from("test"),
+            required: true,
+            status: ValidationStatus::Fail,
+            exit_code: Some(101),
+            stdout: String::from("thread 'case' (26413) panicked at test.rs:1:1"),
+            stderr: String::new(),
+            truncated: false,
+        };
+        let second = ValidationCheckResult {
+            stdout: String::from("thread 'case' (38174) panicked at test.rs:1:1"),
+            ..first.clone()
+        };
+        let independent = ValidationCheckResult {
+            stdout: String::from("thread 'other-case' (38174) panicked at test.rs:1:1"),
+            ..first.clone()
+        };
+
+        assert_eq!(failure_fingerprints(&first), failure_fingerprints(&second));
+        assert_ne!(
+            failure_fingerprints(&second),
+            failure_fingerprints(&independent)
+        );
     }
 
     #[test]
