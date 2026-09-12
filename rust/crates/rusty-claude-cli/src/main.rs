@@ -403,6 +403,7 @@ fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let planning_only = argv.iter().any(|arg| arg == "plan");
     if let Err(error) = run() {
+        let candidate_artifact = benchmark_telemetry::current_candidate_artifact();
         benchmark_telemetry::flush("internal_error");
         let message = error.to_string();
         // When --output-format json is active, emit errors as JSON so downstream
@@ -412,10 +413,7 @@ fn main() {
             .any(|w| w[0] == "--output-format" && w[1] == "json")
             || argv.iter().any(|a| a == "--output-format=json");
         if json_output {
-            eprintln!(
-                "{}",
-                json_error_value(&message, benchmark_telemetry::current_candidate_artifact(),)
-            );
+            eprintln!("{}", json_error_value(&message, candidate_artifact));
         } else if message.contains("`claw --help`") {
             eprintln!("error: {message}");
         } else {
