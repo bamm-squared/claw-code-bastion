@@ -90,6 +90,7 @@ jobs:
           (cd rust && cargo build --workspace)
           python3 - <<'PY'
           import json
+          import os
           from pathlib import Path
 
           settings = json.loads(Path("benchmarks/settings.local.json").read_text())
