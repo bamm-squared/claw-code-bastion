@@ -1,16 +1,8 @@
 name: Ephemeral trusted validator replay
 
 on:
-  workflow_dispatch:
-    inputs:
-      source_sha:
-        description: Exact source revision to replay
-        required: true
-        default: 18e47025d89b92de4d03aaa6cbe2179447e8709a
-      patch_b64:
-        description: Base64-encoded exact historical candidate patch
-        required: true
-        type: string
+  repository_dispatch:
+    types: [ephemeral-validator-replay]
 
 permissions:
   contents: read
@@ -23,8 +15,8 @@ jobs:
     env:
       CARGO_TERM_COLOR: never
       NO_COLOR: "1"
-      SOURCE_SHA: ${{ inputs.source_sha }}
-      PATCH_B64: ${{ inputs.patch_b64 }}
+      SOURCE_SHA: ${{ github.event.client_payload.source_sha }}
+      PATCH_B64: ${{ github.event.client_payload.patch_b64 }}
       WORKER_IMAGE: localhost/claw-bastion-runtime:source-current-20260909-liveness
       VALIDATOR_IMAGE: localhost/claw-bastion-validator-rust:source-current-20260909-liveness
     steps:
