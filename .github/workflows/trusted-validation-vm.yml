@@ -1,0 +1,85 @@
+name: Disposable trusted validation VM
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trusted-validation-vm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  trusted-validation-vm:
+    name: trusted validation on disposable rootless VM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CLAW_REQUIRE_DISPOSABLE_VALIDATOR: "1"
+      CLAW_VALIDATOR_WORKER_CLASS: disposable-vm
+      CLAW_ACCEPTANCE_WORKER_IMAGE: claw-bastion-runtime:trusted-vm
+      CLAW_ACCEPTANCE_VALIDATOR_IMAGE: claw-bastion-validator-rust:trusted-vm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+
+      - name: Install rootless validation prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends podman crun uidmap slirp4netns fuse-overlayfs netavark git
+          user_name="$(id -un)"
+          user_id="$(id -u)"
+          sudo sh -c "grep -q '^${user_name}:' /etc/subuid || printf '%s:100000:65536\\n' '${user_name}' >> /etc/subuid"
+          sudo sh -c "grep -q '^${user_name}:' /etc/subgid || printf '%s:100000:65536\\n' '${user_name}' >> /etc/subgid"
+          sudo install -d -m 700 -o "${user_name}" -g "${user_name}" "/run/user/${user_id}"
+          echo "XDG_RUNTIME_DIR=/run/user/${user_id}" >> "$GITHUB_ENV"
+          echo "CONTAINERS_CONF=$RUNNER_TEMP/containers.conf" >> "$GITHUB_ENV"
+          printf '[engine]\ncgroup_manager = "cgroupfs"\n' > "$RUNNER_TEMP/containers.conf"
+
+      - name: Verify supported disposable worker
+        run: |
+          ./scripts/security-runner-preflight.sh
+          podman info
+          podman unshare cat /proc/self/uid_map
+          podman unshare cat /proc/self/gid_map
+          podman pull --quiet docker.io/library/alpine:3.20
+          podman run --rm --network=none --cap-drop=ALL --security-opt=no-new-privileges alpine:3.20 sh -c 'test -x /bin/sh && ! wget -q -T 2 -O- https://example.invalid'
+
+      - name: Build pinned validation images
+        run: |
+          podman build --pull=never --build-arg CLAW_SOURCE_REVISION="$GITHUB_SHA" -f Containerfile.worker -t "$CLAW_ACCEPTANCE_WORKER_IMAGE" .
+          podman build --pull=never --build-arg CLAW_SOURCE_REVISION="$GITHUB_SHA" -f Containerfile.validator -t "$CLAW_ACCEPTANCE_VALIDATOR_IMAGE" .
+          podman image inspect --format 'worker={{.Id}}' "$CLAW_ACCEPTANCE_WORKER_IMAGE"
+          podman image inspect --format 'validator={{.Id}}' "$CLAW_ACCEPTANCE_VALIDATOR_IMAGE"
+
+      - name: Verify built worker policy
+        env:
+          CLAW_REAL_PODMAN_IMAGE: claw-bastion-runtime:trusted-vm
+        run: ./scripts/security-runner-preflight.sh
+
+      - name: Run repository secure-isolation tests
+        env:
+          CLAW_REAL_PODMAN_IMAGE: claw-bastion-runtime:trusted-vm
+          CLAW_WORKER_IMAGE: claw-bastion-runtime:trusted-vm
+          CLAW_VALIDATOR_IMAGE: claw-bastion-validator-rust:trusted-vm
+        working-directory: rust
+        run: cargo test -p runtime --test podman_isolation -- --ignored --nocapture
+
+      - name: Run normal production lifecycle fixture
+        run: ./scripts/run-local-acceptance.sh --task config-threading --artifacts-dir "$RUNNER_TEMP/acceptance"
+
+      - name: Upload trusted-validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trusted-validation-vm-${{ github.run_id }}
+          path: |
+            artifacts/
+            ${{ runner.temp }}/acceptance/
+          if-no-files-found: ignore

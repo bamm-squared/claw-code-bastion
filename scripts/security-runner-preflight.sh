@@ -6,11 +6,19 @@ pass() { printf 'PASS  %s\n' "$1"; }
 fail() { printf 'FAIL  %s\n' "$1"; failures=$((failures + 1)); }
 
 printf '%s\n' 'Claw isolation-runner preflight'
+for command in podman crun newuidmap newgidmap slirp4netns netavark git cargo rustc; do
+    if command -v "$command" >/dev/null 2>&1; then
+        pass "$command executable ($(command -v "$command"))"
+    else
+        fail "$command executable"
+    fi
+done
+
 if command -v podman >/dev/null 2>&1; then
     version="$(podman --version 2>&1 || true)"
-    pass "Podman executable ($version)"
+    pass "Podman version ($version)"
 else
-    fail "Podman executable"
+    fail "Podman version"
 fi
 
 rootless="$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || true)"
@@ -18,8 +26,17 @@ if [ "$rootless" = true ]; then pass "Rootless execution"; else fail "Rootless e
 
 runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 if [ -d "$runtime_dir" ] && [ -w "$runtime_dir" ]; then pass "Writable runtime directory ($runtime_dir)"; else fail "Writable runtime directory ($runtime_dir)"; fi
-if unshare -Ur true >/dev/null 2>&1; then pass "User namespaces"; else fail "User namespaces"; fi
+if timeout 15 podman unshare sh -c 'test -s /proc/self/uid_map && test -s /proc/self/gid_map' >/dev/null 2>&1; then pass "Podman user namespaces"; else fail "Podman user namespaces"; fi
 if [ -f /sys/fs/cgroup/cgroup.controllers ]; then pass "cgroup v2"; else fail "cgroup v2"; fi
+if [ -r /etc/subuid ] && grep -q "^$(id -un):" /etc/subuid; then pass "Subordinate UID mapping"; else fail "Subordinate UID mapping"; fi
+if [ -r /etc/subgid ] && grep -q "^$(id -un):" /etc/subgid; then pass "Subordinate GID mapping"; else fail "Subordinate GID mapping"; fi
+if [ "${CLAW_REQUIRE_DISPOSABLE_VALIDATOR:-0}" = 1 ]; then
+    if [ "${CLAW_VALIDATOR_WORKER_CLASS:-}" = "disposable-vm" ]; then
+        pass "Supported worker class (disposable-vm)"
+    else
+        fail "Supported worker class (set CLAW_VALIDATOR_WORKER_CLASS=disposable-vm)"
+    fi
+fi
 
 image="${CLAW_REAL_PODMAN_IMAGE:-}"
 if [ "${CLAW_PREFLIGHT_CONFIG_ONLY:-0}" = 1 ]; then

@@ -25,6 +25,33 @@ IPC namespaces, host filesystem mounts, host home mounts, engine sockets, SSH
 agent forwarding, or broad added capabilities. It should be an expendable
 Ubuntu 24.04-class host with no production or personal credentials.
 
+## Supported trusted-validation deployment
+
+Trusted validation that exercises repository-owned secure-isolation tests runs on
+the disposable VM workflow `Disposable trusted validation VM`. The VM is the
+outer security boundary; Bastion runs as an unprivileged user and uses rootless
+Podman for each isolated Git snapshot. The workflow provisions Ubuntu 24.04,
+Podman, `crun`, `uidmap`, `slirp4netns`, `netavark`, cgroups v2, Git, and the
+Rust toolchain, then runs worker preflight before materializing any candidate.
+
+The worker contract is selected with:
+
+```text
+CLAW_REQUIRE_DISPOSABLE_VALIDATOR=1
+CLAW_VALIDATOR_WORKER_CLASS=disposable-vm
+```
+
+Preflight records the worker class, rootless status, user mappings, OCI and
+network helpers, runtime directory, and container policy smoke. Validation
+returns bounded baseline/candidate artifacts before the VM is destroyed. No
+candidate process, rootless storage, or engine state is retained across jobs.
+
+The previous topology of a hardened validator container attempting to start a
+second rootless Podman is unsupported. It must fail preflight as
+`VALIDATOR_WORKER_UNSUPPORTED`; do not add privileges, mount a host engine
+socket, use host PID, or disable `no-new-privileges` to make nested execution
+appear to work.
+
 ## Provisioning and running the gate
 
 Inspect a new runner without changing system configuration:
@@ -67,9 +94,9 @@ network/socket isolation, candidate independence, timeout/descendant cleanup
 and output bounds; and the candidate/canonical boundary, validation identity,
 whole-change-set apply, and full hostile authoritative lifecycle.
 
-## Runner registration
+## Legacy runner registration
 
-The dedicated workflow requires a manually registered self-hosted runner with
+The legacy dedicated workflow requires a manually registered self-hosted runner with
 these labels:
 
 ```text
