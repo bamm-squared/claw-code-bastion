@@ -57,6 +57,7 @@ jobs:
           baseline="$root/baseline"
           candidate="$root/candidate"
           mkdir -p "$baseline" "$candidate"
+          git fetch --no-tags origin "$SOURCE_SHA"
           git archive "$SOURCE_SHA" | tar -x -C "$baseline"
           cp -a "$baseline/." "$candidate/"
           printf '%s' "$PATCH_B64" | base64 --decode > "$root/historical.patch"
