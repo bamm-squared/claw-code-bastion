@@ -55,6 +55,8 @@ jobs:
 
       - name: Build pinned validation images
         run: |
+          podman pull docker.io/library/rust:bookworm
+          podman pull docker.io/library/debian:bookworm-slim
           podman build --pull=never --build-arg CLAW_SOURCE_REVISION="$GITHUB_SHA" -f Containerfile.worker -t "$CLAW_ACCEPTANCE_WORKER_IMAGE" .
           podman build --pull=never --build-arg CLAW_SOURCE_REVISION="$GITHUB_SHA" -f Containerfile.validator -t "$CLAW_ACCEPTANCE_VALIDATOR_IMAGE" .
           podman image inspect --format 'worker={{.Id}}' "$CLAW_ACCEPTANCE_WORKER_IMAGE"
