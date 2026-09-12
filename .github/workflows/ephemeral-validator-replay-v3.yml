@@ -1,0 +1,346 @@
+name: Ephemeral trusted validator replay
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  replay:
+    name: rootless VM baseline-candidate replay
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_TERM_COLOR: never
+      NO_COLOR: "1"
+      SOURCE_SHA: 18e47025d89b92de4d03aaa6cbe2179447e8709a
+      PATCH_B64: LS0tIGEvcnVzdC9jcmF0ZXMvcnVudGltZS9zcmMvZmlsZV9vcHMucnMKKysrIGIvcnVzdC9jcmF0ZXMvcnVudGltZS9zcmMvZmlsZV9vcHMucnMKQEAgLTUyMSwxMiArNTIxLDE5IEBACiAgICAgfQogCiAgICAgbGV0IGNvbnRlbnQgPSBmczo6cmVhZF90b19zdHJpbmcoJmFic29sdXRlX3BhdGgpPzsKLSAgICBsZXQgbGluZXM6IFZlYzwmc3RyPiA9IGNvbnRlbnQubGluZXMoKS5jb2xsZWN0KCk7CisgICAgLy8gS2VlcCBlYWNoIGxpbmUncyBvcmlnaW5hbCB0ZXJtaW5hdG9yIGluIHRoZSBzbGljZSBzbyBsaW5lIHdpbmRvd3MgZG8gbm90CisgICAgLy8gbm9ybWFsaXplIENSTEYgKG9yIGRpc2NhcmQgYSBmaW5hbCBuZXdsaW5lKS4gQW4gZW1wdHkgZmlsZSBoYXMgbm8gbGluZXM7CisgICAgLy8gb3RoZXJ3aXNlIGV2ZXJ5IHNlZ21lbnQgZW5kaW5nIGluIGBcbmAgaXMgYSBsaW5lLCBpbmNsdWRpbmcgdGhlIGZpbmFsIG9uZS4KKyAgICBsZXQgbGluZXM6IFZlYzwmc3RyPiA9IGlmIGNvbnRlbnQuaXNfZW1wdHkoKSB7CisgICAgICAgIFZlYzo6bmV3KCkKKyAgICB9IGVsc2UgeworICAgICAgICBjb250ZW50LnNwbGl0X2luY2x1c2l2ZSgnXG4nKS5jb2xsZWN0KCkKKyAgICB9OwogICAgIGxldCBzdGFydF9pbmRleCA9IG9mZnNldC51bndyYXBfb3IoMCkubWluKGxpbmVzLmxlbigpKTsKICAgICBsZXQgZW5kX2luZGV4ID0gbGltaXQubWFwX29yKGxpbmVzLmxlbigpLCB8bGltaXR8IHsKICAgICAgICAgc3RhcnRfaW5kZXguc2F0dXJhdGluZ19hZGQobGltaXQpLm1pbihsaW5lcy5sZW4oKSkKICAgICB9KTsKLSAgICBsZXQgc2VsZWN0ZWQgPSBsaW5lc1tzdGFydF9pbmRleC4uZW5kX2luZGV4XS5qb2luKCJcbiIpOworICAgIGxldCBzZWxlY3RlZCA9IGxpbmVzW3N0YXJ0X2luZGV4Li5lbmRfaW5kZXhdLmNvbmNhdCgpOwogCiAgICAgT2soUmVhZEZpbGVPdXRwdXQgewogICAgICAgICBraW5kOiBTdHJpbmc6OmZyb20oInRleHQiKSwKQEAgLTExMzgsNyArMTE0NSw0OSBAQAogCiAgICAgICAgIGxldCByZWFkX291dHB1dCA9IHJlYWRfZmlsZShwYXRoLnRvX3N0cmluZ19sb3NzeSgpLmFzX3JlZigpLCBTb21lKDEpLCBTb21lKDEpKQogICAgICAgICAgICAgLmV4cGVjdCgicmVhZCBzaG91bGQgc3VjY2VlZCIpOwotICAgICAgICBhc3NlcnRfZXEhKHJlYWRfb3V0cHV0LmZpbGUuY29udGVudCwgInR3byIpOworICAgICAgICBhc3NlcnRfZXEhKHJlYWRfb3V0cHV0LmZpbGUuY29udGVudCwgInR3b1xuIik7CisgICAgfQorCisgICAgI1t0ZXN0XQorICAgIGZuIHByZXNlcnZlc19saW5lX2VuZGluZ3NfYW5kX3RyYWlsaW5nX25ld2xpbmVfaW5fd2luZG93cygpIHsKKyAgICAgICAgbGV0IHBhdGggPSB0ZW1wX3BhdGgoInJlYWQtbGluZS1lbmRpbmdzLnR4dCIpOworICAgICAgICBmczo6d3JpdGUoJnBhdGgsIGIiZmlyc3Rcclxuc2Vjb25kXHJcbnRoaXJkXHJcbiIpLmV4cGVjdCgiZmlsZSBzaG91bGQgYmUgd3JpdHRlbiIpOworCisgICAgICAgIGxldCBvdXRwdXQgPSByZWFkX2ZpbGUocGF0aC50b19zdHJpbmdfbG9zc3koKS5hc19yZWYoKSwgU29tZSgxKSwgU29tZSgyKSkKKyAgICAgICAgICAgIC5leHBlY3QoImJvdW5kZWQgcmVhZCBzaG91bGQgc3VjY2VlZCIpOworICAgICAgICBhc3NlcnRfZXEhKG91dHB1dC5maWxlLmNvbnRlbnQsICJzZWNvbmRcclxudGhpcmRcclxuIik7CisgICAgICAgIGFzc2VydF9lcSEob3V0cHV0LmZpbGUubnVtX2xpbmVzLCAyKTsKKyAgICAgICAgYXNzZXJ0X2VxIShvdXRwdXQuZmlsZS5zdGFydF9saW5lLCAyKTsKKyAgICAgICAgYXNzZXJ0X2VxIShvdXRwdXQuZmlsZS50b3RhbF9saW5lcywgMyk7CisgICAgICAgIGxldCBfID0gZnM6OnJlbW92ZV9maWxlKHBhdGgpOworICAgIH0KKworICAgICNbdGVzdF0KKyAgICBmbiByZXBvcnRzX2xpbmVfbWV0YWRhdGFfZm9yX3NpbmdsZV9saW5lX2ZpbGUoKSB7CisgICAgICAgIGxldCBwYXRoID0gdGVtcF9wYXRoKCJyZWFkLXNpbmdsZS1saW5lLnR4dCIpOworICAgICAgICBmczo6d3JpdGUoJnBhdGgsIGIib25seSBsaW5lIikuZXhwZWN0KCJmaWxlIHNob3VsZCBiZSB3cml0dGVuIik7CisKKyAgICAgICAgbGV0IG91dHB1dCA9CisgICAgICAgICAgICByZWFkX2ZpbGUocGF0aC50b19zdHJpbmdfbG9zc3koKS5hc19yZWYoKSwgTm9uZSwgTm9uZSkuZXhwZWN0KCJyZWFkIHNob3VsZCBzdWNjZWVkIik7CisgICAgICAgIGFzc2VydF9lcSEob3V0cHV0LmZpbGUuY29udGVudCwgIm9ubHkgbGluZSIpOworICAgICAgICBhc3NlcnRfZXEhKG91dHB1dC5maWxlLm51bV9saW5lcywgMSk7CisgICAgICAgIGFzc2VydF9lcSEob3V0cHV0LmZpbGUuc3RhcnRfbGluZSwgMSk7CisgICAgICAgIGFzc2VydF9lcSEob3V0cHV0LmZpbGUudG90YWxfbGluZXMsIDEpOworICAgICAgICBsZXQgXyA9IGZzOjpyZW1vdmVfZmlsZShwYXRoKTsKKyAgICB9CisKKyAgICAjW3Rlc3RdCisgICAgZm4gcmVwb3J0c196ZXJvX2xpbmVzX2Zvcl9lbXB0eV9maWxlKCkgeworICAgICAgICBsZXQgcGF0aCA9IHRlbXBfcGF0aCgicmVhZC1lbXB0eS50eHQiKTsKKyAgICAgICAgZnM6OndyaXRlKCZwYXRoLCBiIiIpLmV4cGVjdCgiZmlsZSBzaG91bGQgYmUgd3JpdHRlbiIpOworCisgICAgICAgIGxldCBvdXRwdXQgPQorICAgICAgICAgICAgcmVhZF9maWxlKHBhdGgudG9fc3RyaW5nX2xvc3N5KCkuYXNfcmVmKCksIE5vbmUsIE5vbmUpLmV4cGVjdCgicmVhZCBzaG91bGQgc3VjY2VlZCIpOworICAgICAgICBhc3NlcnRfZXEhKG91dHB1dC5maWxlLmNvbnRlbnQsICIiKTsKKyAgICAgICAgYXNzZXJ0X2VxIShvdXRwdXQuZmlsZS5udW1fbGluZXMsIDApOworICAgICAgICBhc3NlcnRfZXEhKG91dHB1dC5maWxlLnN0YXJ0X2xpbmUsIDEpOworICAgICAgICBhc3NlcnRfZXEhKG91dHB1dC5maWxlLnRvdGFsX2xpbmVzLCAwKTsKKyAgICAgICAgbGV0IF8gPSBmczo6cmVtb3ZlX2ZpbGUocGF0aCk7CiAgICAgfQogCiAgICAgI1t0ZXN0XQo=
+      WORKER_IMAGE: localhost/claw-bastion-runtime:source-current-20260909-liveness
+      VALIDATOR_IMAGE: localhost/claw-bastion-validator-rust:source-current-20260909-liveness
+    steps:
+      - name: Checkout replay harness
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install rootless validation prerequisites
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends podman crun uidmap slirp4netns fuse-overlayfs git jq patch
+          user="$(id -un)"
+          if ! sudo grep -q "^${user}:" /etc/subuid; then
+            printf '%s\n' "${user}:100000:65536" | sudo tee -a /etc/subuid
+          fi
+          if ! sudo grep -q "^${user}:" /etc/subgid; then
+            printf '%s\n' "${user}:100000:65536" | sudo tee -a /etc/subgid
+          fi
+          runtime_dir="/run/user/$(id -u)"
+          sudo install -d -m 700 -o "${user}" -g "${user}" "${runtime_dir}"
+          echo "XDG_RUNTIME_DIR=${runtime_dir}" >> "$GITHUB_ENV"
+          podman --version
+          podman info --format '{{.Host.Security.Rootless}}'
+          test "$(podman info --format '{{.Host.Security.Rootless}}')" = true
+          unshare -Ur true
+          command -v newuidmap
+          command -v newgidmap
+          command -v crun
+          podman pull docker.io/library/alpine:3.20
+          podman run --rm --network=none alpine:3.20 sh -c 'test "$(id -u)" != 0; test ! -e /run/host; touch /tmp/rootless-smoke'
+          podman rm -af >/dev/null 2>&1 || true
+
+      - name: Prepare exact baseline and candidate
+        run: |
+          set -euxo pipefail
+          root="$RUNNER_TEMP/exact-replay"
+          baseline="$root/baseline"
+          candidate="$root/candidate"
+          mkdir -p "$baseline" "$candidate"
+          git archive "$SOURCE_SHA" | tar -x -C "$baseline"
+          cp -a "$baseline/." "$candidate/"
+          printf '%s' "$PATCH_B64" | base64 --decode > "$root/historical.patch"
+          test "$(sha256sum "$root/historical.patch" | awk '{print $1}')" = c5edd42269504844b61ff938f828133a8b76d5f4203fa13cc1a3cddf9503af0f
+          git -C "$candidate" apply --check "$root/historical.patch"
+          git -C "$candidate" apply "$root/historical.patch"
+          test "$(sha256sum "$candidate/rust/crates/runtime/src/file_ops.rs" | awk '{print $1}')" = 5cff0e8f813225fbef6c7d128ba95593e065b4fb73265e8e159b8d567643fa1f
+          for dir in "$baseline" "$candidate"; do
+            git -C "$dir" init -q
+            git -C "$dir" config user.name 'Claw replay'
+            git -C "$dir" config user.email replay@claw.invalid
+            git -C "$dir" add --all
+            git -C "$dir" commit --quiet --allow-empty -m 'replay snapshot'
+          done
+          {
+            printf 'source_sha=%s\n' "$SOURCE_SHA"
+            printf 'patch_sha=%s\n' "$(sha256sum "$root/historical.patch" | awk '{print $1}')"
+            printf 'baseline_commit=%s\n' "$(git -C "$baseline" rev-parse HEAD)"
+            printf 'candidate_commit=%s\n' "$(git -C "$candidate" rev-parse HEAD)"
+          } | tee "$root/replay-inputs.txt"
+          echo "REPLAY_ROOT=$root" >> "$GITHUB_ENV"
+
+      - name: Build pinned production worker and validator images
+        run: |
+          set -euxo pipefail
+          podman build -f "$REPLAY_ROOT/baseline/Containerfile.worker" -t "$WORKER_IMAGE" "$REPLAY_ROOT/baseline"
+          podman build -f "$REPLAY_ROOT/baseline/Containerfile.validator" -t "$VALIDATOR_IMAGE" "$REPLAY_ROOT/baseline"
+          podman image inspect --format '{{.Id}}' "$WORKER_IMAGE"
+          podman image inspect --format '{{.Id}}' "$VALIDATOR_IMAGE"
+
+      - name: Run repository secure-isolation tests on the VM worker
+        run: |
+          set -euxo pipefail
+          cd "$REPLAY_ROOT/baseline/rust"
+          HOME="$HOME" \
+          CLAW_WORKER_IMAGE="$WORKER_IMAGE" \
+          CLAW_VALIDATOR_IMAGE="$VALIDATOR_IMAGE" \
+          cargo test -p rusty-claude-cli --test mock_parity_harness -- --nocapture
+
+      - name: Fetch dependencies before offline validation
+        run: |
+          set -euxo pipefail
+          cd "$REPLAY_ROOT/baseline/rust"
+          cargo fetch --locked
+
+      - name: Build VM direct validation comparator
+        run: |
+          set -euxo pipefail
+          driver="$RUNNER_TEMP/replay-driver"
+          mkdir -p "$driver/src"
+          cat > "$driver/Cargo.toml" <<'TOML'
+[package]
+name = "claw-vm-replay-driver"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+runtime = { path = "__RUNTIME_PATH__" }
+serde_json = "1"
+TOML
+          sed -i "s#__RUNTIME_PATH__#$GITHUB_WORKSPACE/rust/crates/runtime#" "$driver/Cargo.toml"
+          cat > "$driver/src/main.rs" <<'RS'
+use runtime::snapshot::{create_disposable_snapshot, scan_candidate, CandidateChangeSetId, UntrustedCandidate};
+use runtime::validator::{
+    compare_validation_results, detect_validation_plan, ValidatedCandidateInput,
+    ValidationCheck, ValidationCheckComparison, ValidationCheckDisposition, ValidationCheckResult,
+    ValidationDisposition, ValidationPlan, ValidationResult, ValidationStatus, ValidatorBackend,
+};
+use serde_json::{json, Value};
+use std::env;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
+
+#[derive(Debug, Clone)]
+struct VmValidator {
+    worker_image: String,
+    validator_image: String,
+}
+
+impl ValidatorBackend for VmValidator {
+    fn backend_id(&self) -> &'static str {
+        "vm-direct-validator-v1"
+    }
+
+    fn validate(
+        &self,
+        candidate: &ValidatedCandidateInput,
+        plan: &ValidationPlan,
+    ) -> io::Result<ValidationResult> {
+        let mut checks = Vec::with_capacity(plan.checks.len());
+        let target = candidate.root.join(".claw-validation-target");
+        for check in &plan.checks {
+            checks.push(run_check(&candidate.root, &target, check, self)?);
+        }
+        Ok(ValidationResult {
+            candidate_identity: candidate.candidate_identity,
+            validation_identity: plan.identity(&self.identity()),
+            checks,
+            duration: Duration::ZERO,
+            comparison: None,
+        })
+    }
+}
+
+fn run_check(
+    root: &Path,
+    target: &Path,
+    check: &ValidationCheck,
+    validator: &VmValidator,
+) -> io::Result<ValidationCheckResult> {
+    let output = Command::new("timeout")
+        .args(["900", "sh", "-c", &check.command])
+        .current_dir(root)
+        .env("CARGO_TARGET_DIR", target)
+        .env("CARGO_NET_OFFLINE", "true")
+        .env("CARGO_TERM_COLOR", "never")
+        .env("NO_COLOR", "1")
+        .env("CLAW_WORKER_IMAGE", &validator.worker_image)
+        .env("CLAW_VALIDATOR_IMAGE", &validator.validator_image)
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("OPENAI_BASE_URL")
+        .env_remove("ANTHROPIC_BASE_URL")
+        .output()?;
+    let exit_code = output.status.code();
+    let status = if output.status.success() {
+        ValidationStatus::Pass
+    } else if exit_code == Some(124) {
+        ValidationStatus::Timeout
+    } else if exit_code == Some(127) || exit_code == Some(125) {
+        ValidationStatus::Blocked
+    } else {
+        ValidationStatus::Fail
+    };
+    let (stdout, stdout_truncated) = bounded(&output.stdout);
+    let (stderr, stderr_truncated) = bounded(&output.stderr);
+    Ok(ValidationCheckResult {
+        name: check.name.clone(),
+        command: check.command.clone(),
+        required: check.required,
+        status,
+        exit_code,
+        stdout,
+        stderr,
+        truncated: stdout_truncated || stderr_truncated,
+    })
+}
+
+fn bounded(bytes: &[u8]) -> (String, bool) {
+    const LIMIT: usize = 128 * 1024;
+    if bytes.len() <= LIMIT {
+        return (String::from_utf8_lossy(bytes).into_owned(), false);
+    }
+    let half = LIMIT / 2;
+    let mut output = String::from_utf8_lossy(&bytes[..half]).into_owned();
+    output.push_str("\n[VM replay output truncated; tail retained]\n");
+    output.push_str(&String::from_utf8_lossy(&bytes[bytes.len() - half..]));
+    (output, true)
+}
+
+fn status(status: ValidationStatus) -> &'static str {
+    match status {
+        ValidationStatus::Pass => "pass",
+        ValidationStatus::Fail => "fail",
+        ValidationStatus::Blocked => "blocked",
+        ValidationStatus::Timeout => "timeout",
+        ValidationStatus::Error => "error",
+        ValidationStatus::Skipped => "skipped",
+    }
+}
+
+fn check_json(check: &ValidationCheckResult) -> Value {
+    json!({
+        "name": check.name,
+        "command": check.command,
+        "status": status(check.status),
+        "exit_code": check.exit_code,
+        "stdout": check.stdout,
+        "stderr": check.stderr,
+        "truncated": check.truncated,
+    })
+}
+
+fn comparison_json(check: &ValidationCheckComparison) -> Value {
+    json!({
+        "name": check.name,
+        "baseline_status": status(check.baseline_status),
+        "candidate_status": status(check.candidate_status),
+        "baseline_fingerprints": check.baseline_fingerprints,
+        "candidate_fingerprints": check.candidate_fingerprints,
+        "unchanged_failures": check.unchanged_failures,
+        "new_failures": check.new_failures,
+        "resolved_failures": check.resolved_failures,
+        "disposition": check.disposition.label(),
+    })
+}
+
+fn disposition(disposition: ValidationDisposition) -> &'static str {
+    disposition.label()
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<_> = env::args_os().collect();
+    if args.len() != 4 {
+        return Err("usage: driver BASELINE CANDIDATE REPORT".into());
+    }
+    let baseline = PathBuf::from(&args[1]);
+    let candidate = PathBuf::from(&args[2]);
+    let report_path = PathBuf::from(&args[3]);
+    let worker_image = env::var("WORKER_IMAGE")?;
+    let validator_image = env::var("VALIDATOR_IMAGE")?;
+
+    let identity_task = create_disposable_snapshot(&baseline)?;
+    let baseline_identity = identity_task.baseline.identity();
+    let candidate_changes = scan_candidate(
+        &identity_task.baseline,
+        &UntrustedCandidate { root: candidate.clone() },
+    )?;
+    let candidate_identity = candidate_changes.id;
+    identity_task.discard()?;
+
+    let plan = detect_validation_plan(&candidate);
+    let validator = VmValidator { worker_image, validator_image };
+    let baseline_result = validator.validate(
+        &ValidatedCandidateInput { candidate_identity: baseline_identity, root: baseline.clone() },
+        &plan,
+    )?;
+    let mut candidate_result = validator.validate(
+        &ValidatedCandidateInput { candidate_identity, root: candidate.clone() },
+        &plan,
+    )?;
+    let comparison = compare_validation_results(&baseline_result, &candidate_result, baseline_identity);
+    candidate_result.comparison = Some(comparison.clone());
+
+    let report = json!({
+        "terminal": {
+            "status": disposition(comparison.disposition),
+            "source_baseline": env::var("SOURCE_SHA").unwrap_or_default(),
+            "baseline_identity": baseline_identity.to_string(),
+            "candidate_identity": candidate_identity.to_string(),
+            "validator_backend": validator.identity(),
+        },
+        "plan": {
+            "checks": plan.checks.iter().map(|check| json!({"name": check.name, "command": check.command})).collect::<Vec<_>>(),
+        },
+        "baseline": {
+            "checks": baseline_result.checks.iter().map(check_json).collect::<Vec<_>>(),
+        },
+        "candidate": {
+            "checks": candidate_result.checks.iter().map(check_json).collect::<Vec<_>>(),
+        },
+        "comparison": {
+            "disposition": disposition(comparison.disposition),
+            "checks": comparison.checks.iter().map(comparison_json).collect::<Vec<_>>(),
+        },
+    });
+    fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+RS
+          cargo build --manifest-path "$driver/Cargo.toml" --release --offline
+          echo "REPLAY_DRIVER=$driver/target/release/claw-vm-replay-driver" >> "$GITHUB_ENV"
+
+      - name: Run exact baseline and candidate trusted validation
+        run: |
+          set -euxo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/artifacts/ephemeral-replay"
+          export SOURCE_SHA PATCH_B64 WORKER_IMAGE VALIDATOR_IMAGE
+          CARGO_NET_OFFLINE=true "$REPLAY_DRIVER" "$REPLAY_ROOT/baseline" "$REPLAY_ROOT/candidate" "$GITHUB_WORKSPACE/artifacts/ephemeral-replay/validation-report.json" | tee "$GITHUB_WORKSPACE/artifacts/ephemeral-replay/validation-report.txt"
+          cp "$REPLAY_ROOT/replay-inputs.txt" "$GITHUB_WORKSPACE/artifacts/ephemeral-replay/"
+          printf 'podman_version=%s\n' "$(podman --version)" > "$GITHUB_WORKSPACE/artifacts/ephemeral-replay/worker-preflight.txt"
+          podman info >> "$GITHUB_WORKSPACE/artifacts/ephemeral-replay/worker-preflight.txt"
+          podman ps -a >> "$GITHUB_WORKSPACE/artifacts/ephemeral-replay/worker-preflight.txt"
+
+      - name: Upload replay evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: claw-ephemeral-validator-replay-${{ github.run_id }}
+          path: artifacts/ephemeral-replay
+          if-no-files-found: warn
