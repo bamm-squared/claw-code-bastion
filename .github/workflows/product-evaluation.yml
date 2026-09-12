@@ -12,15 +12,29 @@ concurrency:
 
 jobs:
   product-evaluation:
-    name: frozen Bastion Luna ticket batch
+    name: frozen Bastion Luna ticket ${{ matrix.task }}
     runs-on: ubuntu-24.04
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        task:
+          - config-required-resource-fields
+          - config-merge-precedence-regression
+          - stale-range-edit-regression
+          - validation-comparison-regression
+          - terminal-result-projection
+          - validator-provenance-regression
+          - read-only-config-validation
+          - repository-search-determinism
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       CLAW_REQUIRE_DISPOSABLE_VALIDATOR: "1"
       CLAW_VALIDATOR_WORKER_CLASS: disposable-vm
       CLAW_ACCEPTANCE_WORKER_IMAGE: claw-bastion-runtime:product-evaluation
       CLAW_ACCEPTANCE_VALIDATOR_IMAGE: claw-bastion-validator-rust:product-evaluation
+      CLAW_PRODUCT_TASK_ID: ${{ matrix.task }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -162,6 +176,8 @@ jobs:
                   continue
 
           for task_id, category, prompt in tasks:
+              if task_id != os.environ["CLAW_PRODUCT_TASK_ID"]:
+                  continue
               task_file = out / f"{task_id}.json"
               result_file = out / f"{task_id}.jsonl"
               telemetry_file = out / f"{task_id}.telemetry.json"
@@ -201,6 +217,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: luna-product-evaluation-${{ github.run_id }}
+          name: luna-product-evaluation-${{ github.run_id }}-${{ matrix.task }}
           path: ${{ runner.temp }}/product-evaluation
           if-no-files-found: warn
