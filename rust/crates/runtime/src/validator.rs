@@ -421,16 +421,35 @@ fn failure_fingerprints(check: &ValidationCheckResult) -> Vec<String> {
     }
     let mut fingerprints = Vec::new();
     for line in check.stdout.lines().chain(check.stderr.lines()) {
-        let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        let normalized = strip_ansi(line)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let lower = normalized.to_ascii_lowercase();
+        let normalized = if lower.starts_with("thread '") && lower.contains(" panicked at") {
+            format!(
+                "{} panicked",
+                normalized
+                    .split(" panicked at")
+                    .next()
+                    .unwrap_or(&normalized)
+            )
+        } else if lower.starts_with("test result: failed") {
+            String::from("test result: FAILED")
+        } else {
+            normalized
+        };
         let lower = normalized.to_ascii_lowercase();
         let high_signal = lower.starts_with("error")
             || lower.starts_with("warning")
-            || lower.starts_with("test ")
-            || lower.contains(" failed")
+            || (lower.starts_with("test ")
+                && lower.contains(" failed")
+                && !lower.starts_with("test result: ok"))
+            || lower.starts_with("fatal")
             || lower.contains("panicked")
             || lower.contains("assertion")
             || lower.contains("could not compile")
-            || lower.contains("test result:")
+            || lower.starts_with("test result: failed")
             || lower.contains("diff in");
         if high_signal && !normalized.is_empty() && !fingerprints.contains(&normalized) {
             fingerprints.push(normalized);
@@ -446,6 +465,23 @@ fn failure_fingerprints(check: &ValidationCheckResult) -> Vec<String> {
         ));
     }
     fingerprints
+}
+
+fn strip_ansi(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut escape = false;
+    for character in input.chars() {
+        if escape {
+            if character == 'm' {
+                escape = false;
+            }
+        } else if character == '\u{1b}' {
+            escape = true;
+        } else {
+            output.push(character);
+        }
+    }
+    output
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

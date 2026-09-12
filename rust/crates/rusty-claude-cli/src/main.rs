@@ -19827,7 +19827,9 @@ mod multimodal_command_integration_tests {
 
     #[test]
     fn assistant_attach_text_does_not_enter_user_command_dispatch() {
-        let _cwd_guard = super::tests::cwd_lock().lock().unwrap();
+        let _cwd_guard = super::tests::cwd_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _dir = HarnessDir::new();
         let assistant_text = ConversationMessage {
             role: MessageRole::Assistant,
