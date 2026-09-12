@@ -4629,6 +4629,7 @@ struct LiveCli {
     evaluation: Option<requirement_evaluator::EvaluationReport>,
     last_validation_status: Option<String>,
     last_validation_evidence: Option<String>,
+    last_validation_comparison: Option<Value>,
     model_pool: model_router::ModelPool,
     calibration: model_router::CalibrationStore,
     routing_policy: model_router::RoutingPolicy,
@@ -5346,6 +5347,14 @@ fn render_candidate_file_selection(
 }
 
 fn validation_status(validation: &runtime::validator::ValidationResult) -> &'static str {
+    if let Some(comparison) = &validation.comparison {
+        return match comparison.disposition {
+            runtime::validator::ValidationDisposition::Pass => "PASS",
+            runtime::validator::ValidationDisposition::BaselineFailure => "PASS_BASELINE_FAILURE",
+            runtime::validator::ValidationDisposition::CandidateFailure => "FAIL",
+            runtime::validator::ValidationDisposition::InfrastructureFailure => "BLOCKED",
+        };
+    }
     if validation.checks.iter().any(|check| {
         matches!(
             check.status,
@@ -5391,7 +5400,44 @@ fn render_validation_evidence(validation: &runtime::validator::ValidationResult)
             output.push('\n');
         }
     }
+    if let Some(comparison) = &validation.comparison {
+        let _ = writeln!(
+            output,
+            "baseline_identity={} disposition={}",
+            comparison.baseline_identity,
+            comparison.disposition.label()
+        );
+        for check in &comparison.checks {
+            let _ = writeln!(
+                output,
+                "comparison={} unchanged={} new={} resolved={}",
+                check.name,
+                check.unchanged_failures.len(),
+                check.new_failures.len(),
+                check.resolved_failures.len()
+            );
+        }
+    }
     compact_validation_diagnostic(&output, 12_000)
+}
+
+fn validation_comparison_json(comparison: &runtime::validator::ValidationComparison) -> Value {
+    json!({
+        "baseline_identity": comparison.baseline_identity.to_string(),
+        "candidate_identity": comparison.candidate_identity.to_string(),
+        "disposition": comparison.disposition.label(),
+        "checks": comparison.checks.iter().map(|check| json!({
+            "name": check.name,
+            "baseline_status": format_validation_status(check.baseline_status),
+            "candidate_status": format_validation_status(check.candidate_status),
+            "disposition": check.disposition.label(),
+            "baseline_fingerprints": check.baseline_fingerprints,
+            "candidate_fingerprints": check.candidate_fingerprints,
+            "unchanged_failures": check.unchanged_failures,
+            "new_failures": check.new_failures,
+            "resolved_failures": check.resolved_failures,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -6016,6 +6062,7 @@ impl LiveCli {
             evaluation: None,
             last_validation_status: None,
             last_validation_evidence: None,
+            last_validation_comparison: None,
             model_pool,
             calibration,
             routing_policy,
@@ -7678,6 +7725,9 @@ impl LiveCli {
                         result[key] = value.clone();
                     }
                 }
+                if let Some(comparison) = &self.last_validation_comparison {
+                    result["validation_comparison"] = comparison.clone();
+                }
                 result["task_state"] = json!({
                     "current_work_unit": self.task_plan.current_work_unit_id,
                     "work_units_total": self.task_plan.work_units.len(),
@@ -7774,6 +7824,10 @@ impl LiveCli {
         let validation_diagnostics = render_validation_evidence(&validation);
         self.last_validation_status = Some(validation_status(&validation).to_string());
         self.last_validation_evidence = Some(validation_diagnostics.clone());
+        self.last_validation_comparison = validation
+            .comparison
+            .as_ref()
+            .map(validation_comparison_json);
         benchmark_telemetry::validation_details(
             &changes.id.to_string(),
             &validation.validation_identity.to_string(),
@@ -7791,6 +7845,9 @@ impl LiveCli {
                 })
                 .collect(),
         );
+        if let Some(comparison) = validation.comparison.as_ref() {
+            benchmark_telemetry::validation_comparison(validation_comparison_json(comparison));
+        }
         benchmark_telemetry::validation(validation_status(&validation));
         benchmark_telemetry::lifecycle_event("validation_completed");
         if validation.has_infrastructure_failure() {
@@ -15257,6 +15314,36 @@ mod tests {
         assert!(value.get("validation").is_none());
     }
 
+    #[test]
+    fn validation_comparison_projection_retains_baseline_and_new_failures() {
+        let comparison = runtime::validator::ValidationComparison {
+            baseline_identity: runtime::CandidateChangeSetId::new([1; 32]),
+            candidate_identity: runtime::CandidateChangeSetId::new([2; 32]),
+            disposition: runtime::validator::ValidationDisposition::CandidateFailure,
+            checks: vec![runtime::validator::ValidationCheckComparison {
+                name: "cargo test".to_string(),
+                baseline_status: runtime::ValidationStatus::Fail,
+                candidate_status: runtime::ValidationStatus::Fail,
+                baseline_fingerprints: vec!["test existing ... FAILED".to_string()],
+                candidate_fingerprints: vec![
+                    "test existing ... FAILED".to_string(),
+                    "test new ... FAILED".to_string(),
+                ],
+                unchanged_failures: vec!["test existing ... FAILED".to_string()],
+                new_failures: vec!["test new ... FAILED".to_string()],
+                resolved_failures: Vec::new(),
+                disposition: runtime::validator::ValidationCheckDisposition::CandidateFailure,
+            }],
+        };
+        let value = super::validation_comparison_json(&comparison);
+        assert_eq!(value["disposition"], "candidate_failure");
+        assert_eq!(
+            value["checks"][0]["unchanged_failures"][0],
+            "test existing ... FAILED"
+        );
+        assert_eq!(value["checks"][0]["new_failures"][0], "test new ... FAILED");
+    }
+
     fn registry_with_plugin_tool() -> GlobalToolRegistry {
         GlobalToolRegistry::with_plugin_tools(vec![PluginTool::new(
             "plugin-demo@external",
@@ -20132,14 +20219,13 @@ mod frozen_plan_identity_tests {
 #[cfg(test)]
 mod repository_cwd_identity_tests {
     use super::{build_repository_context_at, planning_artifact_hash, repository_root_for_cwd};
-    use std::env;
     use std::path::Path;
 
     const REQUEST: &str = "Improve /doctor so it validates effective merged configuration and emits actionable, secret-safe text and JSON diagnostics while preserving existing checks and avoiding workspace mutation.";
 
     #[test]
     fn repository_root_is_stable_from_nested_workspace() {
-        let invocation = env::current_dir().expect("test should have a current directory");
+        let invocation = Path::new(env!("CARGO_MANIFEST_DIR"));
         let repository = repository_root_for_cwd(&invocation).expect("test runs in a git repo");
         let nested = repository.join("rust");
         assert!(
@@ -20155,7 +20241,7 @@ mod repository_cwd_identity_tests {
 
     #[test]
     fn repository_context_and_frozen_hash_are_cwd_independent() {
-        let invocation = env::current_dir().expect("test should have a current directory");
+        let invocation = Path::new(env!("CARGO_MANIFEST_DIR"));
         let repository = repository_root_for_cwd(&invocation).expect("test runs in a git repo");
         let nested = repository.join("rust");
         let root_selection = build_repository_context_at(REQUEST, &repository, None)

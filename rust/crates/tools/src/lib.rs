@@ -630,6 +630,9 @@ impl ExecutionBackend for IsolatedExecutionBackend {
         let validator_image = validator_image_for_plan(&plan).map_err(|error| {
             format!("candidate trusted validation infrastructure failure: {error}")
         })?;
+        let baseline_snapshot =
+            runtime::ValidationSnapshot::create_baseline(&self.workspace.baseline)
+                .map_err(|error| format!("unable to snapshot validation baseline: {error}"))?;
         let snapshot = runtime::ValidationSnapshot::create_verified(
             &self.workspace.candidate,
             &self.workspace.baseline,
@@ -640,9 +643,21 @@ impl ExecutionBackend for IsolatedExecutionBackend {
             image: validator_image,
             ..runtime::PodmanValidatorBackend::default()
         };
-        match runtime::ValidatorBackend::validate(&backend, &snapshot.input(), &plan) {
-            Ok(result) => Ok(result),
-            Err(error) => Ok(runtime::validator::ValidationResult::blocked(
+        let baseline =
+            runtime::ValidatorBackend::validate(&backend, &baseline_snapshot.input(), &plan);
+        let candidate = runtime::ValidatorBackend::validate(&backend, &snapshot.input(), &plan);
+        drop(baseline_snapshot);
+        drop(snapshot);
+        match (baseline, candidate) {
+            (Ok(baseline), Ok(candidate)) => Ok(runtime::validator::ValidationResult {
+                comparison: Some(runtime::validator::compare_validation_results(
+                    &baseline,
+                    &candidate,
+                    self.workspace.baseline.identity(),
+                )),
+                ..candidate
+            }),
+            (Err(error), _) | (_, Err(error)) => Ok(runtime::validator::ValidationResult::blocked(
                 changes.id,
                 &plan,
                 &backend.identity(),

@@ -79,6 +79,7 @@ pub struct Snapshot {
     pub validation_candidate_identity: Option<String>,
     pub validation_identity: Option<String>,
     pub validation_checks: Vec<ValidationDiagnostic>,
+    pub validation_comparison: Option<Value>,
     pub validation_history: Vec<ValidationAttempt>,
     pub rework_cycles: u64,
     pub validation_repair_cycles: u64,
@@ -1222,6 +1223,13 @@ pub fn validation_details(
             validation_identity: validation_identity.to_string(),
             checks,
         });
+    });
+    persist_snapshot();
+}
+
+pub fn validation_comparison(comparison: Value) {
+    with_state(|s| {
+        s.snapshot.validation_comparison = Some(comparison);
     });
     persist_snapshot();
 }

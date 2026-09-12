@@ -101,19 +101,85 @@ pub struct ValidationCheckResult {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationDisposition {
+    Pass,
+    BaselineFailure,
+    CandidateFailure,
+    InfrastructureFailure,
+}
+
+impl ValidationDisposition {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::BaselineFailure => "baseline_failure",
+            Self::CandidateFailure => "candidate_failure",
+            Self::InfrastructureFailure => "infrastructure_failure",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationCheckDisposition {
+    Pass,
+    UnchangedBaselineFailure,
+    CandidateFixedBaselineFailure,
+    CandidateFailure,
+    InfrastructureFailure,
+}
+
+impl ValidationCheckDisposition {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::UnchangedBaselineFailure => "unchanged_baseline_failure",
+            Self::CandidateFixedBaselineFailure => "candidate_fixed_baseline_failure",
+            Self::CandidateFailure => "candidate_failure",
+            Self::InfrastructureFailure => "infrastructure_failure",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationCheckComparison {
+    pub name: String,
+    pub baseline_status: ValidationStatus,
+    pub candidate_status: ValidationStatus,
+    pub baseline_fingerprints: Vec<String>,
+    pub candidate_fingerprints: Vec<String>,
+    pub unchanged_failures: Vec<String>,
+    pub new_failures: Vec<String>,
+    pub resolved_failures: Vec<String>,
+    pub disposition: ValidationCheckDisposition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationComparison {
+    pub baseline_identity: CandidateChangeSetId,
+    pub candidate_identity: CandidateChangeSetId,
+    pub checks: Vec<ValidationCheckComparison>,
+    pub disposition: ValidationDisposition,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationResult {
     pub candidate_identity: CandidateChangeSetId,
     pub validation_identity: ValidationIdentity,
     pub checks: Vec<ValidationCheckResult>,
     pub duration: Duration,
+    pub comparison: Option<ValidationComparison>,
 }
 
 impl ValidationResult {
     /// Infrastructure could not produce trustworthy candidate evidence.
     #[must_use]
     pub fn has_infrastructure_failure(&self) -> bool {
-        self.checks.is_empty()
+        self.comparison.as_ref().is_some_and(|comparison| {
+            comparison.disposition == ValidationDisposition::InfrastructureFailure
+        }) || self.checks.is_empty()
             || self.checks.iter().any(|check| {
                 matches!(
                     check.status,
@@ -164,6 +230,21 @@ impl ValidationResult {
         {
             return false;
         }
+        if self.comparison.as_ref().is_some_and(|comparison| {
+            matches!(
+                comparison.disposition,
+                ValidationDisposition::CandidateFailure
+                    | ValidationDisposition::InfrastructureFailure
+            )
+        }) {
+            return false;
+        }
+        let baseline_aware = self.comparison.as_ref().is_some_and(|comparison| {
+            matches!(
+                comparison.disposition,
+                ValidationDisposition::Pass | ValidationDisposition::BaselineFailure
+            )
+        });
         for check in &self.checks {
             let terminal_failure = matches!(
                 check.status,
@@ -173,7 +254,10 @@ impl ValidationResult {
                 check.status,
                 ValidationStatus::Blocked | ValidationStatus::Skipped
             );
-            if terminal_failure && (check.required || policy.optional_fail_blocks) {
+            if terminal_failure
+                && !baseline_aware
+                && (check.required || policy.optional_fail_blocks)
+            {
                 return false;
             }
             if incomplete
@@ -207,8 +291,161 @@ impl ValidationResult {
                 truncated: false,
             }],
             duration: Duration::ZERO,
+            comparison: None,
         }
     }
+}
+
+#[must_use]
+pub fn compare_validation_results(
+    baseline: &ValidationResult,
+    candidate: &ValidationResult,
+    baseline_identity: CandidateChangeSetId,
+) -> ValidationComparison {
+    if baseline.checks.len() != candidate.checks.len()
+        || baseline
+            .checks
+            .iter()
+            .zip(&candidate.checks)
+            .any(|(left, right)| left.name != right.name || left.command != right.command)
+    {
+        return ValidationComparison {
+            baseline_identity,
+            candidate_identity: candidate.candidate_identity,
+            checks: Vec::new(),
+            disposition: ValidationDisposition::InfrastructureFailure,
+        };
+    }
+
+    let checks = baseline
+        .checks
+        .iter()
+        .zip(&candidate.checks)
+        .map(|(baseline, candidate)| compare_check(baseline, candidate))
+        .collect::<Vec<_>>();
+    let disposition = if checks
+        .iter()
+        .any(|check| check.disposition == ValidationCheckDisposition::InfrastructureFailure)
+    {
+        ValidationDisposition::InfrastructureFailure
+    } else if checks
+        .iter()
+        .any(|check| check.disposition == ValidationCheckDisposition::CandidateFailure)
+    {
+        ValidationDisposition::CandidateFailure
+    } else if checks.iter().any(|check| {
+        matches!(
+            check.disposition,
+            ValidationCheckDisposition::UnchangedBaselineFailure
+                | ValidationCheckDisposition::CandidateFixedBaselineFailure
+        )
+    }) {
+        ValidationDisposition::BaselineFailure
+    } else {
+        ValidationDisposition::Pass
+    };
+    ValidationComparison {
+        baseline_identity,
+        candidate_identity: candidate.candidate_identity,
+        checks,
+        disposition,
+    }
+}
+
+fn compare_check(
+    baseline: &ValidationCheckResult,
+    candidate: &ValidationCheckResult,
+) -> ValidationCheckComparison {
+    let baseline_fingerprints = failure_fingerprints(baseline);
+    let candidate_fingerprints = failure_fingerprints(candidate);
+    let unchanged_failures = candidate_fingerprints
+        .iter()
+        .filter(|fingerprint| baseline_fingerprints.contains(fingerprint))
+        .cloned()
+        .collect::<Vec<_>>();
+    let new_failures = candidate_fingerprints
+        .iter()
+        .filter(|fingerprint| !baseline_fingerprints.contains(fingerprint))
+        .cloned()
+        .collect::<Vec<_>>();
+    let resolved_failures = baseline_fingerprints
+        .iter()
+        .filter(|fingerprint| !candidate_fingerprints.contains(fingerprint))
+        .cloned()
+        .collect::<Vec<_>>();
+    let baseline_infra = is_infrastructure_status(baseline.status);
+    let candidate_infra = is_infrastructure_status(candidate.status);
+    let candidate_failed = is_failure_status(candidate.status);
+    let baseline_failed = is_failure_status(baseline.status);
+    let disposition = if baseline_infra || candidate_infra {
+        ValidationCheckDisposition::InfrastructureFailure
+    } else if candidate_failed && (!baseline_failed || !new_failures.is_empty()) {
+        ValidationCheckDisposition::CandidateFailure
+    } else if !candidate_failed && baseline_failed {
+        ValidationCheckDisposition::CandidateFixedBaselineFailure
+    } else if candidate_failed && baseline_failed {
+        ValidationCheckDisposition::UnchangedBaselineFailure
+    } else {
+        ValidationCheckDisposition::Pass
+    };
+    ValidationCheckComparison {
+        name: candidate.name.clone(),
+        baseline_status: baseline.status,
+        candidate_status: candidate.status,
+        baseline_fingerprints,
+        candidate_fingerprints,
+        unchanged_failures,
+        new_failures,
+        resolved_failures,
+        disposition,
+    }
+}
+
+fn is_failure_status(status: ValidationStatus) -> bool {
+    status == ValidationStatus::Fail
+}
+
+fn is_infrastructure_status(status: ValidationStatus) -> bool {
+    matches!(
+        status,
+        ValidationStatus::Blocked
+            | ValidationStatus::Skipped
+            | ValidationStatus::Timeout
+            | ValidationStatus::Error
+    )
+}
+
+fn failure_fingerprints(check: &ValidationCheckResult) -> Vec<String> {
+    if !is_failure_status(check.status) {
+        return Vec::new();
+    }
+    let mut fingerprints = Vec::new();
+    for line in check.stdout.lines().chain(check.stderr.lines()) {
+        let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        let lower = normalized.to_ascii_lowercase();
+        let high_signal = lower.starts_with("error")
+            || lower.starts_with("warning")
+            || lower.starts_with("test ")
+            || lower.contains(" failed")
+            || lower.contains("panicked")
+            || lower.contains("assertion")
+            || lower.contains("could not compile")
+            || lower.contains("test result:")
+            || lower.contains("diff in");
+        if high_signal && !normalized.is_empty() && !fingerprints.contains(&normalized) {
+            fingerprints.push(normalized);
+        }
+        if fingerprints.len() >= 32 {
+            break;
+        }
+    }
+    if fingerprints.is_empty() {
+        fingerprints.push(format!(
+            "status={:?} exit_code={:?}",
+            check.status, check.exit_code
+        ));
+    }
+    fingerprints
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,6 +504,15 @@ impl ValidationSnapshot {
             ));
         }
         Ok(snapshot)
+    }
+
+    pub fn create_baseline(baseline: &TrustedBaseline) -> io::Result<Self> {
+        Self::create(
+            &UntrustedCandidate {
+                root: baseline.root.clone(),
+            },
+            baseline.identity(),
+        )
     }
 
     #[must_use]
@@ -393,6 +639,7 @@ impl ValidatorBackend for PodmanValidatorBackend {
             validation_identity,
             checks: results,
             duration: started.elapsed(),
+            comparison: None,
         })
     }
 }
@@ -1055,6 +1302,7 @@ mod tests {
             validation_identity: plan.identity("podman-validator-v2"),
             checks: Vec::new(),
             duration: Duration::ZERO,
+            comparison: None,
         };
 
         assert!(result.has_infrastructure_failure());
@@ -1073,6 +1321,7 @@ mod tests {
             validation_identity: plan.identity("podman-validator-v1"),
             checks: Vec::new(),
             duration: Duration::ZERO,
+            comparison: None,
         };
         assert!(result.matches(CandidateChangeSetId::zero(), &plan, "podman-validator-v1"));
         assert!(!result.matches(
@@ -1098,12 +1347,119 @@ mod tests {
                 truncated: false,
             }],
             duration: Duration::ZERO,
+            comparison: None,
         };
         assert!(!result.allows_apply(
             CandidateChangeSetId::zero(),
             ValidationPolicy::default(),
             false
         ));
+    }
+
+    fn comparison_check(status: ValidationStatus, output: &str) -> ValidationCheckResult {
+        ValidationCheckResult {
+            name: String::from("workspace tests"),
+            command: String::from("cargo test"),
+            required: true,
+            status,
+            exit_code: Some(i32::from(status != ValidationStatus::Pass)),
+            stdout: output.to_string(),
+            stderr: String::new(),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn unchanged_baseline_failure_does_not_block_apply() {
+        let baseline = ValidationResult {
+            candidate_identity: CandidateChangeSetId::zero(),
+            validation_identity: ValidationIdentity([1; 32]),
+            checks: vec![comparison_check(
+                ValidationStatus::Fail,
+                "test repository_cwd_identity_tests::root ... FAILED\ntest result: FAILED",
+            )],
+            duration: Duration::ZERO,
+            comparison: None,
+        };
+        let candidate = ValidationResult {
+            candidate_identity: CandidateChangeSetId::new([2; 32]),
+            validation_identity: ValidationIdentity([1; 32]),
+            checks: baseline.checks.clone(),
+            duration: Duration::ZERO,
+            comparison: None,
+        };
+        let comparison =
+            compare_validation_results(&baseline, &candidate, CandidateChangeSetId::new([9; 32]));
+        assert_eq!(
+            comparison.disposition,
+            ValidationDisposition::BaselineFailure
+        );
+        let candidate = ValidationResult {
+            comparison: Some(comparison),
+            ..candidate
+        };
+        assert!(candidate.allows_apply(
+            CandidateChangeSetId::new([2; 32]),
+            ValidationPolicy::default(),
+            false
+        ));
+    }
+
+    #[test]
+    fn new_failure_blocks_and_fixed_baseline_failure_is_reported() {
+        let baseline = ValidationResult {
+            candidate_identity: CandidateChangeSetId::zero(),
+            validation_identity: ValidationIdentity([1; 32]),
+            checks: vec![comparison_check(
+                ValidationStatus::Fail,
+                "test existing_failure ... FAILED",
+            )],
+            duration: Duration::ZERO,
+            comparison: None,
+        };
+        let introduced = ValidationResult {
+            candidate_identity: CandidateChangeSetId::new([2; 32]),
+            validation_identity: ValidationIdentity([1; 32]),
+            checks: vec![comparison_check(
+                ValidationStatus::Fail,
+                "test existing_failure ... FAILED\ntest new_failure ... FAILED",
+            )],
+            duration: Duration::ZERO,
+            comparison: None,
+        };
+        let comparison =
+            compare_validation_results(&baseline, &introduced, CandidateChangeSetId::new([9; 32]));
+        assert_eq!(
+            comparison.disposition,
+            ValidationDisposition::CandidateFailure
+        );
+        assert!(!ValidationResult {
+            comparison: Some(comparison),
+            ..introduced
+        }
+        .allows_apply(
+            CandidateChangeSetId::new([2; 32]),
+            ValidationPolicy::default(),
+            false
+        ));
+
+        let fixed = ValidationResult {
+            candidate_identity: CandidateChangeSetId::new([3; 32]),
+            validation_identity: ValidationIdentity([1; 32]),
+            checks: vec![comparison_check(ValidationStatus::Pass, "")],
+            duration: Duration::ZERO,
+            comparison: None,
+        };
+        let comparison =
+            compare_validation_results(&baseline, &fixed, CandidateChangeSetId::new([9; 32]));
+        assert_eq!(
+            comparison.checks[0].disposition,
+            ValidationCheckDisposition::CandidateFixedBaselineFailure
+        );
+        assert_eq!(
+            comparison.disposition,
+            ValidationDisposition::BaselineFailure
+        );
     }
 
     #[test]

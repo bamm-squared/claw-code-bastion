@@ -30,6 +30,29 @@ pub struct TrustedBaseline {
     pub manifest: BaselineManifest,
 }
 
+impl TrustedBaseline {
+    /// Stable identity for the exact trusted baseline contents.
+    #[must_use]
+    pub fn identity(&self) -> CandidateChangeSetId {
+        let mut hasher = Sha256::new();
+        for (path, entry) in &self.manifest.entries {
+            hasher.update(path.to_string_lossy().as_bytes());
+            hasher.update([0]);
+            hasher.update(format!("{:?}", entry.kind).as_bytes());
+            hasher.update(entry.size.to_le_bytes());
+            hasher.update([u8::from(entry.executable)]);
+            if let Some(hash) = entry.hash {
+                hasher.update(hash);
+            }
+            if let Some(target) = &entry.symlink_target {
+                hasher.update(target.to_string_lossy().as_bytes());
+            }
+            hasher.update([0xff]);
+        }
+        CandidateChangeSetId::new(hasher.finalize().into())
+    }
+}
+
 #[derive(Debug)]
 pub struct IsolatedWorkspace {
     pub canonical: CanonicalWorkspace,
