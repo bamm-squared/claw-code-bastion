@@ -18924,6 +18924,9 @@ UU conflicted.rs",
     #[test]
     #[allow(clippy::too_many_lines)]
     fn build_runtime_plugin_state_discovers_mcp_tools_and_surfaces_pending_servers() {
+        let _cwd_guard = cwd_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let config_home = temp_dir();
         let workspace = temp_dir();
         fs::create_dir_all(&config_home).expect("config home");
@@ -19668,6 +19671,7 @@ mod multimodal_command_integration_tests {
     use commands::SlashCommand;
     use runtime::{ConversationMessage, MessageRole};
     use std::fs;
+    use std::process::Command;
     use std::sync::Mutex;
 
     struct HarnessDir {
@@ -19691,8 +19695,39 @@ mod multimodal_command_integration_tests {
 
     impl Drop for HarnessDir {
         fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.previous);
-            let _ = fs::remove_dir_all(&self.root);
+            if std::env::set_current_dir(&self.previous).is_ok() {
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+    }
+
+    #[test]
+    fn harness_dir_restores_cwd_before_child_process_and_cleanup() {
+        let _cwd_guard = super::tests::cwd_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original = std::env::current_dir().expect("original cwd should be available");
+
+        for _ in 0..32 {
+            let root = {
+                let dir = HarnessDir::new();
+                let root = dir.root.clone();
+                let output = Command::new("/bin/pwd")
+                    .output()
+                    .expect("child should start with a valid cwd");
+                assert!(
+                    output.status.success(),
+                    "child should observe a valid cwd: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                root
+            };
+
+            assert_eq!(
+                std::env::current_dir().expect("cwd should be restored"),
+                original
+            );
+            assert!(!root.exists(), "harness directory should be cleaned up");
         }
     }
 
