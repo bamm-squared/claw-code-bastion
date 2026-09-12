@@ -1,0 +1,205 @@
+name: Luna product evaluation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: luna-product-evaluation
+  cancel-in-progress: true
+
+jobs:
+  product-evaluation:
+    name: frozen Bastion Luna ticket batch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      CLAW_REQUIRE_DISPOSABLE_VALIDATOR: "1"
+      CLAW_VALIDATOR_WORKER_CLASS: disposable-vm
+      CLAW_ACCEPTANCE_WORKER_IMAGE: claw-bastion-runtime:product-evaluation
+      CLAW_ACCEPTANCE_VALIDATOR_IMAGE: claw-bastion-validator-rust:product-evaluation
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+
+      - name: Install supported rootless validation worker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends podman crun uidmap slirp4netns fuse-overlayfs netavark git python3-pexpect
+          user_name="$(id -un)"
+          user_id="$(id -u)"
+          sudo sh -c "grep -q '^${user_name}:' /etc/subuid || printf '%s:100000:65536\\n' '${user_name}' >> /etc/subuid"
+          sudo sh -c "grep -q '^${user_name}:' /etc/subgid || printf '%s:100000:65536\\n' '${user_name}' >> /etc/subgid"
+          sudo mkdir -p "/run/user/${user_id}"
+          sudo chown "${user_id}:${user_id}" "/run/user/${user_id}"
+          printf '[engine]\ncgroup_manager = "cgroupfs"\n' > "$RUNNER_TEMP/containers.conf"
+          echo "XDG_RUNTIME_DIR=/run/user/${user_id}" >> "$GITHUB_ENV"
+          echo "CONTAINERS_CONF=$RUNNER_TEMP/containers.conf" >> "$GITHUB_ENV"
+
+      - name: Verify supported worker and build pinned images
+        env:
+          CLAW_REAL_PODMAN_IMAGE: alpine:3.20
+        run: |
+          ./scripts/security-runner-preflight.sh
+          podman pull docker.io/library/rust:bookworm
+          podman pull docker.io/library/debian:bookworm-slim
+          podman build --pull=never --build-arg CLAW_SOURCE_REVISION="$GITHUB_SHA" \
+            -f Containerfile.worker -t "$CLAW_ACCEPTANCE_WORKER_IMAGE" .
+          podman build --pull=never --build-arg CLAW_SOURCE_REVISION="$GITHUB_SHA" \
+            -f Containerfile.validator -t "$CLAW_ACCEPTANCE_VALIDATOR_IMAGE" .
+          podman image inspect --format '{{.Id}} {{index .Config.Labels "org.opencontainers.image.revision"}}' \
+            "$CLAW_ACCEPTANCE_WORKER_IMAGE" "$CLAW_ACCEPTANCE_VALIDATOR_IMAGE"
+
+      - name: Run focused security boundary gate
+        working-directory: rust
+        env:
+          CLAW_REAL_PODMAN_IMAGE: claw-bastion-runtime:product-evaluation
+          CLAW_WORKER_IMAGE: claw-bastion-runtime:product-evaluation
+          CLAW_VALIDATOR_IMAGE: claw-bastion-validator-rust:product-evaluation
+        run: |
+          set -euo pipefail
+          for test_name in \
+            real_worker_boundary_blocks_host_state_and_allows_candidate_edits \
+            real_worker_network_and_mount_policy_denies_host_state \
+            real_worker_edit_positive_control \
+            real_worker_outside_write_is_denied \
+            real_worker_external_symlink_isolation \
+            real_worker_candidate_git_metadata_is_harmless \
+            real_worker_process_limit_and_output_bounds \
+            real_validator_is_fresh_networkless_and_does_not_mutate_candidate \
+            real_validator_host_and_socket_isolation \
+            podman_full_hostile_authoritative_lifecycle \
+            real_mcp_stdio_isolated_boundary_and_cleanup \
+            real_private_mode_lifecycle_preserves_isolation_and_apply_boundary \
+            real_custom_runtime_preserves_outer_security_policy \
+            real_combined_hostile_lifecycle_keeps_canonical_authoritative
+          do
+            cargo test -p runtime --test podman_isolation -- "$test_name" --ignored --nocapture
+          done
+
+      - name: Build production binaries and Luna settings
+        run: |
+          (cd rust && cargo build --workspace)
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          settings = json.loads(Path("benchmarks/settings.local.json").read_text())
+          luna = [item for item in settings["modelResources"] if item["id"] == "gpt-5.6-luna"]
+          if len(luna) != 1:
+              raise SystemExit("expected exactly one Luna resource")
+          temp = Path(os.environ["RUNNER_TEMP"])
+          temp.joinpath("luna-settings.json").write_text(json.dumps({
+              "modelResources": luna,
+              "routing": {"allowRemote": True, "preferredProvider": "openai", "minimumMargin": 8},
+          }))
+          temp.joinpath("luna-models.json").write_text(json.dumps({
+              "schema_version": 1,
+              "models": [{
+                  "alias": "gpt-5.6-luna",
+                  "provider_profile": "openai",
+                  "model": "gpt-5.6-luna",
+                  "reasoning": "default",
+                  "authorized": True,
+                  "local": False,
+                  "actual_input_usd_per_million": 0.2,
+                  "actual_output_usd_per_million": 1.2,
+                  "cached_input_usd_per_million": 0.0,
+                  "cache_write_usd_per_million": 0.0,
+              }],
+          }))
+          PY
+
+      - name: Run real Luna ticket batch
+        env:
+          CLAW_WORKER_IMAGE: claw-bastion-runtime:product-evaluation
+          CLAW_VALIDATOR_IMAGE: claw-bastion-validator-rust:product-evaluation
+          CLAW_BENCH_PERMISSION_RESPONSE: allow
+          CLAW_PROVIDER_TRACE: "1"
+          CLAW_ORCHESTRATION_TRACE: "1"
+        run: |
+          set -u
+          mkdir -p "$RUNNER_TEMP/product-evaluation"
+          python3 - "$RUNNER_TEMP/product-evaluation" <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          out = Path(sys.argv[1])
+          root = Path.cwd()
+          tasks = [
+              ("config-required-resource-fields", "small", "Improve configuration validation so every model resource rejects a missing or blank id, model, or provider with an actionable field/path diagnostic. Preserve existing per-source validation, merge precedence, secret-safe diagnostics, and downstream text/JSON presentation. Add focused verification for each required field and for valid resources."),
+              ("config-merge-precedence-regression", "small", "Add focused coverage for effective configuration merge precedence across the supported configuration sources. Confirm a higher-precedence value wins, unrelated lower-precedence values are retained, and the merged result remains read-only. Preserve the existing public configuration behavior and diagnostic shapes."),
+              ("stale-range-edit-regression", "small", "Strengthen the bounded source-edit behavior around stale revisions. A replacement using an old revision must fail without changing the file, while a replacement using the current revision succeeds and reports the new revision. Add focused tests and preserve all path containment rules."),
+              ("validation-comparison-regression", "medium", "Add focused validation coverage for baseline-aware command comparison. An unchanged baseline failure must be reported without becoming a candidate repair target; a new or worsened compiler, test, or lint failure must block; and a candidate that removes a baseline failure must report that improvement. Preserve strict candidate regression detection."),
+              ("terminal-result-projection", "medium", "Improve terminal result coverage so successful, candidate-failure, and infrastructure-failure outcomes consistently expose terminal state, candidate identity/diff when present, validation disposition, and bounded diagnostic evidence in both text and JSON. Keep presentation as a projection of authoritative lifecycle state and do not add a second lifecycle path."),
+              ("validator-provenance-regression", "small", "Add focused coverage that trusted validation records its worker/runtime provenance, baseline identity, candidate identity, and per-command baseline-versus-candidate disposition. Preserve existing isolation and baseline-aware validation semantics and avoid leaking credentials or full unbounded logs."),
+              ("read-only-config-validation", "medium", "Make the configuration validation command demonstrably read-only. It must inspect the effective configuration, report actionable diagnostics, and leave the workspace, configuration files, and candidate state unchanged. Add focused tests for unchanged state and preserve existing text/JSON parity."),
+              ("repository-search-determinism", "medium-cross-module", "Make repository-intelligence search results deterministic when multiple files or matches have the same relevance. Preserve all match metadata and useful ranking, but provide stable de-duplication and tie ordering across repeated runs. Add focused regression coverage without changing permission boundaries."),
+          ]
+
+          tracked = subprocess.check_output(["git", "ls-files", "-z"], text=False).split(b"\0")
+          files = {}
+          for raw in tracked:
+              if not raw:
+                  continue
+              path = raw.decode()
+              source = root / path
+              try:
+                  files[path] = source.read_text(encoding="utf-8")
+              except (UnicodeDecodeError, OSError):
+                  continue
+
+          for task_id, category, prompt in tasks:
+              task_file = out / f"{task_id}.json"
+              result_file = out / f"{task_id}.jsonl"
+              telemetry_file = out / f"{task_id}.telemetry.json"
+              task_file.write_text(json.dumps([{
+                  "id": task_id,
+                  "version": 1,
+                  "category": category,
+                  "language": "rust",
+                  "prompt": prompt,
+                  "fixture": {"files": files, "mock_actions": []},
+                  "hidden_oracle": {"expected_files": {}, "forbidden_paths": ["hidden.txt"]},
+                  "expected_change_scope": [],
+                  "timeout_seconds": 600,
+                  "max_agent_turns": 40,
+              }]))
+              env = os.environ.copy()
+              env["CLAW_BENCH_TELEMETRY"] = str(telemetry_file)
+              command = [
+                  "rust/target/debug/agent-bench", "run", "--execution", "production",
+                  "--interactive", "--tasks", str(task_file), "--task", task_id,
+                  "--models", str(Path(os.environ["RUNNER_TEMP"]) / "luna-models.json"),
+                  "--settings", str(Path(os.environ["RUNNER_TEMP"]) / "luna-settings.json"),
+                  "--model", "gpt-5.6-luna", "--binary", "rust/target/debug/claw",
+                  "--runtime-image", os.environ["CLAW_WORKER_IMAGE"],
+                  "--validator-image", os.environ["CLAW_VALIDATOR_IMAGE"],
+                  "--task-timeout", "600", "--exploration-timeout", "90",
+                  "--repetitions", "1", "--output", str(result_file),
+              ]
+              print(f"=== {task_id} ({category}) ===", flush=True)
+              completed = subprocess.run(command, env=env, text=True)
+              (out / f"{task_id}.exit").write_text(str(completed.returncode))
+              if completed.returncode != 0:
+                  print(f"task {task_id} exited {completed.returncode}; continuing batch", flush=True)
+          PY
+
+      - name: Upload product evaluation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: luna-product-evaluation-${{ github.run_id }}
+          path: ${{ runner.temp }}/product-evaluation
+          if-no-files-found: warn
