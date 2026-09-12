@@ -65,6 +65,16 @@ pub struct PromptCacheEvent {
 pub trait ApiClient {
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError>;
 
+    /// Install the cumulative provider-attempt budget for this runtime.
+    /// Implementations that retry at the transport layer must apply it to
+    /// every actual network attempt, not only logical conversation turns.
+    fn set_provider_request_budget(&mut self, _budget: usize) {}
+
+    /// Return actual provider attempts made, including bounded retries.
+    fn provider_requests_made(&self) -> usize {
+        0
+    }
+
     /// Optional provider/resource signal that should cause a writer checkpoint
     /// before sending this request. This is advisory and never judges code.
     fn checkpoint_reason(&self, _request: &ApiRequest) -> Option<String> {
@@ -380,8 +390,14 @@ where
     /// reconstructed or finalization runtime from sending past its allowance.
     #[must_use]
     pub fn with_provider_request_budget(mut self, budget: usize) -> Self {
+        self.api_client.set_provider_request_budget(budget);
         self.provider_request_budget = Some(budget);
         self
+    }
+
+    #[must_use]
+    pub fn provider_requests_made(&self) -> usize {
+        self.api_client.provider_requests_made()
     }
 
     /// Let the caller own checkpoint decisions while retaining shared

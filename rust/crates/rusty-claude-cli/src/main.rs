@@ -4780,6 +4780,12 @@ impl BuiltRuntime {
         self
     }
 
+    fn provider_requests_made(&self) -> usize {
+        self.runtime
+            .as_ref()
+            .map_or(0, ConversationRuntime::provider_requests_made)
+    }
+
     fn with_orchestrator_checkpointing(mut self) -> Self {
         let runtime = self
             .runtime
@@ -6981,21 +6987,21 @@ impl LiveCli {
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
+                let provider_requests = runtime.provider_requests_made();
                 let available_writer_turns = self
                     .work_unit_turn_allowance
                     .saturating_sub(self.work_unit_writer_turns);
-                if summary.iterations > available_writer_turns {
+                if provider_requests > available_writer_turns {
                     let _ = finish_candidate_for_terminal(&mut runtime);
                     self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
                     return Err(format!(
-                        "writer request accounting exceeded WorkUnit allowance: requested={}, available={available_writer_turns}",
-                        summary.iterations
+                        "writer request accounting exceeded WorkUnit allowance: requested={provider_requests}, available={available_writer_turns}",
                     )
                     .into());
                 }
                 self.work_unit_writer_turns = self
                     .work_unit_writer_turns
-                    .saturating_add(summary.iterations);
+                    .saturating_add(provider_requests);
                 benchmark_telemetry::work_unit_budget(
                     self.work_unit_writer_turns,
                     self.work_unit_turn_allowance,
@@ -7477,6 +7483,15 @@ impl LiveCli {
                 Ok(())
             }
             Err(error) => {
+                let provider_requests = runtime.provider_requests_made();
+                self.work_unit_writer_turns = self
+                    .work_unit_writer_turns
+                    .saturating_add(provider_requests);
+                benchmark_telemetry::work_unit_budget(
+                    self.work_unit_writer_turns,
+                    self.work_unit_turn_allowance,
+                    self.work_unit_continuation_grants,
+                );
                 let preserved = finish_candidate_for_terminal(&mut runtime).is_ok();
                 self.candidate_state = if preserved {
                     CandidateLifecycleState::EvaluationBlocked
@@ -12416,6 +12431,8 @@ struct AnthropicRuntimeClient {
     progress_reporter: Option<InternalPromptProgressReporter>,
     reasoning_effort: Option<String>,
     rate_limit_state: Arc<Mutex<Option<RateLimitState>>>,
+    provider_request_budget: std::cell::Cell<Option<usize>>,
+    provider_requests_made: std::cell::Cell<usize>,
 }
 
 impl AnthropicRuntimeClient {
@@ -12514,6 +12531,8 @@ impl AnthropicRuntimeClient {
             progress_reporter,
             reasoning_effort: None,
             rate_limit_state: Arc::new(Mutex::new(None)),
+            provider_request_budget: std::cell::Cell::new(None),
+            provider_requests_made: std::cell::Cell::new(0),
         })
     }
 
@@ -12798,6 +12817,14 @@ impl ApiClient for AnthropicRuntimeClient {
                 let mut provider_recoveries = 0;
 
                 for attempt in 1..=max_attempts {
+                    if let Some(remaining) = self.provider_request_budget.get() {
+                        if remaining == 0 {
+                            return Err(RuntimeError::new("provider request budget exhausted"));
+                        }
+                        self.provider_request_budget.set(Some(remaining - 1));
+                    }
+                    self.provider_requests_made
+                        .set(self.provider_requests_made.get().saturating_add(1));
                     benchmark_telemetry::provider_call();
                     let result = self
                         .consume_stream(&message_request, is_post_tool && attempt == 1)
@@ -12865,6 +12892,14 @@ impl ApiClient for AnthropicRuntimeClient {
             })
         });
         result
+    }
+
+    fn set_provider_request_budget(&mut self, budget: usize) {
+        self.provider_request_budget.set(Some(budget));
+    }
+
+    fn provider_requests_made(&self) -> usize {
+        self.provider_requests_made.get()
     }
 
     fn checkpoint_reason(&self, request: &ApiRequest) -> Option<String> {
