@@ -42,7 +42,7 @@ jobs:
           podman --version
           podman info --format '{{.Host.Security.Rootless}}'
           test "$(podman info --format '{{.Host.Security.Rootless}}')" = true
-          unshare -Ur true
+          podman unshare cat /proc/self/uid_map
           command -v newuidmap
           command -v newgidmap
           command -v crun
