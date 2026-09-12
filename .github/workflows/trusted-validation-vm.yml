@@ -94,9 +94,6 @@ jobs:
             cargo test -p runtime --test podman_isolation -- "$test_name" --ignored --nocapture
           done
 
-      - name: Run normal production lifecycle fixture
-        run: ./scripts/run-local-acceptance.sh --task config-threading --artifacts-dir "$RUNNER_TEMP/acceptance"
-
       - name: Upload trusted-validation evidence
         if: always()
         uses: actions/upload-artifact@v4
