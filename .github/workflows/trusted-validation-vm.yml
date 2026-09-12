@@ -73,7 +73,26 @@ jobs:
           CLAW_WORKER_IMAGE: claw-bastion-runtime:trusted-vm
           CLAW_VALIDATOR_IMAGE: claw-bastion-validator-rust:trusted-vm
         working-directory: rust
-        run: cargo test -p runtime --test podman_isolation -- --ignored --nocapture
+        run: |
+          set -euo pipefail
+          for test_name in \
+            real_worker_boundary_blocks_host_state_and_allows_candidate_edits \
+            real_worker_network_and_mount_policy_denies_host_state \
+            real_worker_edit_positive_control \
+            real_worker_outside_write_is_denied \
+            real_worker_external_symlink_isolation \
+            real_worker_candidate_git_metadata_is_harmless \
+            real_worker_process_limit_and_output_bounds \
+            real_validator_is_fresh_networkless_and_does_not_mutate_candidate \
+            real_validator_host_and_socket_isolation \
+            podman_full_hostile_authoritative_lifecycle \
+            real_mcp_stdio_isolated_boundary_and_cleanup \
+            real_private_mode_lifecycle_preserves_isolation_and_apply_boundary \
+            real_custom_runtime_preserves_outer_security_policy \
+            real_combined_hostile_lifecycle_keeps_canonical_authoritative
+          do
+            cargo test -p runtime --test podman_isolation -- "$test_name" --ignored --nocapture
+          done
 
       - name: Run normal production lifecycle fixture
         run: ./scripts/run-local-acceptance.sh --task config-threading --artifacts-dir "$RUNNER_TEMP/acceptance"
