@@ -4778,10 +4778,10 @@ impl BuiltRuntime {
         self
     }
 
-    fn provider_requests_made(&self) -> usize {
+    fn logical_requests_made(&self) -> usize {
         self.runtime
             .as_ref()
-            .map_or(0, ConversationRuntime::provider_requests_made)
+            .map_or(0, ConversationRuntime::logical_requests_made)
     }
 
     fn with_orchestrator_checkpointing(mut self) -> Self {
@@ -6985,21 +6985,20 @@ impl LiveCli {
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
-                let provider_requests = runtime.provider_requests_made();
+                let logical_requests = runtime.logical_requests_made();
                 let available_writer_turns = self
                     .work_unit_turn_allowance
                     .saturating_sub(self.work_unit_writer_turns);
-                if provider_requests > available_writer_turns {
+                if logical_requests > available_writer_turns {
                     let _ = finish_candidate_for_terminal(&mut runtime);
                     self.candidate_state = CandidateLifecycleState::EvaluationBlocked;
                     return Err(format!(
-                        "writer request accounting exceeded WorkUnit allowance: requested={provider_requests}, available={available_writer_turns}",
+                        "writer logical-turn accounting exceeded WorkUnit allowance: requested={logical_requests}, available={available_writer_turns}",
                     )
                     .into());
                 }
-                self.work_unit_writer_turns = self
-                    .work_unit_writer_turns
-                    .saturating_add(provider_requests);
+                self.work_unit_writer_turns =
+                    self.work_unit_writer_turns.saturating_add(logical_requests);
                 benchmark_telemetry::work_unit_budget(
                     self.work_unit_writer_turns,
                     self.work_unit_turn_allowance,
@@ -7481,10 +7480,9 @@ impl LiveCli {
                 Ok(())
             }
             Err(error) => {
-                let provider_requests = runtime.provider_requests_made();
-                self.work_unit_writer_turns = self
-                    .work_unit_writer_turns
-                    .saturating_add(provider_requests);
+                let logical_requests = runtime.logical_requests_made();
+                self.work_unit_writer_turns =
+                    self.work_unit_writer_turns.saturating_add(logical_requests);
                 benchmark_telemetry::work_unit_budget(
                     self.work_unit_writer_turns,
                     self.work_unit_turn_allowance,

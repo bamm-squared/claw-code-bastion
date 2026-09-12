@@ -285,6 +285,7 @@ pub struct ConversationRuntime<C, T> {
     checkpoint_finalization_turns: usize,
     checkpoint_turns_remaining: usize,
     provider_request_budget: Option<usize>,
+    logical_requests_made: usize,
     pre_candidate_continuation_turns: usize,
     context_checkpoint_tokens: usize,
     checkpoint: Option<WriterCheckpoint>,
@@ -345,6 +346,7 @@ where
             checkpoint_finalization_turns: 0,
             checkpoint_turns_remaining: 0,
             provider_request_budget: None,
+            logical_requests_made: 0,
             pre_candidate_continuation_turns: 4,
             context_checkpoint_tokens: DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD as usize,
             checkpoint: None,
@@ -385,14 +387,21 @@ where
         self
     }
 
-    /// Bound the number of provider requests made by this runtime instance.
-    /// The caller owns cumulative WorkUnit accounting; this guard prevents a
-    /// reconstructed or finalization runtime from sending past its allowance.
+    /// Bound the number of logical provider turns made by this runtime
+    /// instance. Transport retries remain bounded by the provider client and
+    /// are recorded separately from the caller-owned WorkUnit allowance.
     #[must_use]
     pub fn with_provider_request_budget(mut self, budget: usize) -> Self {
-        self.api_client.set_provider_request_budget(budget);
         self.provider_request_budget = Some(budget);
         self
+    }
+
+    /// Return the number of logical model decisions made by this runtime.
+    /// This is deliberately distinct from provider attempts, which may include
+    /// bounded transport retries for one logical decision.
+    #[must_use]
+    pub fn logical_requests_made(&self) -> usize {
+        self.logical_requests_made
     }
 
     #[must_use]
@@ -744,6 +753,7 @@ where
                 }
                 *remaining -= 1;
             }
+            self.logical_requests_made = self.logical_requests_made.saturating_add(1);
             let events = match self.api_client.stream(request) {
                 Ok(events) => events,
                 Err(error) => {
@@ -2375,6 +2385,80 @@ mod tests {
         assert!(error
             .to_string()
             .contains("provider request budget exhausted"));
+    }
+
+    #[test]
+    fn transport_attempts_do_not_charge_extra_logical_writer_turns() {
+        struct RetriedApi;
+
+        impl ApiClient for RetriedApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Ok(vec![
+                    AssistantEvent::TextDelta("recovered".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+
+            fn provider_requests_made(&self) -> usize {
+                2
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            RetriedApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_provider_request_budget(1);
+
+        runtime
+            .run_turn("retry once", None)
+            .expect("a recovered logical turn should succeed");
+
+        assert_eq!(runtime.logical_requests_made(), 1);
+        assert_eq!(runtime.provider_requests_made(), 2);
+    }
+
+    #[test]
+    fn exhausted_transport_retry_consumes_one_logical_turn_and_stops() {
+        struct ExhaustedApi;
+
+        impl ApiClient for ExhaustedApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Err(RuntimeError::transient_provider_failure(
+                    "retryable transport failure",
+                ))
+            }
+
+            fn provider_requests_made(&self) -> usize {
+                3
+            }
+        }
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ExhaustedApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_provider_request_budget(1);
+
+        let error = runtime
+            .run_turn("retry exhaustion", None)
+            .expect_err("exhausted transport retries must terminate the turn");
+
+        assert!(error.to_string().contains("retryable transport failure"));
+        assert_eq!(runtime.logical_requests_made(), 1);
+        assert_eq!(runtime.provider_requests_made(), 3);
     }
 
     #[test]
