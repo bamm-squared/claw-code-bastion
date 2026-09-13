@@ -189,7 +189,79 @@ def product_result(path: Path) -> Any:
         return None
 
 
+def process_alive(pid: int) -> bool:
+    try:
+        stat = (Path("/proc") / str(pid) / "stat").read_text(encoding="utf-8")
+        _, rest = stat.split(") ", 1)
+        return rest.split()[0] != "Z"
+    except (FileNotFoundError, PermissionError, ValueError, IndexError):
+        return False
+
+
+def watchdog_main(arguments: list[str]) -> int:
+    (
+        parent_pid,
+        child_pid,
+        timeout,
+        task_id,
+        journal_name,
+        host_result_name,
+        candidate_name,
+        telemetry_name,
+        heartbeat_name,
+    ) = arguments
+    parent = int(parent_pid)
+    child = int(child_pid)
+    deadline = time.monotonic() + float(timeout)
+    journal = Path(journal_name)
+    host_result = Path(host_result_name)
+    candidate_file = Path(candidate_name)
+    telemetry_file = Path(telemetry_name)
+    heartbeat_file = Path(heartbeat_name)
+    while time.monotonic() < deadline and process_alive(child):
+        time.sleep(0.5)
+    if not process_alive(child):
+        return 0
+
+    append_event(journal, "watchdog_timeout", child_pid=child, watchdog_pid=os.getpid())
+    signal_tree(child, signal.SIGTERM)
+    time.sleep(12)
+    if process_alive(child):
+        append_event(journal, "watchdog_force_kill", child_pid=child, watchdog_pid=os.getpid())
+        signal_tree(child, signal.SIGKILL)
+    candidate = None
+    if candidate_file.is_file():
+        try:
+            candidate = json.loads(candidate_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            candidate = None
+    heartbeat = None
+    if heartbeat_file.is_file():
+        try:
+            heartbeat = json.loads(heartbeat_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            heartbeat = None
+    projection = {
+        "classification": "INFRA_FAIL",
+        "reason": "RUNNER_TIMEOUT",
+        "task_id": task_id,
+        "child_pid": child,
+        "last_event": heartbeat.get("last_event") if isinstance(heartbeat, dict) else None,
+        "candidate": candidate,
+        "telemetry": telemetry_summary(telemetry_file),
+    }
+    append_event(journal, "terminal", **projection)
+    atomic_json(host_result, projection)
+    try:
+        os.kill(parent, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    return 124
+
+
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "--watchdog":
+        return watchdog_main(sys.argv[2:])
     parser = argparse.ArgumentParser()
     parser.add_argument("--task-id", required=True)
     parser.add_argument("--artifacts", type=Path, required=True)
@@ -243,6 +315,28 @@ def main() -> int:
         start_new_session=True,
     )
     append_event(journal, "child_started", pid=child.pid, process_group=child.pid)
+    watchdog = subprocess.Popen(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--watchdog",
+            str(os.getpid()),
+            str(child.pid),
+            str(args.timeout),
+            args.task_id,
+            str(journal),
+            str(host_result),
+            str(run_dir / "candidate.json"),
+            str(args.telemetry) if args.telemetry else "",
+            str(heartbeat),
+        ],
+        cwd=args.cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
     last_event = "child_started"
     last_digest: str | None = None
     started = time.monotonic()
@@ -307,6 +401,12 @@ def main() -> int:
             child.wait(timeout=15)
         except subprocess.TimeoutExpired:
             signal_tree(child.pid, signal.SIGKILL)
+        if watchdog.poll() is None:
+            watchdog.terminate()
+            try:
+                watchdog.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                watchdog.kill()
             child.wait(timeout=15)
         child_stdout.close()
         child_stderr.close()
