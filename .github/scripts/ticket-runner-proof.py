@@ -71,7 +71,7 @@ def run_case(root: Path, mode: str, timeout: float) -> tuple[int, dict]:
 
 
 def main() -> int:
-    root = Path(os.environ.get("RUNNER_PROOF_DIR", str(ROOT / ".runner-proof")))
+    root = Path(os.environ.get("RUNNER_PROOF_DIR", str(ROOT / "runner-proof-artifacts")))
     if root.exists():
         import shutil
 

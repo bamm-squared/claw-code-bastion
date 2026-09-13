@@ -27,5 +27,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: frozen-five-runner-proof-${{ github.run_id }}
-          path: .runner-proof/
+          path: runner-proof-artifacts/
           if-no-files-found: warn
