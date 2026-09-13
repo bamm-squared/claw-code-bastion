@@ -207,7 +207,8 @@ jobs:
           PY
           telemetry="$out/production-telemetry.json"
           result="$out/result.jsonl"
-          python3 .github/scripts/ticket-runner.py \
+          timeout --signal=TERM --kill-after=45s 960s \
+            python3 .github/scripts/ticket-runner.py \
             --task-id "$CLAW_PRODUCT_TASK_ID" \
             --artifacts "$out" \
             --cwd "$GITHUB_WORKSPACE/product" \
