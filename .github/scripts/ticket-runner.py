@@ -247,6 +247,15 @@ def main() -> int:
     last_digest: str | None = None
     started = time.monotonic()
     timed_out = False
+    alarm_fired = False
+
+    def watchdog_alarm(_signum: int, _frame: Any) -> None:
+        nonlocal alarm_fired
+        alarm_fired = True
+        signal_tree(child.pid, signal.SIGTERM)
+
+    signal.signal(signal.SIGALRM, watchdog_alarm)
+    signal.setitimer(signal.ITIMER_REAL, args.timeout)
     try:
         while child.poll() is None:
             state = project_state(work_root, args.task_file)
@@ -278,7 +287,7 @@ def main() -> int:
             with heartbeat_history.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps(heartbeat_value, sort_keys=True) + "\n")
                 stream.flush()
-            if time.monotonic() - started >= args.timeout:
+            if alarm_fired or time.monotonic() - started >= args.timeout:
                 timed_out = True
                 append_event(journal, "watchdog_timeout", child_pid=child.pid)
                 signal_tree(child.pid, signal.SIGTERM)
@@ -291,6 +300,7 @@ def main() -> int:
                 break
             time.sleep(0.5)
     finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
         if child.poll() is None:
             signal_tree(child.pid, signal.SIGKILL)
         try:
