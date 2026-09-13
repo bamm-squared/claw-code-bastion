@@ -92,6 +92,10 @@ jobs:
 
       - name: Run repository security boundary gate
         working-directory: product/rust
+        env:
+          CLAW_REAL_PODMAN_IMAGE: claw-bastion-runtime:frozen-five
+          CLAW_WORKER_IMAGE: claw-bastion-runtime:frozen-five
+          CLAW_VALIDATOR_IMAGE: claw-bastion-validator-rust:frozen-five
         run: |
           set -euo pipefail
           for test_name in \
