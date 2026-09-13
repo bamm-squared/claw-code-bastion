@@ -1,0 +1,234 @@
+name: Frozen Bastion five-ticket evaluation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: frozen-bastion-five-ticket-evaluation
+  cancel-in-progress: false
+
+jobs:
+  evaluate:
+    name: frozen Bastion Luna evaluation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      OPENAI_API_KEY: ${{ secrets.BASTION_EVAL_OPENAI_API_KEY }}
+      CLAW_REQUIRE_DISPOSABLE_VALIDATOR: "1"
+      CLAW_VALIDATOR_WORKER_CLASS: disposable-vm
+      CLAW_ACCEPTANCE_WORKER_IMAGE: claw-bastion-runtime:frozen-five
+      CLAW_ACCEPTANCE_VALIDATOR_IMAGE: claw-bastion-validator-rust:frozen-five
+      CLAW_WORKER_IMAGE: claw-bastion-runtime:frozen-five
+      CLAW_VALIDATOR_IMAGE: claw-bastion-validator-rust:frozen-five
+      CLAW_BENCH_PERMISSION_RESPONSE: allow
+      CLAW_PROVIDER_TRACE: "1"
+      CLAW_ORCHESTRATION_TRACE: "1"
+    steps:
+      - name: Checkout frozen product source
+        uses: actions/checkout@v4
+        with:
+          ref: 1d38d6562ca0aaf23e6c45e59997aafb240ddadd
+          path: product
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+
+      - name: Install supported rootless validation worker
+        working-directory: product
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            podman crun uidmap slirp4netns fuse-overlayfs netavark git python3-pexpect
+          user_name="$(id -un)"
+          user_id="$(id -u)"
+          sudo sh -c "grep -q '^${user_name}:' /etc/subuid || printf '%s:100000:65536\\n' '${user_name}' >> /etc/subuid"
+          sudo sh -c "grep -q '^${user_name}:' /etc/subgid || printf '%s:100000:65536\\n' '${user_name}' >> /etc/subgid"
+          sudo install -d -m 700 -o "${user_name}" -g "${user_name}" "/run/user/${user_id}"
+          printf '[engine]\ncgroup_manager = "cgroupfs"\n' > "$RUNNER_TEMP/containers.conf"
+          echo "XDG_RUNTIME_DIR=/run/user/${user_id}" >> "$GITHUB_ENV"
+          echo "CONTAINERS_CONF=$RUNNER_TEMP/containers.conf" >> "$GITHUB_ENV"
+
+      - name: Preflight supported worker before provider traffic
+        working-directory: product
+        env:
+          CLAW_REAL_PODMAN_IMAGE: alpine:3.20
+        run: |
+          set -euo pipefail
+          ./scripts/security-runner-preflight.sh
+          test "$(podman info --format '{{.Host.OCIRuntime.Name}}')" = crun
+          podman info
+          podman unshare cat /proc/self/uid_map
+          podman unshare cat /proc/self/gid_map
+          podman pull --quiet docker.io/library/alpine:3.20
+          podman run --rm --network=none --cap-drop=ALL \
+            --security-opt=no-new-privileges alpine:3.20 \
+            sh -c 'test -x /bin/sh && ! wget -q -T 2 -O- https://example.invalid'
+
+      - name: Build pinned validation images
+        working-directory: product
+        run: |
+          set -euo pipefail
+          podman pull docker.io/library/rust:bookworm
+          podman pull docker.io/library/debian:bookworm-slim
+          podman build --pull=never --build-arg CLAW_SOURCE_REVISION=1d38d6562ca0aaf23e6c45e59997aafb240ddadd \
+            -f Containerfile.worker -t "$CLAW_ACCEPTANCE_WORKER_IMAGE" .
+          podman build --pull=never --build-arg CLAW_SOURCE_REVISION=1d38d6562ca0aaf23e6c45e59997aafb240ddadd \
+            -f Containerfile.validator -t "$CLAW_ACCEPTANCE_VALIDATOR_IMAGE" .
+          podman image inspect --format 'worker={{.Id}}' "$CLAW_ACCEPTANCE_WORKER_IMAGE"
+          podman image inspect --format 'validator={{.Id}}' "$CLAW_ACCEPTANCE_VALIDATOR_IMAGE"
+
+      - name: Verify production worker policy
+        working-directory: product
+        env:
+          CLAW_REAL_PODMAN_IMAGE: claw-bastion-runtime:frozen-five
+        run: ./scripts/security-runner-preflight.sh
+
+      - name: Run repository security boundary gate
+        working-directory: product/rust
+        run: |
+          set -euo pipefail
+          for test_name in \
+            real_worker_boundary_blocks_host_state_and_allows_candidate_edits \
+            real_worker_network_and_mount_policy_denies_host_state \
+            real_worker_edit_positive_control \
+            real_worker_outside_write_is_denied \
+            real_worker_external_symlink_isolation \
+            real_worker_candidate_git_metadata_is_harmless \
+            real_worker_process_limit_and_output_bounds \
+            real_validator_is_fresh_networkless_and_does_not_mutate_candidate \
+            real_validator_host_and_socket_isolation \
+            podman_full_hostile_authoritative_lifecycle \
+            real_mcp_stdio_isolated_boundary_and_cleanup \
+            real_private_mode_lifecycle_preserves_isolation_and_apply_boundary \
+            real_custom_runtime_preserves_outer_security_policy \
+            real_combined_hostile_lifecycle_keeps_canonical_authoritative
+          do
+            cargo test -p runtime --test podman_isolation -- "$test_name" --ignored --nocapture
+          done
+
+      - name: Build production binaries and Luna settings
+        working-directory: product
+        run: |
+          set -euo pipefail
+          (cd rust && cargo build --workspace)
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          settings = json.loads(Path("benchmarks/settings.local.json").read_text())
+          luna = [item for item in settings["modelResources"] if item["id"] == "gpt-5.6-luna"]
+          if len(luna) != 1:
+              raise SystemExit("expected exactly one Luna resource")
+          temp = Path(os.environ["RUNNER_TEMP"])
+          temp.joinpath("luna-settings.json").write_text(json.dumps({
+              "modelResources": luna,
+              "routing": {"allowRemote": True, "preferredProvider": "openai", "minimumMargin": 8},
+          }))
+          temp.joinpath("luna-models.json").write_text(json.dumps({
+              "schema_version": 1,
+              "models": [{
+                  "alias": "gpt-5.6-luna",
+                  "provider_profile": "openai",
+                  "model": "gpt-5.6-luna",
+                  "reasoning": "default",
+                  "authorized": True,
+                  "local": False,
+                  "actual_input_usd_per_million": 0.2,
+                  "actual_output_usd_per_million": 1.2,
+                  "cached_input_usd_per_million": 0.0,
+                  "cache_write_usd_per_million": 0.0,
+              }],
+          }))
+          PY
+
+      - name: Run five fresh real Luna tickets
+        working-directory: product
+        run: |
+          set -u
+          mkdir -p "$RUNNER_TEMP/frozen-five-evaluation"
+          python3 - "$RUNNER_TEMP/frozen-five-evaluation" <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          out = Path(sys.argv[1])
+          root = Path.cwd()
+          tasks = [
+              ("windows-first-run-onboarding", "small", "Add a clear Windows first-run setup section to the user documentation. It should tell a new Windows user to install Rust with rustup before using the project, choose Git Bash or WSL for the documented shell workflow, explain how Windows paths appear in Git Bash, and make clear that a MINGW64 prompt is normal. Keep the existing installation guidance accurate and consistent."),
+              ("agent-binary-name-documentation", "small", "Clarify the installation documentation for the renamed command-line package so users can distinguish the package name from the executable name. Show the exact command to install agent-code and the command users should run on Unix and Windows after installation. Keep the deprecated claw-code warning accurate and avoid implying that agent-code is the installed executable name."),
+              ("workspace-shell-permission-boundary", "medium", "Make shell-tool permission behavior consistent for workspace-scoped development. Read-only commands that inspect paths inside the current workspace should be usable under the normal workspace permission, while commands that write, execute arbitrary programs, access the network, or target paths outside the workspace must retain the stronger permission requirement. Preserve containment and add focused coverage for read, write, network, and outside-workspace cases across the supported shell surfaces."),
+              ("auth-provider-error-guidance", "medium", "Improve authentication diagnostics for common provider-configuration mistakes. When a user selects an environment variable or token form that maps to the wrong provider or HTTP authentication header, the error should explain the correct variable and why, without exposing credential values. Preserve provider routing, existing error classes, JSON/text parity, and coverage for both API-key and OAuth-style inputs."),
+              ("configured-worker-trust-defaults", "medium-cross-module", "Make worker creation practical for callers that use a configured trusted-root policy. A normal settings file should be able to provide default trusted roots, worker creation should use those defaults when no per-worker roots are supplied, explicit per-worker roots must remain predictable and auditable, and an empty configuration must remain fail-closed. Expose the behavior through the existing configuration and worker status surfaces with focused tests and documentation."),
+          ]
+
+          tracked = subprocess.check_output(["git", "ls-files", "-z"], text=False).split(b"\0")
+          files = {}
+          for raw in tracked:
+              if not raw:
+                  continue
+              path = raw.decode()
+              source = root / path
+              try:
+                  files[path] = source.read_text(encoding="utf-8")
+              except (UnicodeDecodeError, OSError):
+                  continue
+
+          for task_id, category, prompt in tasks:
+              task_file = out / f"{task_id}.json"
+              result_file = out / f"{task_id}.jsonl"
+              telemetry_file = out / f"{task_id}.telemetry.json"
+              task_file.write_text(json.dumps([{
+                  "id": task_id,
+                  "version": 1,
+                  "category": category,
+                  "language": "rust",
+                  "prompt": prompt,
+                  "fixture": {"files": files, "mock_actions": []},
+                  "hidden_oracle": {"expected_files": {}, "forbidden_paths": ["hidden.txt"]},
+                  "expected_change_scope": [],
+                  "timeout_seconds": 600,
+                  "max_agent_turns": 40,
+              }]))
+              env = os.environ.copy()
+              env["CLAW_BENCH_TELEMETRY"] = str(telemetry_file)
+              command = [
+                  "rust/target/debug/agent-bench", "run", "--execution", "production",
+                  "--interactive", "--tasks", str(task_file), "--task", task_id,
+                  "--models", str(Path(os.environ["RUNNER_TEMP"]) / "luna-models.json"),
+                  "--settings", str(Path(os.environ["RUNNER_TEMP"]) / "luna-settings.json"),
+                  "--model", "gpt-5.6-luna", "--binary", "rust/target/debug/claw",
+                  "--runtime-image", os.environ["CLAW_WORKER_IMAGE"],
+                  "--validator-image", os.environ["CLAW_VALIDATOR_IMAGE"],
+                  "--task-timeout", "600", "--exploration-timeout", "90",
+                  "--repetitions", "1", "--output", str(result_file),
+              ]
+              print(f"=== {task_id} ({category}) ===", flush=True)
+              try:
+                  completed = subprocess.run(command, env=env, text=True, timeout=900)
+              except subprocess.TimeoutExpired:
+                  print(f"task {task_id} exceeded the external 900-second watchdog; continuing", flush=True)
+                  (out / f"{task_id}.exit").write_text("124")
+                  continue
+              (out / f"{task_id}.exit").write_text(str(completed.returncode))
+              if completed.returncode != 0:
+                  print(f"task {task_id} exited {completed.returncode}; continuing batch", flush=True)
+          PY
+
+      - name: Upload complete evaluation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frozen-five-evaluation-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/frozen-five-evaluation/
+            ${{ runner.temp }}/acceptance/
+          if-no-files-found: ignore
