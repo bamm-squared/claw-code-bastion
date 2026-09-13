@@ -218,9 +218,9 @@ def watchdog_main(arguments: list[str]) -> int:
     candidate_file = Path(candidate_name)
     telemetry_file = Path(telemetry_name)
     heartbeat_file = Path(heartbeat_name)
-    while time.monotonic() < deadline and process_alive(child):
+    while time.monotonic() < deadline and not host_result.exists():
         time.sleep(0.5)
-    if not process_alive(child):
+    if host_result.exists():
         return 0
 
     append_event(journal, "watchdog_timeout", child_pid=child, watchdog_pid=os.getpid())
