@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: frozen-five-ticket-evaluation
+  group: frozen-five-ticket-evaluation-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
