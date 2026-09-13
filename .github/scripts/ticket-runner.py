@@ -20,6 +20,16 @@ from pathlib import Path
 from typing import Any
 
 
+CHECKPOINT_IGNORED_DIRS = {
+    ".git",
+    ".cache",
+    "build",
+    "dist",
+    "node_modules",
+    "target",
+}
+
+
 def atomic_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -89,17 +99,22 @@ def project_state(work_root: Path, task_fixture: Path | None) -> dict[str, Any] 
     project = projects[-1]
     digest = hashlib.sha256()
     files: list[str] = []
-    for path in sorted(project.rglob("*")):
-        if not path.is_file() or ".git" in path.parts:
-            continue
-        relative = path.relative_to(project).as_posix()
-        files.append(relative)
-        digest.update(relative.encode("utf-8"))
-        digest.update(b"\0")
-        try:
-            digest.update(path.read_bytes())
-        except OSError:
-            continue
+    for root, directories, names in os.walk(project):
+        directories[:] = sorted(
+            name for name in directories if name not in CHECKPOINT_IGNORED_DIRS
+        )
+        for name in sorted(names):
+            path = Path(root) / name
+            if not path.is_file():
+                continue
+            relative = path.relative_to(project).as_posix()
+            files.append(relative)
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            try:
+                digest.update(path.read_bytes())
+            except OSError:
+                continue
     changed: list[str] = []
     if task_fixture and task_fixture.is_file():
         try:
