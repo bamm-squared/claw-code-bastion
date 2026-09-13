@@ -141,7 +141,11 @@ def snapshot_project(state: dict[str, Any], snapshot: Path) -> None:
     temporary = snapshot.with_name(f".{snapshot.name}.{os.getpid()}.tmp")
     if temporary.exists():
         shutil.rmtree(temporary)
-    shutil.copytree(source, temporary, ignore=shutil.ignore_patterns(".git"))
+    shutil.copytree(
+        source,
+        temporary,
+        ignore=shutil.ignore_patterns(*sorted(CHECKPOINT_IGNORED_DIRS)),
+    )
     if snapshot.exists():
         shutil.rmtree(snapshot)
     os.replace(temporary, snapshot)
