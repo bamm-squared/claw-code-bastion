@@ -209,6 +209,7 @@ def watchdog_main(arguments: list[str]) -> int:
         candidate_name,
         telemetry_name,
         heartbeat_name,
+        timeout_marker_name,
     ) = arguments
     parent = int(parent_pid)
     child = int(child_pid)
@@ -218,12 +219,17 @@ def watchdog_main(arguments: list[str]) -> int:
     candidate_file = Path(candidate_name)
     telemetry_file = Path(telemetry_name)
     heartbeat_file = Path(heartbeat_name)
+    timeout_marker = Path(timeout_marker_name)
     while time.monotonic() < deadline and not host_result.exists():
         time.sleep(0.5)
     if host_result.exists():
         return 0
 
     append_event(journal, "watchdog_timeout", child_pid=child, watchdog_pid=os.getpid())
+    atomic_json(
+        timeout_marker,
+        {"task_id": task_id, "child_pid": child, "timestamp": time.time()},
+    )
     signal_tree(child, signal.SIGTERM)
     time.sleep(12)
     if process_alive(child):
@@ -329,6 +335,7 @@ def main() -> int:
             str(run_dir / "candidate.json"),
             str(args.telemetry) if args.telemetry else "",
             str(heartbeat),
+            str(run_dir / "watchdog-timeout.json"),
         ],
         cwd=args.cwd,
         stdin=subprocess.DEVNULL,
@@ -407,6 +414,8 @@ def main() -> int:
                 watchdog.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 watchdog.kill()
+        if (run_dir / "watchdog-timeout.json").is_file():
+            timed_out = True
             child.wait(timeout=15)
         child_stdout.close()
         child_stderr.close()
