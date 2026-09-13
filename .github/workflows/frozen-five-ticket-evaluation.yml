@@ -183,7 +183,7 @@ jobs:
           }
           category, prompt = prompts[task_id]
           root = Path("product")
-          tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=root, text=False).split(b"\\0")
+          tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=root, text=False).split(b"\0")
           files = {}
           for raw in tracked:
               if raw:
