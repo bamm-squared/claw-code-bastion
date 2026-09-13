@@ -1,0 +1,31 @@
+name: Frozen five ticket runner proof
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: frozen-five-runner-proof-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  runner-proof:
+    name: crash-durable per-ticket runner proof
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run provider-free runner proof
+        run: python3 .github/scripts/ticket-runner-proof.py
+      - name: Upload runner proof bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frozen-five-runner-proof-${{ github.run_id }}
+          path: .runner-proof/
+          if-no-files-found: warn
