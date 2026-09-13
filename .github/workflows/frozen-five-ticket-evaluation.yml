@@ -13,11 +13,22 @@ concurrency:
 
 jobs:
   evaluate:
-    name: frozen Bastion Luna evaluation
+    name: frozen Bastion Luna ${{ matrix.task }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 300
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        task:
+          - windows-first-run-onboarding
+          - agent-binary-name-documentation
+          - workspace-shell-permission-boundary
+          - auth-provider-error-guidance
+          - configured-worker-trust-defaults
     env:
       OPENAI_API_KEY: ${{ secrets.BASTION_EVAL_OPENAI_API_KEY }}
+      CLAW_PRODUCT_TASK_ID: ${{ matrix.task }}
       CLAW_REQUIRE_DISPOSABLE_VALIDATOR: "1"
       CLAW_VALIDATOR_WORKER_CLASS: disposable-vm
       CLAW_ACCEPTANCE_WORKER_IMAGE: claw-bastion-runtime:frozen-five
@@ -153,96 +164,71 @@ jobs:
           }))
           PY
 
-      - name: Run five fresh real Luna tickets
+      - name: Run one fresh real Luna ticket
         working-directory: product
         run: |
-          set -u
-          mkdir -p "$RUNNER_TEMP/frozen-five-evaluation"
-          python3 - "$RUNNER_TEMP/frozen-five-evaluation" <<'PY'
+          set +e
+          out="$RUNNER_TEMP/frozen-five-evaluation/$CLAW_PRODUCT_TASK_ID"
+          mkdir -p "$out"
+          python3 - "$out/task.json" "$CLAW_PRODUCT_TASK_ID" <<'PY'
           import json
-          import os
-          import signal
           import subprocess
           import sys
           from pathlib import Path
 
-          out = Path(sys.argv[1])
+          output = Path(sys.argv[1])
+          task_id = sys.argv[2]
+          prompts = {
+              "windows-first-run-onboarding": ("small", "Add a clear Windows first-run setup section to the user documentation. It should tell a new Windows user to install Rust with rustup before using the project, choose Git Bash or WSL for the documented shell workflow, explain how Windows paths appear in Git Bash, and make clear that a MINGW64 prompt is normal. Keep the existing installation guidance accurate and consistent."),
+              "agent-binary-name-documentation": ("small", "Clarify the installation documentation for the renamed command-line package so users can distinguish the package name from the executable name. Show the exact command to install agent-code and the command users should run on Unix and Windows after installation. Keep the deprecated claw-code warning accurate and avoid implying that agent-code is the installed executable name."),
+              "workspace-shell-permission-boundary": ("medium", "Make shell-tool permission behavior consistent for workspace-scoped development. Read-only commands that inspect paths inside the current workspace should be usable under the normal workspace permission, while commands that write, execute arbitrary programs, access the network, or target paths outside the workspace must retain the stronger permission requirement. Preserve containment and add focused coverage for read, write, network, and outside-workspace cases across the supported shell surfaces."),
+              "auth-provider-error-guidance": ("medium", "Improve authentication diagnostics for common provider-configuration mistakes. When a user selects an environment variable or token form that maps to the wrong provider or HTTP authentication header, the error should explain the correct variable and why, without exposing credential values. Preserve provider routing, existing error classes, JSON/text parity, and coverage for both API-key and OAuth-style inputs."),
+              "configured-worker-trust-defaults": ("medium-cross-module", "Make worker creation practical for callers that use a configured trusted-root policy. A normal settings file should be able to provide default trusted roots, worker creation should use those defaults when no per-worker roots are supplied, explicit per-worker roots must remain predictable and auditable, and an empty configuration must remain fail-closed. Expose the behavior through the existing configuration and worker status surfaces with focused tests and documentation."),
+          }
+          category, prompt = prompts[task_id]
           root = Path.cwd()
-          tasks = [
-              ("windows-first-run-onboarding", "small", "Add a clear Windows first-run setup section to the user documentation. It should tell a new Windows user to install Rust with rustup before using the project, choose Git Bash or WSL for the documented shell workflow, explain how Windows paths appear in Git Bash, and make clear that a MINGW64 prompt is normal. Keep the existing installation guidance accurate and consistent."),
-              ("agent-binary-name-documentation", "small", "Clarify the installation documentation for the renamed command-line package so users can distinguish the package name from the executable name. Show the exact command to install agent-code and the command users should run on Unix and Windows after installation. Keep the deprecated claw-code warning accurate and avoid implying that agent-code is the installed executable name."),
-              ("workspace-shell-permission-boundary", "medium", "Make shell-tool permission behavior consistent for workspace-scoped development. Read-only commands that inspect paths inside the current workspace should be usable under the normal workspace permission, while commands that write, execute arbitrary programs, access the network, or target paths outside the workspace must retain the stronger permission requirement. Preserve containment and add focused coverage for read, write, network, and outside-workspace cases across the supported shell surfaces."),
-              ("auth-provider-error-guidance", "medium", "Improve authentication diagnostics for common provider-configuration mistakes. When a user selects an environment variable or token form that maps to the wrong provider or HTTP authentication header, the error should explain the correct variable and why, without exposing credential values. Preserve provider routing, existing error classes, JSON/text parity, and coverage for both API-key and OAuth-style inputs."),
-              ("configured-worker-trust-defaults", "medium-cross-module", "Make worker creation practical for callers that use a configured trusted-root policy. A normal settings file should be able to provide default trusted roots, worker creation should use those defaults when no per-worker roots are supplied, explicit per-worker roots must remain predictable and auditable, and an empty configuration must remain fail-closed. Expose the behavior through the existing configuration and worker status surfaces with focused tests and documentation."),
-          ]
-
           tracked = subprocess.check_output(["git", "ls-files", "-z"], text=False).split(b"\0")
           files = {}
           for raw in tracked:
-              if not raw:
-                  continue
-              path = raw.decode()
-              source = root / path
-              try:
-                  files[path] = source.read_text(encoding="utf-8")
-              except (UnicodeDecodeError, OSError):
-                  continue
-
-          for task_id, category, prompt in tasks:
-              task_file = out / f"{task_id}.json"
-              result_file = out / f"{task_id}.jsonl"
-              telemetry_file = out / f"{task_id}.telemetry.json"
-              task_file.write_text(json.dumps([{
-                  "id": task_id,
-                  "version": 1,
-                  "category": category,
-                  "language": "rust",
-                  "prompt": prompt,
-                  "fixture": {"files": files, "mock_actions": []},
-                  "hidden_oracle": {"expected_files": {}, "forbidden_paths": ["hidden.txt"]},
-                  "expected_change_scope": [],
-                  "timeout_seconds": 600,
-                  "max_agent_turns": 40,
-              }]))
-              env = os.environ.copy()
-              env["CLAW_BENCH_TELEMETRY"] = str(telemetry_file)
-              command = [
-                  "rust/target/debug/agent-bench", "run", "--execution", "production",
-                  "--interactive", "--tasks", str(task_file), "--task", task_id,
-                  "--models", str(Path(os.environ["RUNNER_TEMP"]) / "luna-models.json"),
-                  "--settings", str(Path(os.environ["RUNNER_TEMP"]) / "luna-settings.json"),
-                  "--model", "gpt-5.6-luna", "--binary", "rust/target/debug/claw",
-                  "--runtime-image", os.environ["CLAW_WORKER_IMAGE"],
-                  "--validator-image", os.environ["CLAW_VALIDATOR_IMAGE"],
-                  "--task-timeout", "600", "--exploration-timeout", "90",
-                  "--repetitions", "1", "--output", str(result_file),
-              ]
-              print(f"=== {task_id} ({category}) ===", flush=True)
-              process = subprocess.Popen(
-                  command,
-                  env=env,
-                  text=True,
-                  start_new_session=True,
-              )
-              try:
-                  returncode = process.wait(timeout=900)
-              except subprocess.TimeoutExpired:
-                  os.killpg(process.pid, signal.SIGKILL)
-                  process.wait()
-                  print(f"task {task_id} exceeded the external 900-second watchdog; continuing", flush=True)
-                  (out / f"{task_id}.exit").write_text("124")
-                  continue
-              (out / f"{task_id}.exit").write_text(str(returncode))
-              if returncode != 0:
-                  print(f"task {task_id} exited {returncode}; continuing batch", flush=True)
+              if raw:
+                  path = raw.decode()
+                  try:
+                      files[path] = (root / path).read_text(encoding="utf-8")
+                  except (UnicodeDecodeError, OSError):
+                      pass
+          output.write_text(json.dumps([{
+              "id": task_id,
+              "version": 1,
+              "category": category,
+              "language": "rust",
+              "prompt": prompt,
+              "fixture": {"files": files, "mock_actions": []},
+              "hidden_oracle": {"expected_files": {}, "forbidden_paths": ["hidden.txt"]},
+              "expected_change_scope": [],
+              "timeout_seconds": 600,
+              "max_agent_turns": 40,
+          }]))
           PY
+          timeout --foreground --signal=TERM --kill-after=30s 900s \
+            rust/target/debug/agent-bench run --execution production --interactive \
+            --tasks "$out/task.json" --task "$CLAW_PRODUCT_TASK_ID" \
+            --models "$RUNNER_TEMP/luna-models.json" \
+            --settings "$RUNNER_TEMP/luna-settings.json" \
+            --model gpt-5.6-luna --binary rust/target/debug/claw \
+            --runtime-image "$CLAW_WORKER_IMAGE" --validator-image "$CLAW_VALIDATOR_IMAGE" \
+            --task-timeout 600 --exploration-timeout 90 --repetitions 1 \
+            --output "$out/result.jsonl" \
+            > "$out/stdout.log" 2> "$out/stderr.log"
+          status=$?
+          printf '%s\n' "$status" > "$out/exit"
+          exit 0
 
-      - name: Upload complete evaluation evidence
+      - name: Upload complete ticket evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: frozen-five-evaluation-${{ github.run_id }}
+          name: frozen-five-${{ matrix.task }}-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/frozen-five-evaluation/
+            ${{ runner.temp }}/frozen-five-evaluation/${{ matrix.task }}/
             ${{ runner.temp }}/acceptance/
           if-no-files-found: ignore
